@@ -34,6 +34,8 @@ class ContextPack:
     relevance_rejected: int = 0
     included_count: int = 0
     budget_rejected: int = 0
+    plan_budget_rejected: int = 0
+    memory_budget_rejected: int = 0
     anti_echo: dict[str, int] | None = None
     dedup: dict[str, int] | None = None
 
@@ -53,6 +55,8 @@ class ContextPack:
             "relevance_rejected": self.relevance_rejected,
             "included_count": self.included_count,
             "budget_rejected": self.budget_rejected,
+            "plan_budget_rejected": self.plan_budget_rejected,
+            "memory_budget_rejected": self.memory_budget_rejected,
             "anti_echo": dict(self.anti_echo or {}),
             "dedup": dict(self.dedup or {}),
         }
@@ -116,11 +120,11 @@ class ContextPackBuilder:
         anti_echo: dict[str, int] | None = None,
         dedup: dict[str, int] | None = None,
     ) -> ContextPack:
-        active_plans = tuple(
+        plan_candidates = tuple(
             dict(plan)
             for plan in plans
             if str(plan.get("status") or "active").lower() == "active"
-        )[:self.max_plans]
+        )
 
         candidates = [
             memory for memory in memories
@@ -130,42 +134,72 @@ class ContextPackBuilder:
         filtered_memories = self.relevance_filter.filter(candidates)
 
         state_tokens = _estimate_tokens(state.to_dict())
-        plan_tokens = _estimate_tokens(active_plans)
+        used_tokens = state_tokens
 
-        used_tokens = state_tokens + plan_tokens
+        selected_plans = []
+        selected_memories = []
+
+        plan_tokens_used = 0
         memory_tokens_used = 0
-        budget_rejected = 0
 
-        selected = []
-        truncated = False
+        plan_budget_rejected = 0
+        memory_budget_rejected = 0
 
-        for memory in filtered_memories[:self.max_memories]:
-            memory_tokens = _estimate_tokens(memory)
+        # State is never truncated.
+        # If State alone exceeds the nominal budget, keep it and report truncation.
+        truncated = state_tokens > self.token_budget
 
-            if used_tokens + memory_tokens <= self.token_budget:
-                selected.append(memory)
-                used_tokens += memory_tokens
-                memory_tokens_used += memory_tokens
-            else:
-                budget_rejected += 1
-                truncated = True
+        # Priority 2: Active Plans.
+        for plan in plan_candidates:
+            if len(selected_plans) >= self.max_plans:
                 break
+
+            tokens = _estimate_tokens(plan)
+
+            if used_tokens + tokens <= self.token_budget:
+                selected_plans.append(plan)
+                used_tokens += tokens
+                plan_tokens_used += tokens
+            else:
+                plan_budget_rejected += 1
+                truncated = True
+
+        # Priority 3: Relevant Memories.
+        for memory in filtered_memories:
+            if len(selected_memories) >= self.max_memories:
+                break
+
+            tokens = _estimate_tokens(memory)
+
+            if used_tokens + tokens <= self.token_budget:
+                selected_memories.append(memory)
+                used_tokens += tokens
+                memory_tokens_used += tokens
+            else:
+                memory_budget_rejected += 1
+                truncated = True
+
+        budget_rejected = (
+            plan_budget_rejected + memory_budget_rejected
+        )
 
         return ContextPack(
             state=state,
-            plans=active_plans,
-            memories=tuple(selected),
+            plans=tuple(selected_plans),
+            memories=tuple(selected_memories),
             token_budget=self.token_budget,
             estimated_tokens=used_tokens,
             truncated=truncated,
             state_tokens=state_tokens,
-            plan_tokens=plan_tokens,
+            plan_tokens=plan_tokens_used,
             memory_tokens=memory_tokens_used,
             candidate_count=len(candidates),
             retrieval_candidate_count=retrieval_candidate_count,
             relevance_rejected=relevance_rejected,
-            included_count=len(selected),
+            included_count=len(selected_memories),
             budget_rejected=budget_rejected,
+            plan_budget_rejected=plan_budget_rejected,
+            memory_budget_rejected=memory_budget_rejected,
             anti_echo=dict(anti_echo or {}),
             dedup=dict(dedup or {}),
         )
