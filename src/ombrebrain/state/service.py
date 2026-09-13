@@ -76,7 +76,7 @@ class StateService:
 
                 previous = float(relationship.get(key, value))
 
-                if key in relationship and abs(value - previous) > self.MAX_DELTA:
+                if key in relationship and abs(value - previous) > self.MAX_DELTA + 1e-12:
                     raise ValueError(
                         f"relationship.{key} change exceeds {self.MAX_DELTA}"
                     )
