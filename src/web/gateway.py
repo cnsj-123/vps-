@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 from urllib.parse import urlsplit
@@ -28,6 +30,14 @@ _REQUEST_DROP = _HOP_BY_HOP | {
 _RESPONSE_DROP = _HOP_BY_HOP | {
     "content-length",
 }
+
+_OBSERVE_MAX_DEPTH = 8
+_OBSERVE_MAX_ITEMS = 64
+_SAFE_ENUM_KEYS = {"role", "type"}
+
+
+def _truthy(value) -> bool:
+    return str(value or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _upstream_base() -> str:
@@ -60,6 +70,93 @@ def _forward_response_headers(response: httpx.Response) -> dict[str, str]:
     return headers
 
 
+def _text_fingerprint(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+
+
+def _json_shape(value, *, key: str = "", depth: int = 0):
+    """Describe JSON structure without logging scalar user content."""
+    if depth >= _OBSERVE_MAX_DEPTH:
+        return {"kind": "depth_limit"}
+
+    if isinstance(value, dict):
+        fields = {}
+        items = list(value.items())
+        for raw_key, child in items[:_OBSERVE_MAX_ITEMS]:
+            child_key = str(raw_key)
+            fields[child_key] = _json_shape(
+                child,
+                key=child_key,
+                depth=depth + 1,
+            )
+        result = {
+            "kind": "object",
+            "field_count": len(items),
+            "fields": fields,
+        }
+        if len(items) > _OBSERVE_MAX_ITEMS:
+            result["truncated"] = True
+        return result
+
+    if isinstance(value, list):
+        result = {
+            "kind": "array",
+            "count": len(value),
+            "items": [
+                _json_shape(child, key=key, depth=depth + 1)
+                for child in value[:_OBSERVE_MAX_ITEMS]
+            ],
+        }
+        if len(value) > _OBSERVE_MAX_ITEMS:
+            result["truncated"] = True
+        return result
+
+    if isinstance(value, str):
+        result = {
+            "kind": "string",
+            "chars": len(value),
+            "sha256": _text_fingerprint(value),
+        }
+        if (
+            key in _SAFE_ENUM_KEYS
+            and len(value) <= 64
+            and value.isprintable()
+        ):
+            result["enum"] = value
+        return result
+
+    if value is None:
+        return {"kind": "null"}
+    if isinstance(value, bool):
+        return {"kind": "boolean"}
+    if isinstance(value, (int, float)):
+        return {"kind": "number"}
+
+    return {"kind": type(value).__name__}
+
+
+def _observe_request(body: bytes, content_type: str) -> None:
+    if not _truthy(os.environ.get("OMBRE_GATEWAY_OBSERVE")):
+        return
+
+    try:
+        payload = json.loads(body)
+    except Exception:
+        logger.info(
+            "[gateway.observe] non_json content_type=%s body_bytes=%d sha256=%s",
+            str(content_type or "")[:100],
+            len(body),
+            hashlib.sha256(body).hexdigest()[:12],
+        )
+        return
+
+    shape = _json_shape(payload)
+    logger.info(
+        "[gateway.observe] %s",
+        json.dumps(shape, ensure_ascii=False, separators=(",", ":")),
+    )
+
+
 def register(mcp) -> None:
 
     @mcp.custom_route(
@@ -89,6 +186,11 @@ def register(mcp) -> None:
 
         body = await request.body()
         headers = _forward_request_headers(request)
+
+        _observe_request(
+            body,
+            request.headers.get("content-type", ""),
+        )
 
         logger.info(
             "[gateway] %s /%s body_bytes=%d",
