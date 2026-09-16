@@ -9,6 +9,8 @@ from urllib.parse import urlsplit
 import httpx
 from starlette.responses import JSONResponse, StreamingResponse
 
+from ombrebrain.gateway import canonical_summary_from_body
+
 logger = logging.getLogger("ombre_brain.gateway")
 
 _HOP_BY_HOP = {
@@ -135,6 +137,30 @@ def _json_shape(value, *, key: str = "", depth: int = 0):
     return {"kind": type(value).__name__}
 
 
+def _observe_canonical_request(body: bytes) -> None:
+    if not _truthy(
+        os.environ.get("OMBRE_GATEWAY_CANONICAL_OBSERVE")
+    ):
+        return
+
+    summary = canonical_summary_from_body(body)
+
+    if summary is None:
+        logger.info(
+            "[gateway.canonical] unsupported_or_non_json"
+        )
+        return
+
+    logger.info(
+        "[gateway.canonical] %s",
+        json.dumps(
+            summary,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+    )
+
+
 def _observe_request(body: bytes, content_type: str) -> None:
     if not _truthy(os.environ.get("OMBRE_GATEWAY_OBSERVE")):
         return
@@ -189,6 +215,8 @@ def register(mcp) -> None:
             body,
             request.headers.get("content-type", ""),
         )
+
+        _observe_canonical_request(body)
 
         logger.info(
             "[gateway] %s /%s body_bytes=%d",
