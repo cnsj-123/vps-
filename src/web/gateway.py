@@ -174,13 +174,11 @@ def register(mcp) -> None:
             )
 
         path = str(request.path_params.get("path") or "").lstrip("/")
-        if not path:
-            return JSONResponse(
-                {"error": {"type": "gateway_path_error", "message": "Missing upstream path"}},
-                status_code=404,
-            )
 
-        url = f"{upstream}/{path}"
+        if path:
+            url = f"{upstream}/{path}"
+        else:
+            url = upstream
         if request.url.query:
             url += "?" + request.url.query
 
