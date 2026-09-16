@@ -276,6 +276,30 @@ def safe_canonical_summary(
             for block in request.current.blocks
         )
 
+    history_user_layout = [
+        {
+            "index": message.original_index,
+            "segments": [
+                block.kind.value
+                for block in message.blocks
+            ],
+        }
+        for message in request.history
+        if message.role == "user"
+    ]
+
+    current_layout = None
+
+    if request.current is not None:
+        current_layout = {
+            "index": request.current.original_index,
+            "role": request.current.role,
+            "segments": [
+                block.kind.value
+                for block in request.current.blocks
+            ],
+        }
+
     return {
         "protocol": request.protocol,
         "history_messages": len(request.history),
@@ -286,6 +310,8 @@ def safe_canonical_summary(
         "current_segments": dict(
             sorted(current_counts.items())
         ),
+        "history_user_layout": history_user_layout,
+        "current_layout": current_layout,
         "passthrough_keys": sorted(
             request.passthrough.keys()
         ),
