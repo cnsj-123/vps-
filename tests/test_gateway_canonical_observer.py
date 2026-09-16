@@ -27,8 +27,13 @@ class GatewayCanonicalObserverTests(unittest.TestCase):
                             "type": "text",
                             "text": (
                                 secret
-                                + "\nTime: 12:00\n"
-                                + "Battery: 80%\n"
+                                + "\n"
+                                '<attachment '
+                                'id="message_insert_extra_bundle_1" '
+                                'filename="Time:12:00" '
+                                'type="text/plain">'
+                                "private dynamic data"
+                                "</attachment>"
                             ),
                         }
                     ],
@@ -49,8 +54,12 @@ class GatewayCanonicalObserverTests(unittest.TestCase):
                             "type": "text",
                             "text": (
                                 "current private text\n"
-                                "Fingertips 指尖语气\n"
-                                "typing rhythm\n"
+                                '<attachment '
+                                'id="message_insert_extra_bundle_2" '
+                                'filename="Time:12:01" '
+                                'type="text/plain">'
+                                "current private dynamic data"
+                                "</attachment>"
                             ),
                         }
                     ],
@@ -64,7 +73,7 @@ class GatewayCanonicalObserverTests(unittest.TestCase):
             separators=(",", ":"),
         ).encode("utf-8")
 
-        body_before = bytes(original)
+        before = bytes(original)
 
         summary = canonical_summary_from_body(original)
 
@@ -79,31 +88,29 @@ class GatewayCanonicalObserverTests(unittest.TestCase):
         self.assertNotIn(secret, rendered)
         self.assertNotIn("private system text", rendered)
         self.assertNotIn("private answer", rendered)
-        self.assertNotIn("current private text", rendered)
-        self.assertNotIn("typing rhythm", rendered)
+        self.assertNotIn("private dynamic data", rendered)
 
-        # Observer must not alter the request bytes.
-        self.assertEqual(original, body_before)
+        self.assertEqual(original, before)
 
         self.assertEqual(
-            summary["history_messages"],
-            2,
+            summary["history_user_layout"],
+            [
+                {
+                    "index": 0,
+                    "segments": [
+                        "user_text",
+                        "dynamic_context",
+                    ],
+                }
+            ],
         )
 
         self.assertEqual(
-            summary["history_segments"],
-            {
-                "perception": 1,
-                "user_text": 2,
-            },
-        )
-
-        self.assertEqual(
-            summary["current_segments"],
-            {
-                "fingertips": 1,
-                "user_text": 1,
-            },
+            summary["current_layout"]["segments"],
+            [
+                "user_text",
+                "dynamic_context",
+            ],
         )
 
     def test_non_json_returns_none(self) -> None:

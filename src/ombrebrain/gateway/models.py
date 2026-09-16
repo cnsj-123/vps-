@@ -8,6 +8,7 @@ from typing import Any
 
 class SegmentKind(str, Enum):
     USER_TEXT = "user_text"
+    DYNAMIC_CONTEXT = "dynamic_context"
     PERCEPTION = "perception"
     FINGERTIPS = "fingertips"
     FRONTEND_MEMORY = "frontend_memory"

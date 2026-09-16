@@ -13,38 +13,100 @@ from .models import (
 )
 
 
-_MEMORY_MARKER = re.compile(
-    r"(?:relevant[_ -]?memories(?:\.txt)?|相关记忆|相关记忆文件)",
+# Operit serializes attachments as:
+#
+# <attachment id="..." filename="..." type="..." size="...">
+#   ...
+# </attachment>
+#
+# Self-closing attachment references are accepted as well.
+_ATTACHMENT_RE = re.compile(
+    r'''
+    <attachment\b
+        (?P<attrs>[^>]*)
+    >
+        (?P<body>.*?)
+    </attachment>
+    |
+    <attachment\b
+        (?P<self_attrs>[^>]*)
+    />
+    ''',
+    re.IGNORECASE | re.DOTALL | re.VERBOSE,
+)
+
+_ATTR_RE = re.compile(
+    r'\b(?P<name>id|filename|type|size)\s*=\s*"(?P<value>[^"]*)"',
     re.IGNORECASE,
 )
 
-_FINGERTIPS_MARKER = re.compile(
-    r"(?:\bfingertips\b|指尖语气)",
-    re.IGNORECASE,
+
+# Current Operit message_insert package.
+_OPERIT_EXTRA_ID_PREFIX = "message_insert_extra_bundle_"
+_OPERIT_EXTRA_FILENAME_PREFIX = "Time:"
+
+# Older message_insert attachment forms kept for compatibility.
+_LEGACY_EXTRA_FILENAMES = {
+    "extra_info_time.txt",
+    "extra_info_battery.txt",
+    "extra_info_weather.txt",
+    "extra_info_location.txt",
+    "extra_info_notifications.txt",
+}
+
+_LEGACY_EXTRA_ID_PREFIXES = (
+    "message_insert_extra_time_",
+    "message_insert_extra_battery_",
+    "message_insert_extra_weather_",
+    "message_insert_extra_location_",
+    "message_insert_extra_notifications_",
 )
 
-_PERCEPTION_MARKER = re.compile(
-    r"^\s*(?:time|时间|当前时间)\s*[:：]",
-    re.IGNORECASE,
-)
+
+def _attachment_attrs(raw_attrs: str) -> dict[str, str]:
+    attrs: dict[str, str] = {}
+
+    for match in _ATTR_RE.finditer(raw_attrs):
+        attrs[match.group("name").lower()] = match.group("value")
+
+    return attrs
 
 
-def _marker_kind(line: str) -> SegmentKind | None:
-    stripped = line.strip()
+def _classify_attachment(attrs: dict[str, str]) -> SegmentKind:
+    attachment_id = attrs.get("id", "")
+    filename = attrs.get("filename", "")
 
-    if not stripped:
-        return None
+    attachment_id_lower = attachment_id.lower()
+    filename_lower = filename.lower()
 
-    if _MEMORY_MARKER.search(stripped):
+    # Strong Operit-owned identifiers. These are safer than scanning
+    # attachment contents for words such as Time / memory.
+    if (
+        filename.startswith(_OPERIT_EXTRA_FILENAME_PREFIX)
+        or attachment_id.startswith(_OPERIT_EXTRA_ID_PREFIX)
+        or filename_lower in _LEGACY_EXTRA_FILENAMES
+        or any(
+            attachment_id.startswith(prefix)
+            for prefix in _LEGACY_EXTRA_ID_PREFIXES
+        )
+    ):
+        return SegmentKind.DYNAMIC_CONTEXT
+
+    # A separate front-end memory attachment, if one exists.
+    if filename_lower == "relevant_memories.txt":
         return SegmentKind.FRONTEND_MEMORY
 
-    if _FINGERTIPS_MARKER.search(stripped):
+    # Keep this conservative: only attachment metadata may trigger
+    # Fingertips classification, never normal user text.
+    if (
+        "fingertips" in filename_lower
+        or "fingertips" in attachment_id_lower
+        or "指尖" in filename
+        or "指尖" in attachment_id
+    ):
         return SegmentKind.FINGERTIPS
 
-    if _PERCEPTION_MARKER.search(stripped):
-        return SegmentKind.PERCEPTION
-
-    return None
+    return SegmentKind.UNKNOWN
 
 
 def split_operit_text(
@@ -55,14 +117,16 @@ def split_operit_text(
     metadata: dict[str, Any] | None = None,
 ) -> tuple[CanonicalBlock, ...]:
     """
-    Conservatively split an Operit text block into semantic sections.
+    Split only on explicit Operit attachment envelopes.
 
-    Important:
-    - Nothing is deleted.
-    - Nothing is rewritten.
-    - Unrecognized text stays USER_TEXT.
-    - Only explicit marker lines start dynamic sections.
+    Critical safety rule:
+    ordinary text is never reclassified merely because it contains words such
+    as Time, battery, memory, Fingertips, etc.
+
+    Phase 2B remains observation-only; source_payload is still untouched.
     """
+
+    block_metadata = deepcopy(metadata or {})
 
     if not text:
         return (
@@ -71,61 +135,77 @@ def split_operit_text(
                 source_message_index=source_message_index,
                 source_block_index=source_block_index,
                 text=text,
-                metadata=deepcopy(metadata or {}),
+                metadata=block_metadata,
             ),
         )
 
-    lines = text.splitlines(keepends=True)
+    blocks: list[CanonicalBlock] = []
+    cursor = 0
 
-    chunks: list[tuple[SegmentKind, str]] = []
+    for match in _ATTACHMENT_RE.finditer(text):
+        plain = text[cursor:match.start()]
 
-    current_kind = SegmentKind.USER_TEXT
-    current_lines: list[str] = []
+        # Ignore separator-only whitespace in the canonical view.
+        # Nothing is deleted from source_payload.
+        if plain.strip():
+            blocks.append(
+                CanonicalBlock(
+                    kind=SegmentKind.USER_TEXT,
+                    source_message_index=source_message_index,
+                    source_block_index=source_block_index,
+                    text=plain,
+                    metadata=deepcopy(block_metadata),
+                )
+            )
 
-    def flush() -> None:
-        nonlocal current_lines
+        raw_attachment = match.group(0)
 
-        if not current_lines:
-            return
+        attrs_text = (
+            match.group("attrs")
+            if match.group("attrs") is not None
+            else match.group("self_attrs") or ""
+        )
 
-        chunks.append(
-            (
-                current_kind,
-                "".join(current_lines),
+        attrs = _attachment_attrs(attrs_text)
+        kind = _classify_attachment(attrs)
+
+        blocks.append(
+            CanonicalBlock(
+                kind=kind,
+                source_message_index=source_message_index,
+                source_block_index=source_block_index,
+                text=raw_attachment,
+                metadata=deepcopy(block_metadata),
             )
         )
 
-        current_lines = []
+        cursor = match.end()
 
-    for line in lines:
-        marker = _marker_kind(line)
+    tail = text[cursor:]
 
-        if marker is not None and marker != current_kind:
-            flush()
-            current_kind = marker
-
-        current_lines.append(line)
-
-    flush()
-
-    if not chunks:
-        chunks = [
-            (
-                SegmentKind.USER_TEXT,
-                text,
+    if tail.strip():
+        blocks.append(
+            CanonicalBlock(
+                kind=SegmentKind.USER_TEXT,
+                source_message_index=source_message_index,
+                source_block_index=source_block_index,
+                text=tail,
+                metadata=deepcopy(block_metadata),
             )
-        ]
-
-    return tuple(
-        CanonicalBlock(
-            kind=kind,
-            source_message_index=source_message_index,
-            source_block_index=source_block_index,
-            text=chunk,
-            metadata=deepcopy(metadata or {}),
         )
-        for kind, chunk in chunks
-    )
+
+    if not blocks:
+        blocks.append(
+            CanonicalBlock(
+                kind=SegmentKind.USER_TEXT,
+                source_message_index=source_message_index,
+                source_block_index=source_block_index,
+                text=text,
+                metadata=block_metadata,
+            )
+        )
+
+    return tuple(blocks)
 
 
 def _canonicalize_message(
@@ -255,9 +335,10 @@ def safe_canonical_summary(
     request: CanonicalRequest,
 ) -> dict[str, Any]:
     """
-    Return structure/counts only.
+    Structure/counts only.
 
-    No user text, system text, memory text or Fingertips text is returned.
+    No user text, attachment payload, system text, memory text or Fingertips
+    text is emitted.
     """
 
     history_counts: Counter[str] = Counter()

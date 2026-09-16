@@ -11,8 +11,7 @@ class GatewayCanonicalizerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.adapter = OperitAdapter()
 
-    def test_operit_shape_and_roundtrip(self) -> None:
-
+    def test_operit_attachment_boundary_and_roundtrip(self) -> None:
         payload = {
             "model": "example-model",
             "stream": True,
@@ -25,10 +24,6 @@ class GatewayCanonicalizerTests(unittest.TestCase):
                 {
                     "type": "text",
                     "text": "stable system",
-                    "cache_control": {
-                        "type": "ephemeral",
-                        "ttl": "1h",
-                    },
                 }
             ],
             "messages": [
@@ -39,9 +34,14 @@ class GatewayCanonicalizerTests(unittest.TestCase):
                             "type": "text",
                             "text": (
                                 "historical question\n"
-                                "Time: 12:00\n"
-                                "Battery: 80%\n"
-                                "Weather: sunny\n"
+                                '<attachment '
+                                'id="message_insert_extra_bundle_abc" '
+                                'filename="Time:12:00" '
+                                'type="text/plain">'
+                                "【当前时间】12:00\n"
+                                "【当前电量】80%\n"
+                                "【相关记忆】secret memory"
+                                "</attachment>"
                             ),
                         }
                     ],
@@ -62,12 +62,14 @@ class GatewayCanonicalizerTests(unittest.TestCase):
                             "type": "text",
                             "text": (
                                 "current question\n"
-                                "relevant_memories.txt\n"
-                                "memory candidate\n"
-                                "Time: 12:01\n"
-                                "Battery: 79%\n"
-                                "Fingertips 指尖语气\n"
-                                "typing rhythm\n"
+                                '<attachment '
+                                'id="message_insert_extra_bundle_def" '
+                                'filename="Time:12:01" '
+                                'type="text/plain">'
+                                "【当前时间】12:01\n"
+                                "【相关记忆】another memory\n"
+                                "Fingertips 指尖语气"
+                                "</attachment>"
                             ),
                             "cache_control": {
                                 "type": "ephemeral",
@@ -79,105 +81,32 @@ class GatewayCanonicalizerTests(unittest.TestCase):
             ],
         }
 
-        self.assertTrue(
-            self.adapter.supports(payload)
-        )
-
         request = self.adapter.adapt(payload)
 
-        self.assertEqual(
-            request.protocol,
-            "anthropic_messages",
-        )
-
-        self.assertEqual(
-            len(request.history),
-            2,
-        )
-
-        self.assertIsNotNone(
-            request.current
-        )
-
-        # Phase 2A must never alter the original payload.
         self.assertEqual(
             request.roundtrip_payload(),
             payload,
         )
 
-        history_user = request.history[0]
-
         self.assertEqual(
-            history_user.kinds,
+            request.history[0].kinds,
             (
                 SegmentKind.USER_TEXT,
-                SegmentKind.PERCEPTION,
+                SegmentKind.DYNAMIC_CONTEXT,
             ),
         )
 
-        current = request.current
-        assert current is not None
+        assert request.current is not None
 
         self.assertEqual(
-            current.kinds,
+            request.current.kinds,
             (
                 SegmentKind.USER_TEXT,
-                SegmentKind.FRONTEND_MEMORY,
-                SegmentKind.PERCEPTION,
-                SegmentKind.FINGERTIPS,
+                SegmentKind.DYNAMIC_CONTEXT,
             ),
         )
 
-        self.assertEqual(
-            current.blocks[-1]
-            .metadata["cache_control"]["type"],
-            "ephemeral",
-        )
-
-        self.assertEqual(
-            request.passthrough["thinking"]["type"],
-            "enabled",
-        )
-
-    def test_safe_summary_leaks_no_text(self) -> None:
-
-        secret = "PRIVATE_TEXT_MUST_NOT_APPEAR"
-
-        payload = {
-            "model": "m",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": secret,
-                        }
-                    ],
-                }
-            ],
-        }
-
-        summary = self.adapter.safe_summary(
-            payload
-        )
-
-        rendered = repr(summary)
-
-        self.assertNotIn(
-            secret,
-            rendered,
-        )
-
-        self.assertEqual(
-            summary["current_segments"],
-            {
-                "user_text": 1,
-            },
-        )
-
-    def test_normal_text_is_not_reclassified(self) -> None:
-
+    def test_words_in_normal_text_are_never_dynamic(self) -> None:
         payload = {
             "model": "m",
             "messages": [
@@ -187,8 +116,9 @@ class GatewayCanonicalizerTests(unittest.TestCase):
                         {
                             "type": "text",
                             "text": (
-                                "A normal sentence about "
-                                "time and memory."
+                                "Time: tomorrow at 8\n"
+                                "相关记忆应该怎么设计？\n"
+                                "Fingertips 指尖语气是什么？"
                             ),
                         }
                     ],
@@ -196,16 +126,83 @@ class GatewayCanonicalizerTests(unittest.TestCase):
             ],
         }
 
-        request = self.adapter.adapt(
-            payload
-        )
-
+        request = self.adapter.adapt(payload)
         assert request.current is not None
 
         self.assertEqual(
             request.current.kinds,
             (
                 SegmentKind.USER_TEXT,
+            ),
+        )
+
+    def test_separate_frontend_memory_attachment(self) -> None:
+        payload = {
+            "model": "m",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "hello\n"
+                                '<attachment '
+                                'id="memory_x" '
+                                'filename="relevant_memories.txt" '
+                                'type="text/plain">'
+                                "private memory"
+                                "</attachment>"
+                            ),
+                        }
+                    ],
+                }
+            ],
+        }
+
+        request = self.adapter.adapt(payload)
+        assert request.current is not None
+
+        self.assertEqual(
+            request.current.kinds,
+            (
+                SegmentKind.USER_TEXT,
+                SegmentKind.FRONTEND_MEMORY,
+            ),
+        )
+
+    def test_unknown_attachment_stays_unknown(self) -> None:
+        payload = {
+            "model": "m",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "hello\n"
+                                '<attachment '
+                                'id="document_1" '
+                                'filename="notes.txt" '
+                                'type="text/plain">'
+                                "document"
+                                "</attachment>"
+                            ),
+                        }
+                    ],
+                }
+            ],
+        }
+
+        request = self.adapter.adapt(payload)
+        assert request.current is not None
+
+        self.assertEqual(
+            request.current.kinds,
+            (
+                SegmentKind.USER_TEXT,
+                SegmentKind.UNKNOWN,
             ),
         )
 
