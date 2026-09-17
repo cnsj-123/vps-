@@ -3,6 +3,9 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
+from .attachment_ownership import (
+    is_confirmed_dynamic_attachment,
+)
 from .canonicalizer import (
     _ATTACHMENT_RE,
     _attachment_attrs,
@@ -31,6 +34,7 @@ def _rewrite_historical_text(
     counts = {
         "dynamic_context_removed": 0,
         "fingertips_removed": 0,
+        "empty_guard_preserved": 0,
     }
 
     def replace(match):
@@ -43,13 +47,20 @@ def _rewrite_historical_text(
         attrs = _attachment_attrs(attrs_text)
         kind = _classify_attachment(attrs)
 
-        if kind == SegmentKind.DYNAMIC_CONTEXT:
+        if (
+            kind == SegmentKind.DYNAMIC_CONTEXT
+            and is_confirmed_dynamic_attachment(
+                attrs
+            )
+        ):
             counts["dynamic_context_removed"] += 1
             return ""
 
+        # Observation classification may identify Fingertips,
+        # but destructive removal is disabled until a strong
+        # ownership identifier is verified.
         if kind == SegmentKind.FINGERTIPS:
-            counts["fingertips_removed"] += 1
-            return ""
+            return match.group(0)
 
         return match.group(0)
 
@@ -57,6 +68,18 @@ def _rewrite_historical_text(
         replace,
         text,
     )
+
+    # Never turn a meaningful historical text block into an
+    # empty/whitespace-only block merely because it consisted
+    # solely of removable dynamic metadata.
+    if (
+        text.strip()
+        and not rewritten.strip()
+        and counts["dynamic_context_removed"] > 0
+    ):
+        counts["dynamic_context_removed"] = 0
+        counts["empty_guard_preserved"] = 1
+        return text, counts
 
     return rewritten, counts
 
@@ -84,6 +107,7 @@ def rewrite_history_for_cache(
         "history_user_messages_seen": 0,
         "dynamic_context_removed": 0,
         "fingertips_removed": 0,
+        "empty_guard_preserved": 0,
     }
 
     messages = output.get("messages")
@@ -129,6 +153,10 @@ def rewrite_history_for_cache(
                 counts["fingertips_removed"]
             )
 
+            report["empty_guard_preserved"] += (
+                counts["empty_guard_preserved"]
+            )
+
             continue
 
         if not isinstance(content, list):
@@ -158,6 +186,10 @@ def rewrite_history_for_cache(
             )
             report["fingertips_removed"] += (
                 counts["fingertips_removed"]
+            )
+
+            report["empty_guard_preserved"] += (
+                counts["empty_guard_preserved"]
             )
 
     return output, report

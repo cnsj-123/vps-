@@ -137,7 +137,7 @@ class GatewayCacheStableBodyTests(unittest.TestCase):
         self.assertEqual(
             report["rewrite"]
             ["fingertips_removed"],
-            1,
+            0,
         )
 
         self.assertTrue(
@@ -159,7 +159,7 @@ class GatewayCacheStableBodyTests(unittest.TestCase):
             historical,
         )
 
-        self.assertNotIn(
+        self.assertIn(
             'filename="fingertips.txt"',
             historical,
         )

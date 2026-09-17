@@ -5,6 +5,9 @@ from .cache_move_shadow import (
 )
 from .cache_planner import cache_plan_summary_from_body
 from .cache_stable_body import rewrite_cache_stable_body
+from .fingertips_probe import (
+    fingertips_ownership_summary_from_body,
+)
 from .observer import canonical_summary_from_body
 from .operit_adapter import OperitAdapter
 from .rewriter import rewrite_history_for_cache
@@ -15,6 +18,7 @@ __all__ = [
     "cache_move_shadow_summary_from_body",
     "cache_plan_summary_from_body",
     "canonical_summary_from_body",
+    "fingertips_ownership_summary_from_body",
     "relocate_current_breakpoint",
     "rewrite_body_for_cache",
     "rewrite_cache_stable_body",

@@ -13,6 +13,7 @@ from ombrebrain.gateway import (
     cache_move_shadow_summary_from_body,
     cache_plan_summary_from_body,
     canonical_summary_from_body,
+    fingertips_ownership_summary_from_body,
     rewrite_body_for_cache,
     rewrite_cache_stable_body,
     rewrite_shadow_summary_from_body,
@@ -249,6 +250,39 @@ def _observe_cache_move_shadow(
     )
 
 
+def _observe_fingertips_ownership(
+    body: bytes,
+) -> None:
+    if not _truthy(
+        os.environ.get(
+            "OMBRE_GATEWAY_FINGERTIPS_PROBE"
+        )
+    ):
+        return
+
+    summary = (
+        fingertips_ownership_summary_from_body(
+            body
+        )
+    )
+
+    if summary is None:
+        logger.info(
+            "[gateway.fingertips_probe] "
+            "unsupported_or_non_json"
+        )
+        return
+
+    logger.info(
+        "[gateway.fingertips_probe] %s",
+        json.dumps(
+            summary,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+    )
+
+
 def _rewrite_upstream_body(body: bytes) -> bytes:
     if _truthy(
         os.environ.get(
@@ -365,6 +399,7 @@ def register(mcp) -> None:
         _observe_rewrite_shadow(body)
         _observe_cache_plan(body)
         _observe_cache_move_shadow(body)
+        _observe_fingertips_ownership(body)
 
         forward_body = _rewrite_upstream_body(body)
 
