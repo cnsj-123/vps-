@@ -207,6 +207,61 @@ class GatewayCacheBreakpointTests(unittest.TestCase):
 
         self.assertEqual(transformed, before)
 
+    def test_user_boundary_fails_open(self):
+        payload = self._payload()
+
+        # Force the last historical candidate to be user.
+        payload["messages"][1]["role"] = "user"
+
+        before = deepcopy(payload)
+
+        transformed, report = (
+            relocate_current_breakpoint(payload)
+        )
+
+        self.assertFalse(report["applied"])
+        self.assertEqual(
+            report["reason"],
+            "boundary_not_assistant",
+        )
+        self.assertEqual(transformed, before)
+        self.assertEqual(
+            report["explicit_before"],
+            report["explicit_after"],
+        )
+
+    def test_existing_boundary_marker_fails_open(self):
+        payload = self._payload()
+
+        payload["messages"][1]["content"][0][
+            "cache_control"
+        ] = {
+            "type": "ephemeral",
+            "ttl": "1h",
+        }
+
+        before = deepcopy(payload)
+
+        transformed, report = (
+            relocate_current_breakpoint(payload)
+        )
+
+        self.assertFalse(report["applied"])
+        self.assertEqual(
+            report["reason"],
+            "boundary_already_cached",
+        )
+        self.assertEqual(transformed, before)
+
+        self.assertEqual(
+            report["explicit_before"],
+            3,
+        )
+        self.assertEqual(
+            report["explicit_after"],
+            3,
+        )
+
     def test_shadow_does_not_leak_prompt_text(self):
         payload = self._payload()
 

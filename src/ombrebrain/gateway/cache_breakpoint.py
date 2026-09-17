@@ -202,6 +202,15 @@ def relocate_current_breakpoint(
         report["explicit_after"] = report["explicit_before"]
         return output, report
 
+    # Production safety:
+    # only move the current breakpoint to a completed
+    # assistant turn. Never cache-boundary a historical
+    # user message.
+    if boundary_message.get("role") != "assistant":
+        report["reason"] = "boundary_not_assistant"
+        report["explicit_after"] = report["explicit_before"]
+        return output, report
+
     boundary_content = boundary_message.get(
         "content"
     )
@@ -233,14 +242,19 @@ def relocate_current_breakpoint(
         "cache_control"
     )
 
-    if (
-        existing is not None
-        and existing != cache_control
-    ):
-        report["reason"] = (
-            "boundary_cache_control_conflict"
+    if existing is not None:
+        if existing == cache_control:
+            report["reason"] = (
+                "boundary_already_cached"
+            )
+        else:
+            report["reason"] = (
+                "boundary_cache_control_conflict"
+            )
+
+        report["explicit_after"] = (
+            report["explicit_before"]
         )
-        report["explicit_after"] = report["explicit_before"]
         return output, report
 
     # Everything is validated before mutation.

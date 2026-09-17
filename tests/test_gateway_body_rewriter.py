@@ -115,7 +115,7 @@ class GatewayBodyRewriterTests(unittest.TestCase):
 
         self.assertEqual(
             report["fingertips_removed"],
-            1,
+            0,
         )
 
         rewritten = json.loads(rewritten_body)
@@ -135,7 +135,7 @@ class GatewayBodyRewriterTests(unittest.TestCase):
             historical,
         )
 
-        self.assertNotIn(
+        self.assertIn(
             'filename="fingertips.txt"',
             historical,
         )

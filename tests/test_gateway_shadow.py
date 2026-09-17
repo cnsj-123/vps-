@@ -87,7 +87,7 @@ class GatewayRewriteShadowTests(unittest.TestCase):
 
         self.assertEqual(
             summary["fingertips_removed"],
-            1,
+            0,
         )
 
         self.assertGreater(

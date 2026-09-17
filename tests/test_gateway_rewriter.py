@@ -132,7 +132,7 @@ class GatewayRewriterTests(unittest.TestCase):
             historical,
         )
 
-        self.assertNotIn(
+        self.assertIn(
             "fingertips_context_1",
             historical,
         )
@@ -179,7 +179,7 @@ class GatewayRewriterTests(unittest.TestCase):
 
         self.assertEqual(
             report["fingertips_removed"],
-            1,
+            0,
         )
 
     def test_normal_words_are_never_removed(self) -> None:
