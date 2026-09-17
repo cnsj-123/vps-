@@ -9,7 +9,10 @@ from urllib.parse import urlsplit
 import httpx
 from starlette.responses import JSONResponse, StreamingResponse
 
-from ombrebrain.gateway import canonical_summary_from_body
+from ombrebrain.gateway import (
+    canonical_summary_from_body,
+    rewrite_shadow_summary_from_body,
+)
 
 logger = logging.getLogger("ombre_brain.gateway")
 
@@ -161,6 +164,30 @@ def _observe_canonical_request(body: bytes) -> None:
     )
 
 
+def _observe_rewrite_shadow(body: bytes) -> None:
+    if not _truthy(
+        os.environ.get("OMBRE_GATEWAY_REWRITE_SHADOW")
+    ):
+        return
+
+    summary = rewrite_shadow_summary_from_body(body)
+
+    if summary is None:
+        logger.info(
+            "[gateway.rewrite_shadow] unsupported_or_non_json"
+        )
+        return
+
+    logger.info(
+        "[gateway.rewrite_shadow] %s",
+        json.dumps(
+            summary,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+    )
+
+
 def _observe_request(body: bytes, content_type: str) -> None:
     if not _truthy(os.environ.get("OMBRE_GATEWAY_OBSERVE")):
         return
@@ -217,6 +244,7 @@ def register(mcp) -> None:
         )
 
         _observe_canonical_request(body)
+        _observe_rewrite_shadow(body)
 
         logger.info(
             "[gateway] %s /%s body_bytes=%d",
