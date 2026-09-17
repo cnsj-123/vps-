@@ -10,6 +10,7 @@ import httpx
 from starlette.responses import JSONResponse, StreamingResponse
 
 from ombrebrain.gateway import (
+    cache_plan_summary_from_body,
     canonical_summary_from_body,
     rewrite_body_for_cache,
     rewrite_shadow_summary_from_body,
@@ -189,6 +190,30 @@ def _observe_rewrite_shadow(body: bytes) -> None:
     )
 
 
+def _observe_cache_plan(body: bytes) -> None:
+    if not _truthy(
+        os.environ.get("OMBRE_GATEWAY_CACHE_PLAN_OBSERVE")
+    ):
+        return
+
+    summary = cache_plan_summary_from_body(body)
+
+    if summary is None:
+        logger.info(
+            "[gateway.cache_plan] unsupported_or_non_json"
+        )
+        return
+
+    logger.info(
+        "[gateway.cache_plan] %s",
+        json.dumps(
+            summary,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+    )
+
+
 def _rewrite_upstream_body(body: bytes) -> bytes:
     if not _truthy(
         os.environ.get("OMBRE_GATEWAY_REWRITE")
@@ -275,6 +300,7 @@ def register(mcp) -> None:
 
         _observe_canonical_request(body)
         _observe_rewrite_shadow(body)
+        _observe_cache_plan(body)
 
         forward_body = _rewrite_upstream_body(body)
 
