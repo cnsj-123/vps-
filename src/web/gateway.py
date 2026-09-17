@@ -11,6 +11,7 @@ from starlette.responses import JSONResponse, StreamingResponse
 
 from ombrebrain.gateway import (
     canonical_summary_from_body,
+    rewrite_body_for_cache,
     rewrite_shadow_summary_from_body,
 )
 
@@ -188,6 +189,35 @@ def _observe_rewrite_shadow(body: bytes) -> None:
     )
 
 
+def _rewrite_upstream_body(body: bytes) -> bytes:
+    if not _truthy(
+        os.environ.get("OMBRE_GATEWAY_REWRITE")
+    ):
+        return body
+
+    try:
+        rewritten_body, report = rewrite_body_for_cache(
+            body
+        )
+    except Exception as exc:
+        logger.warning(
+            "[gateway.rewrite] failed type=%s fail_open=true",
+            type(exc).__name__,
+        )
+        return body
+
+    logger.info(
+        "[gateway.rewrite] %s",
+        json.dumps(
+            report,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+    )
+
+    return rewritten_body
+
+
 def _observe_request(body: bytes, content_type: str) -> None:
     if not _truthy(os.environ.get("OMBRE_GATEWAY_OBSERVE")):
         return
@@ -246,6 +276,8 @@ def register(mcp) -> None:
         _observe_canonical_request(body)
         _observe_rewrite_shadow(body)
 
+        forward_body = _rewrite_upstream_body(body)
+
         logger.info(
             "[gateway] %s /%s body_bytes=%d",
             request.method,
@@ -264,7 +296,7 @@ def register(mcp) -> None:
                 method=request.method,
                 url=url,
                 headers=headers,
-                content=body,
+                content=forward_body,
             )
             upstream_response = await client.send(upstream_request, stream=True)
         except Exception as exc:
