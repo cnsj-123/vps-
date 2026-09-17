@@ -14,6 +14,7 @@ from ombrebrain.gateway import (
     cache_plan_summary_from_body,
     canonical_summary_from_body,
     rewrite_body_for_cache,
+    rewrite_cache_stable_body,
     rewrite_shadow_summary_from_body,
 )
 
@@ -249,6 +250,34 @@ def _observe_cache_move_shadow(
 
 
 def _rewrite_upstream_body(body: bytes) -> bytes:
+    if _truthy(
+        os.environ.get(
+            "OMBRE_GATEWAY_CACHE_STABLE"
+        )
+    ):
+        try:
+            transformed_body, report = (
+                rewrite_cache_stable_body(body)
+            )
+        except Exception as exc:
+            logger.warning(
+                "[gateway.cache_stable] "
+                "failed type=%s fail_open=true",
+                type(exc).__name__,
+            )
+            return body
+
+        logger.info(
+            "[gateway.cache_stable] %s",
+            json.dumps(
+                report,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        )
+
+        return transformed_body
+
     if not _truthy(
         os.environ.get("OMBRE_GATEWAY_REWRITE")
     ):
