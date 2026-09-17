@@ -19,6 +19,8 @@ from ombrebrain.gateway import (
     rewrite_shadow_summary_from_body,
 )
 
+from ombrebrain.gateway.response_usage import ResponseUsageObserver
+
 logger = logging.getLogger("ombre_brain.gateway")
 
 _HOP_BY_HOP = {
@@ -442,11 +444,77 @@ def register(mcp) -> None:
 
         response_headers = _forward_response_headers(upstream_response)
 
+        usage_observer = None
+
+        if _truthy(
+            os.environ.get(
+                "OMBRE_GATEWAY_RESPONSE_USAGE_OBSERVE"
+            )
+        ):
+            try:
+                usage_observer = ResponseUsageObserver(
+                    upstream_response.headers.get(
+                        "content-type",
+                        "",
+                    )
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[gateway.response_usage] "
+                    "observer_init_failed=%s",
+                    type(exc).__name__,
+                )
+
         async def relay_body():
+            nonlocal usage_observer
+
+            stream_completed = False
+
             try:
                 async for chunk in upstream_response.aiter_raw():
+                    if usage_observer is not None:
+                        try:
+                            usage_observer.feed(chunk)
+                        except Exception as exc:
+                            logger.warning(
+                                "[gateway.response_usage] "
+                                "observer_feed_failed=%s",
+                                type(exc).__name__,
+                            )
+
+                            # Observation must never affect
+                            # upstream streaming.
+                            usage_observer = None
+
+                    # Critical invariant:
+                    # forward exactly the original raw chunk.
                     yield chunk
+
+                stream_completed = True
+
             finally:
+                if (
+                    stream_completed
+                    and usage_observer is not None
+                ):
+                    try:
+                        summary = usage_observer.finish()
+
+                        logger.info(
+                            "[gateway.response_usage] %s",
+                            json.dumps(
+                                summary,
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            ),
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "[gateway.response_usage] "
+                            "observer_finish_failed=%s",
+                            type(exc).__name__,
+                        )
+
                 await upstream_response.aclose()
                 await client.aclose()
 
