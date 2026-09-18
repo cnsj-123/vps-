@@ -23,6 +23,9 @@ from ombrebrain.gateway.response_usage import ResponseUsageObserver
 from ombrebrain.context.conversation_shadow import (
     observe_conversation_shadow,
 )
+from ombrebrain.context.conversation_snapshot import (
+    update_conversation_snapshot,
+)
 from ombrebrain.gateway.gateway_runtime import (
     record_cache_usage,
     resolve_upstream_base,
@@ -371,11 +374,29 @@ def _observe_request(body: bytes, content_type: str) -> None:
 
 
 def _observe_context_shadow(body: bytes) -> None:
-    """Observe conversation continuity without mutating the request."""
-    if not _truthy(
+    """
+    Phase 4A shadow pipeline.
+
+    - identifies append-only conversation continuity
+    - optionally persists a bounded clean conversation snapshot
+    - never mutates the upstream request
+    """
+
+    context_log_enabled = _truthy(
         os.environ.get(
             "OMBRE_GATEWAY_CONTEXT_SHADOW"
         )
+    )
+
+    snapshot_enabled = _truthy(
+        os.environ.get(
+            "OMBRE_GATEWAY_CONTEXT_SNAPSHOT_SHADOW"
+        )
+    )
+
+    if not (
+        context_log_enabled
+        or snapshot_enabled
     ):
         return
 
@@ -392,50 +413,116 @@ def _observe_context_shadow(body: bytes) -> None:
         return
 
     if not summary.get("observed"):
+        if context_log_enabled:
+            logger.info(
+                "[gateway.context_shadow] %s",
+                json.dumps(
+                    {
+                        "observed": False,
+                        "reason": summary.get(
+                            "reason",
+                            "unknown",
+                        ),
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            )
+        return
+
+    if context_log_enabled:
         logger.info(
             "[gateway.context_shadow] %s",
             json.dumps(
                 {
-                    "observed": False,
-                    "reason": summary.get(
-                        "reason",
-                        "unknown",
+                    "observed": True,
+                    "conversation_id": summary.get(
+                        "conversation_id"
+                    ),
+                    "round": summary.get(
+                        "round"
+                    ),
+                    "new_conversation": summary.get(
+                        "new_conversation"
+                    ),
+                    "duplicate": summary.get(
+                        "duplicate"
+                    ),
+                    "continuity": summary.get(
+                        "continuity"
+                    ),
+                    "messages_count": summary.get(
+                        "messages_count"
                     ),
                 },
                 ensure_ascii=False,
                 separators=(",", ":"),
             ),
         )
+
+    if not snapshot_enabled:
         return
 
-    # Intentionally omit prompt-derived hashes from normal logs.
-    # Only local ID + structural continuity metadata is emitted.
+    conversation_id = summary.get(
+        "conversation_id"
+    )
+
+    if not isinstance(
+        conversation_id,
+        str,
+    ):
+        return
+
+    try:
+        snapshot = update_conversation_snapshot(
+            body,
+            conversation_id=conversation_id,
+            boundary_prefix_sha256=summary.get(
+                "boundary_prefix_sha256"
+            ),
+        )
+    except Exception as exc:
+        logger.warning(
+            "[gateway.context_snapshot] "
+            "store_failed=%s fail_open=true",
+            type(exc).__name__,
+        )
+        return
+
     logger.info(
-        "[gateway.context_shadow] %s",
+        "[gateway.context_snapshot] %s",
         json.dumps(
             {
-                "observed": True,
-                "conversation_id": summary.get(
-                    "conversation_id"
+                "stored": snapshot.get(
+                    "stored"
                 ),
-                "round": summary.get("round"),
-                "new_conversation": summary.get(
-                    "new_conversation"
+                "conversation_id": (
+                    conversation_id
                 ),
-                "duplicate": summary.get(
+                "revision": snapshot.get(
+                    "revision"
+                ),
+                "duplicate": snapshot.get(
                     "duplicate"
                 ),
-                "continuity": summary.get(
-                    "continuity"
+                "included_messages": snapshot.get(
+                    "included_messages"
                 ),
-                "messages_count": summary.get(
-                    "messages_count"
+                "excluded_segments": snapshot.get(
+                    "excluded_segments"
+                ),
+                "total_chars": snapshot.get(
+                    "total_chars"
+                ),
+                "budget_truncated": snapshot.get(
+                    "budget_truncated"
                 ),
             },
             ensure_ascii=False,
             separators=(",", ":"),
         ),
     )
+
 
 def register(mcp) -> None:
 
