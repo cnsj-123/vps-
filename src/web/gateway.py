@@ -703,6 +703,10 @@ def _observe_context_shadow(body: bytes) -> None:
                     semantic.get(
                         "latest_user_ack_only"
                     ),
+                "task_recovered_from_history":
+                    semantic.get(
+                        "task_recovered_from_history"
+                    ),
                 "decision_count":
                     semantic.get(
                         "decision_count"

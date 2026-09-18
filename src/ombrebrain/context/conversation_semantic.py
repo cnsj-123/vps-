@@ -11,7 +11,7 @@ from typing import Any
 
 _LOCK = threading.RLock()
 
-_VERSION = "conversation-semantic.v2"
+_VERSION = "conversation-semantic.v3"
 _DEFAULT_ROOT = "/app/buckets/.context"
 
 _MAX_CURRENT_TASK_CHARS = 600
@@ -54,12 +54,12 @@ _OPEN_RE = re.compile(
 
 
 _ACK_ONLY_RE = re.compile(
-    r"^\\s*(?:"
+    r"^\s*(?:"
     r"好|好的|好了|可以|行|"
     r"嗯+|哦+|收到|明白|知道了|"
     r"继续|继续吧|来|开始|开始吧|欧克克|"
     r"ok(?:ay)?|yes|go|done|sure"
-    r")[\\s。！!,.，]*$",
+    r")[\s。！!,.，]*$",
     re.IGNORECASE,
 )
 
@@ -463,6 +463,9 @@ def build_semantic_frame(
             and candidate.get(
                 "text"
             ).strip()
+            and not _is_ack_or_continuation(
+                candidate["text"]
+            )
         ):
             previous_task = {
                 "text": candidate[
@@ -474,20 +477,23 @@ def build_semantic_frame(
                     ),
             }
 
-    latest_user = None
+    user_messages = [
+        message
+        for message in messages
+        if message.get("role")
+        == "user"
+    ]
 
-    for message in reversed(
-        messages
-    ):
-        if message.get(
-            "role"
-        ) == "user":
-            latest_user = message
-            break
+    latest_user = (
+        user_messages[-1]
+        if user_messages
+        else None
+    )
 
     current_task = None
     task_carried_forward = False
     latest_user_ack_only = False
+    task_recovered_from_history = False
 
     if latest_user is not None:
         latest_text = latest_user[
@@ -500,18 +506,106 @@ def build_semantic_frame(
             )
         )
 
-        if (
-            latest_user_ack_only
-            and previous_task
-            is not None
-        ):
-            current_task = dict(
-                previous_task
-            )
+        if latest_user_ack_only:
+            # Find the newest substantive task still visible in
+            # the bounded Compact window.
+            history_task = None
 
-            task_carried_forward = True
+            for candidate_message in reversed(
+                user_messages[:-1]
+            ):
+                candidate_text = (
+                    candidate_message.get(
+                        "text"
+                    )
+                )
 
-        elif not latest_user_ack_only:
+                if (
+                    isinstance(
+                        candidate_text,
+                        str,
+                    )
+                    and candidate_text.strip()
+                    and not _is_ack_or_continuation(
+                        candidate_text
+                    )
+                ):
+                    history_task = {
+                        "text": _clip(
+                            candidate_text,
+                            _MAX_CURRENT_TASK_CHARS,
+                        ),
+                        "source_index":
+                            candidate_message.get(
+                                "source_index"
+                            ),
+                    }
+                    break
+
+            # Prefer whichever sourced task is newer.
+            candidates = [
+                item
+                for item in (
+                    previous_task,
+                    history_task,
+                )
+                if isinstance(
+                    item,
+                    dict,
+                )
+            ]
+
+            if candidates:
+                def _source_rank(item):
+                    value = item.get(
+                        "source_index"
+                    )
+
+                    if (
+                        isinstance(
+                            value,
+                            int,
+                        )
+                        and not isinstance(
+                            value,
+                            bool,
+                        )
+                    ):
+                        return value
+
+                    return -1
+
+                current_task = dict(
+                    max(
+                        candidates,
+                        key=_source_rank,
+                    )
+                )
+
+                task_carried_forward = True
+
+                if (
+                    history_task
+                    is not None
+                    and current_task.get(
+                        "source_index"
+                    )
+                    == history_task.get(
+                        "source_index"
+                    )
+                    and (
+                        previous_task is None
+                        or previous_task.get(
+                            "source_index"
+                        )
+                        != history_task.get(
+                            "source_index"
+                        )
+                    )
+                ):
+                    task_recovered_from_history = True
+
+        else:
             current_task = {
                 "text": _clip(
                     latest_text,
@@ -582,6 +676,8 @@ def build_semantic_frame(
                 task_carried_forward,
             "latest_user_ack_only":
                 latest_user_ack_only,
+            "task_recovered_from_history":
+                task_recovered_from_history,
             "decision_count":
                 len(decisions),
             "constraint_count":
