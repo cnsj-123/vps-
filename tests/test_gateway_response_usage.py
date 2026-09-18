@@ -74,6 +74,50 @@ class GatewayResponseUsageTests(
             rendered,
         )
 
+    def test_message_delta_zeroes_do_not_erase_start_usage(self):
+        observer = ResponseUsageObserver(
+            "text/event-stream"
+        )
+
+        stream = (
+            'event: message_start\n'
+            'data: {"type":"message_start",'
+            '"message":{"usage":{'
+            '"input_tokens":1016,'
+            '"output_tokens":1,'
+            '"cache_creation_input_tokens":0,'
+            '"cache_read_input_tokens":46171}}}\n\n'
+            'event: message_delta\n'
+            'data: {"type":"message_delta",'
+            '"delta":{"stop_reason":"end_turn"},'
+            '"usage":{'
+            '"input_tokens":0,'
+            '"output_tokens":115,'
+            '"cache_creation_input_tokens":0,'
+            '"cache_read_input_tokens":0}}\n\n'
+        ).encode()
+
+        observer.feed(stream)
+
+        result = observer.finish()
+
+        self.assertEqual(
+            result["input_tokens"],
+            1016,
+        )
+        self.assertEqual(
+            result["cache_creation_input_tokens"],
+            0,
+        )
+        self.assertEqual(
+            result["cache_read_input_tokens"],
+            46171,
+        )
+        self.assertEqual(
+            result["output_tokens"],
+            115,
+        )
+
     def test_json_usage(self):
         observer = ResponseUsageObserver(
             "application/json"

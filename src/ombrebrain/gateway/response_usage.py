@@ -138,9 +138,41 @@ class ResponseUsageObserver:
         except Exception:
             return
 
-        self._merge_usage(
-            _extract_usage_dict(payload)
+        usage = _extract_usage_dict(payload)
+
+        event_type = (
+            payload.get("type")
+            if isinstance(payload, dict)
+            else None
         )
+
+        if event_type == "message_delta":
+            # Streaming contract:
+            # input/cache accounting belongs to the
+            # request and is already known at
+            # message_start. Some compatible relays
+            # emit zero placeholders for these fields
+            # again in message_delta. Never let those
+            # overwrite the initial accounting.
+            if "output_tokens" in usage:
+                self._usage["output_tokens"] = (
+                    usage["output_tokens"]
+                )
+
+            for key in (
+                "input_tokens",
+                "cache_creation_input_tokens",
+                "cache_read_input_tokens",
+            ):
+                if (
+                    key not in self._usage
+                    and key in usage
+                ):
+                    self._usage[key] = usage[key]
+
+            return
+
+        self._merge_usage(usage)
 
     def feed(
         self,
