@@ -4,7 +4,6 @@ import hashlib
 import json
 import logging
 import os
-from urllib.parse import urlsplit
 
 import httpx
 from starlette.responses import JSONResponse, StreamingResponse
@@ -21,6 +20,10 @@ from ombrebrain.gateway import (
 
 from ombrebrain.gateway.cache_fingerprint import cache_fingerprint_summary_from_body
 from ombrebrain.gateway.response_usage import ResponseUsageObserver
+from ombrebrain.gateway.gateway_runtime import (
+    record_cache_usage,
+    resolve_upstream_base,
+)
 
 logger = logging.getLogger("ombre_brain.gateway")
 
@@ -54,13 +57,11 @@ def _truthy(value) -> bool:
 
 
 def _upstream_base() -> str:
-    base = (os.environ.get("OMBRE_GATEWAY_UPSTREAM") or "").strip().rstrip("/")
-    if not base:
-        raise RuntimeError("OMBRE_GATEWAY_UPSTREAM is not configured")
-
-    parsed = urlsplit(base)
-    if parsed.scheme not in ("http", "https") or not parsed.netloc:
-        raise RuntimeError("OMBRE_GATEWAY_UPSTREAM must be an absolute http/https URL")
+    base, _source = resolve_upstream_base(
+        os.environ.get(
+            "OMBRE_GATEWAY_UPSTREAM"
+        )
+    )
 
     return base
 
@@ -475,24 +476,25 @@ def register(mcp) -> None:
 
         usage_observer = None
 
-        if _truthy(
+        usage_log_enabled = _truthy(
             os.environ.get(
                 "OMBRE_GATEWAY_RESPONSE_USAGE_OBSERVE"
             )
-        ):
-            try:
-                usage_observer = ResponseUsageObserver(
-                    upstream_response.headers.get(
-                        "content-type",
-                        "",
-                    )
+        )
+
+        try:
+            usage_observer = ResponseUsageObserver(
+                upstream_response.headers.get(
+                    "content-type",
+                    "",
                 )
-            except Exception as exc:
-                logger.warning(
-                    "[gateway.response_usage] "
-                    "observer_init_failed=%s",
-                    type(exc).__name__,
-                )
+            )
+        except Exception as exc:
+            logger.warning(
+                "[gateway.response_usage] "
+                "observer_init_failed=%s",
+                type(exc).__name__,
+            )
 
         async def relay_body():
             nonlocal usage_observer
@@ -529,14 +531,27 @@ def register(mcp) -> None:
                     try:
                         summary = usage_observer.finish()
 
-                        logger.info(
-                            "[gateway.response_usage] %s",
-                            json.dumps(
+                        try:
+                            record_cache_usage(
                                 summary,
-                                ensure_ascii=False,
-                                separators=(",", ":"),
-                            ),
-                        )
+                                upstream=upstream,
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "[gateway.cache_metrics] "
+                                "record_failed=%s",
+                                type(exc).__name__,
+                            )
+
+                        if usage_log_enabled:
+                            logger.info(
+                                "[gateway.response_usage] %s",
+                                json.dumps(
+                                    summary,
+                                    ensure_ascii=False,
+                                    separators=(",", ":"),
+                                ),
+                            )
                     except Exception as exc:
                         logger.warning(
                             "[gateway.response_usage] "

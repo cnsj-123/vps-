@@ -25,6 +25,7 @@ from . import plans
 from . import letters
 from . import hooks
 from . import gateway
+from . import gateway_admin
 from . import buckets
 from . import import_api
 from . import github
@@ -48,6 +49,7 @@ _WEB_MODULES = (
     ("web.letters", letters.register),
     ("web.hooks", hooks.register),
     ("web.gateway", gateway.register),
+    ("web.gateway_admin", gateway_admin.register),
     ("web.buckets", buckets.register),
     ("web.import_api", import_api.register),
     ("web.github", github.register),
