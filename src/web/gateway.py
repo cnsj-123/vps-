@@ -823,6 +823,34 @@ def _observe_context_shadow(body: bytes) -> None:
                     semantic_state.get(
                         "archived_this_revision"
                     ),
+                "purged_closed_echoes_this_revision":
+                    semantic_state.get(
+                        "purged_closed_echoes_this_revision"
+                    ),
+                "lifecycle_skipped_carried_forward":
+                    semantic_state.get(
+                        "lifecycle_skipped_carried_forward"
+                    ),
+                "lifecycle_command_detected":
+                    semantic_state.get(
+                        "lifecycle_command_detected"
+                    ),
+                "lifecycle_action":
+                    semantic_state.get(
+                        "lifecycle_action"
+                    ),
+                "lifecycle_kind":
+                    semantic_state.get(
+                        "lifecycle_kind"
+                    ),
+                "lifecycle_matched":
+                    semantic_state.get(
+                        "lifecycle_matched"
+                    ),
+                "lifecycle_replacement_added":
+                    semantic_state.get(
+                        "lifecycle_replacement_added"
+                    ),
                 "facts_deferred":
                     semantic_state.get(
                         "facts_deferred"
