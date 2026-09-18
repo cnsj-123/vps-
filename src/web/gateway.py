@@ -695,6 +695,14 @@ def _observe_context_shadow(body: bytes) -> None:
                     semantic.get(
                         "has_current_task"
                     ),
+                "current_task_carried_forward":
+                    semantic.get(
+                        "current_task_carried_forward"
+                    ),
+                "latest_user_ack_only":
+                    semantic.get(
+                        "latest_user_ack_only"
+                    ),
                 "decision_count":
                     semantic.get(
                         "decision_count"

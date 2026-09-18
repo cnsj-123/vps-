@@ -11,7 +11,7 @@ from typing import Any
 
 _LOCK = threading.RLock()
 
-_VERSION = "conversation-semantic.v1"
+_VERSION = "conversation-semantic.v2"
 _DEFAULT_ROOT = "/app/buckets/.context"
 
 _MAX_CURRENT_TASK_CHARS = 600
@@ -51,6 +51,33 @@ _OPEN_RE = re.compile(
     r")",
     re.IGNORECASE,
 )
+
+
+_ACK_ONLY_RE = re.compile(
+    r"^\\s*(?:"
+    r"好|好的|好了|可以|行|"
+    r"嗯+|哦+|收到|明白|知道了|"
+    r"继续|继续吧|来|开始|开始吧|欧克克|"
+    r"ok(?:ay)?|yes|go|done|sure"
+    r")[\\s。！!,.，]*$",
+    re.IGNORECASE,
+)
+
+
+def _is_ack_or_continuation(
+    text: str,
+) -> bool:
+    if not isinstance(
+        text,
+        str,
+    ):
+        return False
+
+    return bool(
+        _ACK_ONLY_RE.fullmatch(
+            text.strip()
+        )
+    )
 
 
 def _root() -> Path:
@@ -380,6 +407,7 @@ def _collect(
 
 def build_semantic_frame(
     compact: dict[str, Any],
+    previous_frame: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
 
     conversation_id = compact.get(
@@ -413,7 +441,40 @@ def build_semantic_frame(
         compact
     )
 
-    current_task = None
+    previous_task = None
+
+    if isinstance(
+        previous_frame,
+        dict,
+    ):
+        candidate = previous_frame.get(
+            "current_task"
+        )
+
+        if (
+            isinstance(
+                candidate,
+                dict,
+            )
+            and isinstance(
+                candidate.get("text"),
+                str,
+            )
+            and candidate.get(
+                "text"
+            ).strip()
+        ):
+            previous_task = {
+                "text": candidate[
+                    "text"
+                ],
+                "source_index":
+                    candidate.get(
+                        "source_index"
+                    ),
+            }
+
+    latest_user = None
 
     for message in reversed(
         messages
@@ -421,17 +482,53 @@ def build_semantic_frame(
         if message.get(
             "role"
         ) == "user":
+            latest_user = message
+            break
+
+    current_task = None
+    task_carried_forward = False
+    latest_user_ack_only = False
+
+    if latest_user is not None:
+        latest_text = latest_user[
+            "text"
+        ]
+
+        latest_user_ack_only = (
+            _is_ack_or_continuation(
+                latest_text
+            )
+        )
+
+        if (
+            latest_user_ack_only
+            and previous_task
+            is not None
+        ):
+            current_task = dict(
+                previous_task
+            )
+
+            task_carried_forward = True
+
+        elif not latest_user_ack_only:
             current_task = {
                 "text": _clip(
-                    message["text"],
+                    latest_text,
                     _MAX_CURRENT_TASK_CHARS,
                 ),
                 "source_index":
-                    message.get(
+                    latest_user.get(
                         "source_index"
                     ),
             }
-            break
+
+    elif previous_task is not None:
+        current_task = dict(
+            previous_task
+        )
+
+        task_carried_forward = True
 
     constraints = _collect(
         messages,
@@ -481,6 +578,10 @@ def build_semantic_frame(
                 len(messages),
             "has_current_task":
                 current_task is not None,
+            "current_task_carried_forward":
+                task_carried_forward,
+            "latest_user_ack_only":
+                latest_user_ack_only,
             "decision_count":
                 len(decisions),
             "constraint_count":
@@ -536,6 +637,10 @@ def update_conversation_semantic(
                 dict,
             )
             and previous.get(
+                "version"
+            )
+            == _VERSION
+            and previous.get(
                 "source_revision"
             )
             == source_revision
@@ -561,7 +666,15 @@ def update_conversation_semantic(
             }
 
         semantic = build_semantic_frame(
-            compact
+            compact,
+            previous_frame=(
+                previous
+                if isinstance(
+                    previous,
+                    dict,
+                )
+                else None
+            ),
         )
 
         _atomic_write(
