@@ -139,5 +139,181 @@ class GatewayCacheFingerprintTests(
         )
 
 
+    def test_append_only_prefix_chain_matches(self):
+        previous = {
+            "model": "model",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "u1",
+                        }
+                    ],
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "a1",
+                            "cache_control": {
+                                "type": "ephemeral",
+                                "ttl": "1h",
+                            },
+                        }
+                    ],
+                },
+            ],
+        }
+
+        current = {
+            "model": "model",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "u1",
+                        }
+                    ],
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "a1",
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "u2",
+                        }
+                    ],
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "a2",
+                            "cache_control": {
+                                "type": "ephemeral",
+                                "ttl": "1h",
+                            },
+                        }
+                    ],
+                },
+            ],
+        }
+
+        a = cache_fingerprint_summary_from_body(
+            json.dumps(previous).encode()
+        )
+        b = cache_fingerprint_summary_from_body(
+            json.dumps(current).encode()
+        )
+
+        self.assertEqual(
+            a["boundary_prefix_sha256"],
+            b["parent_prefix_sha256"],
+        )
+        self.assertEqual(
+            b["parent_boundary_index"],
+            1,
+        )
+
+    def test_old_history_change_breaks_prefix_chain(self):
+        previous = {
+            "model": "model",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "original",
+                        }
+                    ],
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "a1",
+                            "cache_control": {
+                                "type": "ephemeral",
+                            },
+                        }
+                    ],
+                },
+            ],
+        }
+
+        current = {
+            "model": "model",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "changed",
+                        }
+                    ],
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "a1",
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "u2",
+                        }
+                    ],
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "a2",
+                            "cache_control": {
+                                "type": "ephemeral",
+                            },
+                        }
+                    ],
+                },
+            ],
+        }
+
+        a = cache_fingerprint_summary_from_body(
+            json.dumps(previous).encode()
+        )
+        b = cache_fingerprint_summary_from_body(
+            json.dumps(current).encode()
+        )
+
+        self.assertNotEqual(
+            a["boundary_prefix_sha256"],
+            b["parent_prefix_sha256"],
+        )
+
 if __name__ == "__main__":
     unittest.main()

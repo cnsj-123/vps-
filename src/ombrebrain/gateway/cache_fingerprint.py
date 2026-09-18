@@ -25,6 +25,69 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(data).hexdigest()[:16]
 
 
+def _message_prefix_without_cache_control(
+    messages: list[Any],
+    last_index: int,
+) -> list[Any]:
+    """
+    Return a detached message prefix with only
+    content-block cache_control metadata removed.
+
+    Actual message text/content is preserved for hashing
+    but is never returned or logged.
+    """
+
+    prefix: list[Any] = []
+
+    for message in messages[: last_index + 1]:
+        if not isinstance(message, dict):
+            prefix.append(message)
+            continue
+
+        clean_message = dict(message)
+        content = message.get("content")
+
+        if isinstance(content, list):
+            clean_content: list[Any] = []
+
+            for block in content:
+                if isinstance(block, dict):
+                    clean_block = dict(block)
+                    clean_block.pop(
+                        "cache_control",
+                        None,
+                    )
+                    clean_content.append(clean_block)
+                else:
+                    clean_content.append(block)
+
+            clean_message["content"] = clean_content
+
+        prefix.append(clean_message)
+
+    return prefix
+
+
+def _message_prefix_digest(
+    messages: Any,
+    last_index: int | None,
+) -> str | None:
+    if (
+        not isinstance(messages, list)
+        or last_index is None
+        or last_index < 0
+        or last_index >= len(messages)
+    ):
+        return None
+
+    return _digest(
+        _message_prefix_without_cache_control(
+            messages,
+            last_index,
+        )
+    )
+
+
 def cache_fingerprint_summary_from_body(
     body: bytes,
 ) -> dict[str, Any] | None:
@@ -83,6 +146,28 @@ def cache_fingerprint_summary_from_body(
 
     model = payload.get("model")
 
+    parent_boundary_index = None
+
+    if boundary_message_index is not None:
+        candidate = boundary_message_index - 2
+
+        if candidate >= 0:
+            parent_boundary_index = candidate
+
+    boundary_prefix_sha256 = (
+        _message_prefix_digest(
+            messages,
+            boundary_message_index,
+        )
+    )
+
+    parent_prefix_sha256 = (
+        _message_prefix_digest(
+            messages,
+            parent_boundary_index,
+        )
+    )
+
     return {
         "model_present": isinstance(model, str),
         "model_sha256": (
@@ -106,5 +191,14 @@ def cache_fingerprint_summary_from_body(
         "message_cache_markers": cache_markers,
         "boundary_message_index": (
             boundary_message_index
+        ),
+        "boundary_prefix_sha256": (
+            boundary_prefix_sha256
+        ),
+        "parent_boundary_index": (
+            parent_boundary_index
+        ),
+        "parent_prefix_sha256": (
+            parent_prefix_sha256
         ),
     }
