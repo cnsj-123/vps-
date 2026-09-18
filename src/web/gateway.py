@@ -20,6 +20,9 @@ from ombrebrain.gateway import (
 
 from ombrebrain.gateway.cache_fingerprint import cache_fingerprint_summary_from_body
 from ombrebrain.gateway.response_usage import ResponseUsageObserver
+from ombrebrain.context.conversation_shadow import (
+    observe_conversation_shadow,
+)
 from ombrebrain.gateway.gateway_runtime import (
     record_cache_usage,
     resolve_upstream_base,
@@ -366,6 +369,74 @@ def _observe_request(body: bytes, content_type: str) -> None:
     )
 
 
+
+def _observe_context_shadow(body: bytes) -> None:
+    """Observe conversation continuity without mutating the request."""
+    if not _truthy(
+        os.environ.get(
+            "OMBRE_GATEWAY_CONTEXT_SHADOW"
+        )
+    ):
+        return
+
+    try:
+        summary = observe_conversation_shadow(
+            body
+        )
+    except Exception as exc:
+        logger.warning(
+            "[gateway.context_shadow] "
+            "observer_failed=%s fail_open=true",
+            type(exc).__name__,
+        )
+        return
+
+    if not summary.get("observed"):
+        logger.info(
+            "[gateway.context_shadow] %s",
+            json.dumps(
+                {
+                    "observed": False,
+                    "reason": summary.get(
+                        "reason",
+                        "unknown",
+                    ),
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        )
+        return
+
+    # Intentionally omit prompt-derived hashes from normal logs.
+    # Only local ID + structural continuity metadata is emitted.
+    logger.info(
+        "[gateway.context_shadow] %s",
+        json.dumps(
+            {
+                "observed": True,
+                "conversation_id": summary.get(
+                    "conversation_id"
+                ),
+                "round": summary.get("round"),
+                "new_conversation": summary.get(
+                    "new_conversation"
+                ),
+                "duplicate": summary.get(
+                    "duplicate"
+                ),
+                "continuity": summary.get(
+                    "continuity"
+                ),
+                "messages_count": summary.get(
+                    "messages_count"
+                ),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+    )
+
 def register(mcp) -> None:
 
     @mcp.custom_route(
@@ -406,6 +477,13 @@ def register(mcp) -> None:
         _observe_fingertips_ownership(body)
 
         forward_body = _rewrite_upstream_body(body)
+
+        # Phase 4A-1: observation-only conversation continuity.
+        # Important: observe the cache-stabilized body so the stable
+        # boundary used for continuity matches what is actually sent upstream.
+        _observe_context_shadow(
+            forward_body
+        )
 
         if _truthy(
             os.environ.get(
