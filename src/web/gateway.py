@@ -26,6 +26,9 @@ from ombrebrain.context.conversation_shadow import (
 from ombrebrain.context.conversation_snapshot import (
     update_conversation_snapshot,
 )
+from ombrebrain.context.conversation_compact import (
+    update_conversation_compact,
+)
 from ombrebrain.gateway.gateway_runtime import (
     record_cache_usage,
     resolve_upstream_base,
@@ -394,9 +397,16 @@ def _observe_context_shadow(body: bytes) -> None:
         )
     )
 
+    compact_enabled = _truthy(
+        os.environ.get(
+            "OMBRE_GATEWAY_CONTEXT_COMPACT_SHADOW"
+        )
+    )
+
     if not (
         context_log_enabled
         or snapshot_enabled
+        or compact_enabled
     ):
         return
 
@@ -460,7 +470,10 @@ def _observe_context_shadow(body: bytes) -> None:
             ),
         )
 
-    if not snapshot_enabled:
+    if not (
+        snapshot_enabled
+        or compact_enabled
+    ):
         return
 
     conversation_id = summary.get(
@@ -517,6 +530,77 @@ def _observe_context_shadow(body: bytes) -> None:
                 "budget_truncated": snapshot.get(
                     "budget_truncated"
                 ),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+    )
+
+
+
+    if (
+        not compact_enabled
+        or not snapshot.get("stored")
+    ):
+        return
+
+    try:
+        compact = update_conversation_compact(
+            conversation_id
+        )
+    except Exception as exc:
+        logger.warning(
+            "[gateway.context_compact] "
+            "store_failed=%s fail_open=true",
+            type(exc).__name__,
+        )
+        return
+
+    logger.info(
+        "[gateway.context_compact] %s",
+        json.dumps(
+            {
+                "stored": compact.get(
+                    "stored"
+                ),
+                "conversation_id":
+                    conversation_id,
+                "source_revision":
+                    compact.get(
+                        "source_revision"
+                    ),
+                "duplicate":
+                    compact.get(
+                        "duplicate"
+                    ),
+                "source_messages":
+                    compact.get(
+                        "source_messages"
+                    ),
+                "older_messages":
+                    compact.get(
+                        "older_messages"
+                    ),
+                "recent_messages":
+                    compact.get(
+                        "recent_messages"
+                    ),
+                "source_chars":
+                    compact.get(
+                        "source_chars"
+                    ),
+                "compact_chars":
+                    compact.get(
+                        "compact_chars"
+                    ),
+                "compaction_ratio":
+                    compact.get(
+                        "compaction_ratio"
+                    ),
+                "compaction_applied":
+                    compact.get(
+                        "compaction_applied"
+                    ),
             },
             ensure_ascii=False,
             separators=(",", ":"),
