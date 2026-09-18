@@ -19,6 +19,7 @@ from ombrebrain.gateway import (
     rewrite_shadow_summary_from_body,
 )
 
+from ombrebrain.gateway.cache_fingerprint import cache_fingerprint_summary_from_body
 from ombrebrain.gateway.response_usage import ResponseUsageObserver
 
 logger = logging.getLogger("ombre_brain.gateway")
@@ -404,6 +405,34 @@ def register(mcp) -> None:
         _observe_fingertips_ownership(body)
 
         forward_body = _rewrite_upstream_body(body)
+
+        if _truthy(
+            os.environ.get(
+                "OMBRE_GATEWAY_CACHE_FINGERPRINT_OBSERVE"
+            )
+        ):
+            try:
+                fingerprint = (
+                    cache_fingerprint_summary_from_body(
+                        forward_body
+                    )
+                )
+
+                if fingerprint is not None:
+                    logger.info(
+                        "[gateway.cache_fingerprint] %s",
+                        json.dumps(
+                            fingerprint,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "[gateway.cache_fingerprint] "
+                    "observer_failed=%s",
+                    type(exc).__name__,
+                )
 
         logger.info(
             "[gateway] %s /%s body_bytes=%d",
