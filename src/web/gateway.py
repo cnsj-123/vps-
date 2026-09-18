@@ -29,6 +29,9 @@ from ombrebrain.context.conversation_snapshot import (
 from ombrebrain.context.conversation_compact import (
     update_conversation_compact,
 )
+from ombrebrain.context.conversation_semantic import (
+    update_conversation_semantic,
+)
 from ombrebrain.gateway.gateway_runtime import (
     record_cache_usage,
     resolve_upstream_base,
@@ -378,11 +381,15 @@ def _observe_request(body: bytes, content_type: str) -> None:
 
 def _observe_context_shadow(body: bytes) -> None:
     """
-    Phase 4A shadow pipeline.
+    Phase 4A shadow context pipeline.
 
-    - identifies append-only conversation continuity
-    - optionally persists a bounded clean conversation snapshot
-    - never mutates the upstream request
+    Request flow:
+      conversation identity
+        -> bounded snapshot
+        -> deterministic compact
+        -> conservative semantic frame
+
+    Every stage is fail-open and none mutates the upstream request.
     """
 
     context_log_enabled = _truthy(
@@ -403,13 +410,23 @@ def _observe_context_shadow(body: bytes) -> None:
         )
     )
 
+    semantic_enabled = _truthy(
+        os.environ.get(
+            "OMBRE_GATEWAY_CONTEXT_SEMANTIC_SHADOW"
+        )
+    )
+
     if not (
         context_log_enabled
         or snapshot_enabled
         or compact_enabled
+        or semantic_enabled
     ):
         return
 
+    # --------------------------------------------------------
+    # 1. Conversation continuity
+    # --------------------------------------------------------
     try:
         summary = observe_conversation_shadow(
             body
@@ -440,45 +457,42 @@ def _observe_context_shadow(body: bytes) -> None:
             )
         return
 
+    conversation_id = summary.get(
+        "conversation_id"
+    )
+
     if context_log_enabled:
         logger.info(
             "[gateway.context_shadow] %s",
             json.dumps(
                 {
                     "observed": True,
-                    "conversation_id": summary.get(
-                        "conversation_id"
-                    ),
+                    "conversation_id":
+                        conversation_id,
                     "round": summary.get(
                         "round"
                     ),
-                    "new_conversation": summary.get(
-                        "new_conversation"
-                    ),
-                    "duplicate": summary.get(
-                        "duplicate"
-                    ),
-                    "continuity": summary.get(
-                        "continuity"
-                    ),
-                    "messages_count": summary.get(
-                        "messages_count"
-                    ),
+                    "new_conversation":
+                        summary.get(
+                            "new_conversation"
+                        ),
+                    "duplicate":
+                        summary.get(
+                            "duplicate"
+                        ),
+                    "continuity":
+                        summary.get(
+                            "continuity"
+                        ),
+                    "messages_count":
+                        summary.get(
+                            "messages_count"
+                        ),
                 },
                 ensure_ascii=False,
                 separators=(",", ":"),
             ),
         )
-
-    if not (
-        snapshot_enabled
-        or compact_enabled
-    ):
-        return
-
-    conversation_id = summary.get(
-        "conversation_id"
-    )
 
     if not isinstance(
         conversation_id,
@@ -486,6 +500,17 @@ def _observe_context_shadow(body: bytes) -> None:
     ):
         return
 
+    # Semantic depends on Compact, which depends on Snapshot.
+    if not (
+        snapshot_enabled
+        or compact_enabled
+        or semantic_enabled
+    ):
+        return
+
+    # --------------------------------------------------------
+    # 2. Bounded Snapshot
+    # --------------------------------------------------------
     try:
         snapshot = update_conversation_snapshot(
             body,
@@ -506,44 +531,56 @@ def _observe_context_shadow(body: bytes) -> None:
         "[gateway.context_snapshot] %s",
         json.dumps(
             {
-                "stored": snapshot.get(
-                    "stored"
-                ),
-                "conversation_id": (
-                    conversation_id
-                ),
-                "revision": snapshot.get(
-                    "revision"
-                ),
-                "duplicate": snapshot.get(
-                    "duplicate"
-                ),
-                "included_messages": snapshot.get(
-                    "included_messages"
-                ),
-                "excluded_segments": snapshot.get(
-                    "excluded_segments"
-                ),
-                "total_chars": snapshot.get(
-                    "total_chars"
-                ),
-                "budget_truncated": snapshot.get(
-                    "budget_truncated"
-                ),
+                "stored":
+                    snapshot.get(
+                        "stored"
+                    ),
+                "conversation_id":
+                    conversation_id,
+                "revision":
+                    snapshot.get(
+                        "revision"
+                    ),
+                "duplicate":
+                    snapshot.get(
+                        "duplicate"
+                    ),
+                "included_messages":
+                    snapshot.get(
+                        "included_messages"
+                    ),
+                "excluded_segments":
+                    snapshot.get(
+                        "excluded_segments"
+                    ),
+                "total_chars":
+                    snapshot.get(
+                        "total_chars"
+                    ),
+                "budget_truncated":
+                    snapshot.get(
+                        "budget_truncated"
+                    ),
             },
             ensure_ascii=False,
             separators=(",", ":"),
         ),
     )
 
-
-
-    if (
-        not compact_enabled
-        or not snapshot.get("stored")
+    if not snapshot.get(
+        "stored"
     ):
         return
 
+    if not (
+        compact_enabled
+        or semantic_enabled
+    ):
+        return
+
+    # --------------------------------------------------------
+    # 3. Deterministic Compact
+    # --------------------------------------------------------
     try:
         compact = update_conversation_compact(
             conversation_id
@@ -560,9 +597,10 @@ def _observe_context_shadow(body: bytes) -> None:
         "[gateway.context_compact] %s",
         json.dumps(
             {
-                "stored": compact.get(
-                    "stored"
-                ),
+                "stored":
+                    compact.get(
+                        "stored"
+                    ),
                 "conversation_id":
                     conversation_id,
                 "source_revision":
@@ -600,6 +638,82 @@ def _observe_context_shadow(body: bytes) -> None:
                 "compaction_applied":
                     compact.get(
                         "compaction_applied"
+                    ),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+    )
+
+    if not compact.get(
+        "stored"
+    ):
+        return
+
+    if not semantic_enabled:
+        return
+
+    # --------------------------------------------------------
+    # 4. Conservative Semantic Frame
+    # --------------------------------------------------------
+    try:
+        semantic = update_conversation_semantic(
+            conversation_id
+        )
+    except Exception as exc:
+        logger.warning(
+            "[gateway.context_semantic] "
+            "store_failed=%s fail_open=true",
+            type(exc).__name__,
+        )
+        return
+
+    # No semantic text is logged here.
+    logger.info(
+        "[gateway.context_semantic] %s",
+        json.dumps(
+            {
+                "stored":
+                    semantic.get(
+                        "stored"
+                    ),
+                "conversation_id":
+                    conversation_id,
+                "source_revision":
+                    semantic.get(
+                        "source_revision"
+                    ),
+                "duplicate":
+                    semantic.get(
+                        "duplicate"
+                    ),
+                "source_messages":
+                    semantic.get(
+                        "source_messages"
+                    ),
+                "has_current_task":
+                    semantic.get(
+                        "has_current_task"
+                    ),
+                "decision_count":
+                    semantic.get(
+                        "decision_count"
+                    ),
+                "constraint_count":
+                    semantic.get(
+                        "constraint_count"
+                    ),
+                "open_item_count":
+                    semantic.get(
+                        "open_item_count"
+                    ),
+                "fact_count":
+                    semantic.get(
+                        "fact_count"
+                    ),
+                "facts_deferred":
+                    semantic.get(
+                        "facts_deferred"
                     ),
             },
             ensure_ascii=False,
