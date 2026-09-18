@@ -32,6 +32,9 @@ from ombrebrain.context.conversation_compact import (
 from ombrebrain.context.conversation_semantic import (
     update_conversation_semantic,
 )
+from ombrebrain.context.conversation_semantic_state import (
+    update_semantic_state,
+)
 from ombrebrain.gateway.gateway_runtime import (
     record_cache_usage,
     resolve_upstream_base,
@@ -416,11 +419,18 @@ def _observe_context_shadow(body: bytes) -> None:
         )
     )
 
+    semantic_state_enabled = _truthy(
+        os.environ.get(
+            "OMBRE_GATEWAY_CONTEXT_SEMANTIC_STATE_SHADOW"
+        )
+    )
+
     if not (
         context_log_enabled
         or snapshot_enabled
         or compact_enabled
         or semantic_enabled
+        or semantic_state_enabled
     ):
         return
 
@@ -505,6 +515,7 @@ def _observe_context_shadow(body: bytes) -> None:
         snapshot_enabled
         or compact_enabled
         or semantic_enabled
+        or semantic_state_enabled
     ):
         return
 
@@ -575,6 +586,7 @@ def _observe_context_shadow(body: bytes) -> None:
     if not (
         compact_enabled
         or semantic_enabled
+        or semantic_state_enabled
     ):
         return
 
@@ -650,7 +662,10 @@ def _observe_context_shadow(body: bytes) -> None:
     ):
         return
 
-    if not semantic_enabled:
+    if not (
+        semantic_enabled
+        or semantic_state_enabled
+    ):
         return
 
     # --------------------------------------------------------
@@ -725,6 +740,91 @@ def _observe_context_shadow(body: bytes) -> None:
                     ),
                 "facts_deferred":
                     semantic.get(
+                        "facts_deferred"
+                    ),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+    )
+
+
+    if not semantic.get(
+        "stored"
+    ):
+        return
+
+    if not semantic_state_enabled:
+        return
+
+    # --------------------------------------------------------
+    # 5. Persistent Semantic State
+    # --------------------------------------------------------
+    try:
+        semantic_state = update_semantic_state(
+            conversation_id
+        )
+    except Exception as exc:
+        logger.warning(
+            "[gateway.context_semantic_state] "
+            "store_failed=%s fail_open=true",
+            type(exc).__name__,
+        )
+        return
+
+    # No semantic text is logged.
+    logger.info(
+        "[gateway.context_semantic_state] %s",
+        json.dumps(
+            {
+                "stored":
+                    semantic_state.get(
+                        "stored"
+                    ),
+                "conversation_id":
+                    conversation_id,
+                "revision":
+                    semantic_state.get(
+                        "revision"
+                    ),
+                "source_revision":
+                    semantic_state.get(
+                        "source_revision"
+                    ),
+                "duplicate":
+                    semantic_state.get(
+                        "duplicate"
+                    ),
+                "constraint_count":
+                    semantic_state.get(
+                        "constraint_count"
+                    ),
+                "decision_count":
+                    semantic_state.get(
+                        "decision_count"
+                    ),
+                "open_item_count":
+                    semantic_state.get(
+                        "open_item_count"
+                    ),
+                "history_count":
+                    semantic_state.get(
+                        "history_count"
+                    ),
+                "added_this_revision":
+                    semantic_state.get(
+                        "added_this_revision"
+                    ),
+                "refreshed_this_revision":
+                    semantic_state.get(
+                        "refreshed_this_revision"
+                    ),
+                "archived_this_revision":
+                    semantic_state.get(
+                        "archived_this_revision"
+                    ),
+                "facts_deferred":
+                    semantic_state.get(
                         "facts_deferred"
                     ),
             },
