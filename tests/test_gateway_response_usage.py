@@ -118,6 +118,77 @@ class GatewayResponseUsageTests(
             115,
         )
 
+    def test_message_start_explicit_zero_cache_fields_are_present(self):
+        observer = ResponseUsageObserver(
+            "text/event-stream"
+        )
+
+        stream = (
+            'event: message_start\n'
+            'data: {"type":"message_start",'
+            '"message":{"usage":{'
+            '"input_tokens":0,'
+            '"output_tokens":1,'
+            '"cache_creation_input_tokens":0,'
+            '"cache_read_input_tokens":0}}}\n\n'
+        ).encode()
+
+        observer.feed(stream)
+        result = observer.finish()
+
+        self.assertTrue(
+            result["message_start_seen"]
+        )
+        self.assertTrue(
+            result["message_start_usage_present"]
+        )
+        self.assertTrue(
+            result["message_start_input_present"]
+        )
+        self.assertTrue(
+            result["message_start_output_present"]
+        )
+        self.assertTrue(
+            result["message_start_cache_creation_present"]
+        )
+        self.assertTrue(
+            result["message_start_cache_read_present"]
+        )
+
+        self.assertEqual(
+            result["cache_read_input_tokens"],
+            0,
+        )
+
+    def test_message_start_missing_cache_fields_is_detected(self):
+        observer = ResponseUsageObserver(
+            "text/event-stream"
+        )
+
+        stream = (
+            'event: message_start\n'
+            'data: {"type":"message_start",'
+            '"message":{"usage":{'
+            '"input_tokens":0,'
+            '"output_tokens":1}}}\n\n'
+        ).encode()
+
+        observer.feed(stream)
+        result = observer.finish()
+
+        self.assertTrue(
+            result["message_start_seen"]
+        )
+        self.assertTrue(
+            result["message_start_usage_present"]
+        )
+        self.assertFalse(
+            result["message_start_cache_creation_present"]
+        )
+        self.assertFalse(
+            result["message_start_cache_read_present"]
+        )
+
     def test_json_usage(self):
         observer = ResponseUsageObserver(
             "application/json"

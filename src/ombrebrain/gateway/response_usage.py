@@ -103,6 +103,18 @@ class ResponseUsageObserver:
         self._oversize_lines = 0
         self._json_truncated = False
 
+        # Presence-only diagnostics.
+        # Never stores response text or arbitrary metadata.
+        self._message_start_seen = False
+        self._message_start_usage_present = False
+        self._message_start_input_present = False
+        self._message_start_output_present = False
+        self._message_start_cache_creation_present = False
+        self._message_start_cache_read_present = False
+
+        self._message_delta_seen = False
+        self._message_delta_usage_present = False
+
     def _merge_usage(
         self,
         usage: dict[str, int | float],
@@ -125,9 +137,14 @@ class ResponseUsageObserver:
             return
 
         # Avoid parsing ordinary model text events.
+        # Also inspect message_start/message_delta envelopes
+        # so we can distinguish an explicit zero from a
+        # field that the relay omitted entirely.
         if (
             b'"usage"' not in data
             and b'"cache_' not in data
+            and b'"message_start"' not in data
+            and b'"message_delta"' not in data
         ):
             return
 
@@ -146,7 +163,43 @@ class ResponseUsageObserver:
             else None
         )
 
+        usage_dicts: list[dict[str, Any]] = []
+
+        if isinstance(payload, dict):
+            top_usage = payload.get("usage")
+            if isinstance(top_usage, dict):
+                usage_dicts.append(top_usage)
+
+            message = payload.get("message")
+            if isinstance(message, dict):
+                message_usage = message.get("usage")
+                if isinstance(message_usage, dict):
+                    usage_dicts.append(message_usage)
+
+        if event_type == "message_start":
+            self._message_start_seen = True
+
+            if usage_dicts:
+                self._message_start_usage_present = True
+
+            for usage_dict in usage_dicts:
+                if "input_tokens" in usage_dict:
+                    self._message_start_input_present = True
+
+                if "output_tokens" in usage_dict:
+                    self._message_start_output_present = True
+
+                if "cache_creation_input_tokens" in usage_dict:
+                    self._message_start_cache_creation_present = True
+
+                if "cache_read_input_tokens" in usage_dict:
+                    self._message_start_cache_read_present = True
+
         if event_type == "message_delta":
+            self._message_delta_seen = True
+
+            if usage_dicts:
+                self._message_delta_usage_present = True
             # Streaming contract:
             # input/cache accounting belongs to the
             # request and is already known at
@@ -271,6 +324,36 @@ class ResponseUsageObserver:
         for key in _ALLOWED_USAGE_KEYS:
             if key in self._usage:
                 result[key] = self._usage[key]
+
+        if self._is_sse:
+            result.update(
+                {
+                    "message_start_seen": (
+                        self._message_start_seen
+                    ),
+                    "message_start_usage_present": (
+                        self._message_start_usage_present
+                    ),
+                    "message_start_input_present": (
+                        self._message_start_input_present
+                    ),
+                    "message_start_output_present": (
+                        self._message_start_output_present
+                    ),
+                    "message_start_cache_creation_present": (
+                        self._message_start_cache_creation_present
+                    ),
+                    "message_start_cache_read_present": (
+                        self._message_start_cache_read_present
+                    ),
+                    "message_delta_seen": (
+                        self._message_delta_seen
+                    ),
+                    "message_delta_usage_present": (
+                        self._message_delta_usage_present
+                    ),
+                }
+            )
 
         if self._oversize_lines:
             result["oversize_lines"] = (
