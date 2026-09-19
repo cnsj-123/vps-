@@ -35,6 +35,9 @@ from ombrebrain.context.conversation_semantic import (
 from ombrebrain.context.conversation_semantic_state import (
     update_semantic_state,
 )
+from ombrebrain.context.conversation_trusted_facts import (
+    update_conversation_trusted_facts,
+)
 from ombrebrain.gateway.gateway_runtime import (
     record_cache_usage,
     resolve_upstream_base,
@@ -425,12 +428,19 @@ def _observe_context_shadow(body: bytes) -> None:
         )
     )
 
+    trusted_facts_enabled = _truthy(
+        os.environ.get(
+            "OMBRE_GATEWAY_CONTEXT_TRUSTED_FACTS_SHADOW"
+        )
+    )
+
     if not (
         context_log_enabled
         or snapshot_enabled
         or compact_enabled
         or semantic_enabled
         or semantic_state_enabled
+        or trusted_facts_enabled
     ):
         return
 
@@ -516,6 +526,7 @@ def _observe_context_shadow(body: bytes) -> None:
         or compact_enabled
         or semantic_enabled
         or semantic_state_enabled
+        or trusted_facts_enabled
     ):
         return
 
@@ -587,6 +598,7 @@ def _observe_context_shadow(body: bytes) -> None:
         compact_enabled
         or semantic_enabled
         or semantic_state_enabled
+        or trusted_facts_enabled
     ):
         return
 
@@ -662,6 +674,88 @@ def _observe_context_shadow(body: bytes) -> None:
     ):
         return
 
+    # --------------------------------------------------------
+    # 4. Explicit Trusted Facts
+    # --------------------------------------------------------
+    if trusted_facts_enabled:
+        try:
+            trusted_facts = (
+                update_conversation_trusted_facts(
+                    conversation_id
+                )
+            )
+        except Exception as exc:
+            logger.warning(
+                "[gateway.context_trusted_facts] "
+                "store_failed=%s fail_open=true",
+                type(exc).__name__,
+            )
+        else:
+            # Privacy-safe telemetry only; no fact text.
+            logger.info(
+                "[gateway.context_trusted_facts] %s",
+                json.dumps(
+                    {
+                        "stored":
+                            trusted_facts.get(
+                                "stored"
+                            ),
+                        "conversation_id":
+                            conversation_id,
+                        "revision":
+                            trusted_facts.get(
+                                "revision"
+                            ),
+                        "source_revision":
+                            trusted_facts.get(
+                                "source_revision"
+                            ),
+                        "duplicate":
+                            trusted_facts.get(
+                                "duplicate"
+                            ),
+                        "fact_count":
+                            trusted_facts.get(
+                                "fact_count"
+                            ),
+                        "history_count":
+                            trusted_facts.get(
+                                "history_count"
+                            ),
+                        "commands_this_revision":
+                            trusted_facts.get(
+                                "commands_this_revision"
+                            ),
+                        "added_this_revision":
+                            trusted_facts.get(
+                                "added_this_revision"
+                            ),
+                        "confirmed_this_revision":
+                            trusted_facts.get(
+                                "confirmed_this_revision"
+                            ),
+                        "revoked_this_revision":
+                            trusted_facts.get(
+                                "revoked_this_revision"
+                            ),
+                        "replaced_this_revision":
+                            trusted_facts.get(
+                                "replaced_this_revision"
+                            ),
+                        "unmatched_this_revision":
+                            trusted_facts.get(
+                                "unmatched_this_revision"
+                            ),
+                        "inference_enabled":
+                            trusted_facts.get(
+                                "inference_enabled"
+                            ),
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            )
+
     if not (
         semantic_enabled
         or semantic_state_enabled
@@ -669,7 +763,7 @@ def _observe_context_shadow(body: bytes) -> None:
         return
 
     # --------------------------------------------------------
-    # 4. Conservative Semantic Frame
+    # 5. Conservative Semantic Frame
     # --------------------------------------------------------
     try:
         semantic = update_conversation_semantic(
@@ -758,7 +852,7 @@ def _observe_context_shadow(body: bytes) -> None:
         return
 
     # --------------------------------------------------------
-    # 5. Persistent Semantic State
+    # 6. Persistent Semantic State
     # --------------------------------------------------------
     try:
         semantic_state = update_semantic_state(
