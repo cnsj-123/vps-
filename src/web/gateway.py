@@ -38,6 +38,9 @@ from ombrebrain.context.conversation_semantic_state import (
 from ombrebrain.context.conversation_trusted_facts import (
     update_conversation_trusted_facts,
 )
+from ombrebrain.context.conversation_context_candidate import (
+    update_conversation_context_candidate,
+)
 from ombrebrain.gateway.gateway_runtime import (
     record_cache_usage,
     resolve_upstream_base,
@@ -434,6 +437,12 @@ def _observe_context_shadow(body: bytes) -> None:
         )
     )
 
+    candidate_enabled = _truthy(
+        os.environ.get(
+            "OMBRE_GATEWAY_CONTEXT_CANDIDATE_SHADOW"
+        )
+    )
+
     if not (
         context_log_enabled
         or snapshot_enabled
@@ -441,6 +450,7 @@ def _observe_context_shadow(body: bytes) -> None:
         or semantic_enabled
         or semantic_state_enabled
         or trusted_facts_enabled
+        or candidate_enabled
     ):
         return
 
@@ -527,6 +537,7 @@ def _observe_context_shadow(body: bytes) -> None:
         or semantic_enabled
         or semantic_state_enabled
         or trusted_facts_enabled
+        or candidate_enabled
     ):
         return
 
@@ -599,6 +610,7 @@ def _observe_context_shadow(body: bytes) -> None:
         or semantic_enabled
         or semantic_state_enabled
         or trusted_facts_enabled
+        or candidate_enabled
     ):
         return
 
@@ -677,7 +689,10 @@ def _observe_context_shadow(body: bytes) -> None:
     # --------------------------------------------------------
     # 4. Explicit Trusted Facts
     # --------------------------------------------------------
-    if trusted_facts_enabled:
+    if (
+        trusted_facts_enabled
+        or candidate_enabled
+    ):
         try:
             trusted_facts = (
                 update_conversation_trusted_facts(
@@ -759,6 +774,7 @@ def _observe_context_shadow(body: bytes) -> None:
     if not (
         semantic_enabled
         or semantic_state_enabled
+        or candidate_enabled
     ):
         return
 
@@ -848,7 +864,10 @@ def _observe_context_shadow(body: bytes) -> None:
     ):
         return
 
-    if not semantic_state_enabled:
+    if not (
+        semantic_state_enabled
+        or candidate_enabled
+    ):
         return
 
     # --------------------------------------------------------
@@ -954,6 +973,114 @@ def _observe_context_shadow(body: bytes) -> None:
             separators=(",", ":"),
         ),
     )
+
+    if not semantic_state.get(
+        "stored"
+    ):
+        return
+
+    if not candidate_enabled:
+        return
+
+    # --------------------------------------------------------
+    # 7. Conversation Context Candidate
+    # --------------------------------------------------------
+    try:
+        candidate = (
+            update_conversation_context_candidate(
+                conversation_id
+            )
+        )
+    except Exception as exc:
+        logger.warning(
+            "[gateway.context_candidate] "
+            "store_failed=%s fail_open=true",
+            type(exc).__name__,
+        )
+        return
+
+    # Privacy-safe telemetry only.
+    # Candidate text is never written to gateway logs.
+    logger.info(
+        "[gateway.context_candidate] %s",
+        json.dumps(
+            {
+                "stored":
+                    candidate.get(
+                        "stored"
+                    ),
+                "conversation_id":
+                    conversation_id,
+                "revision":
+                    candidate.get(
+                        "revision"
+                    ),
+                "source_revision":
+                    candidate.get(
+                        "source_revision"
+                    ),
+                "duplicate":
+                    candidate.get(
+                        "duplicate"
+                    ),
+                "estimated_tokens":
+                    candidate.get(
+                        "estimated_tokens"
+                    ),
+                "token_budget":
+                    candidate.get(
+                        "token_budget"
+                    ),
+                "truncated":
+                    candidate.get(
+                        "truncated"
+                    ),
+                "budget_rejected":
+                    candidate.get(
+                        "budget_rejected"
+                    ),
+                "dedup_rejected":
+                    candidate.get(
+                        "dedup_rejected"
+                    ),
+                "control_rejected":
+                    candidate.get(
+                        "control_rejected"
+                    ),
+                "has_current_task":
+                    candidate.get(
+                        "has_current_task"
+                    ),
+                "trusted_fact_count":
+                    candidate.get(
+                        "trusted_fact_count"
+                    ),
+                "constraint_count":
+                    candidate.get(
+                        "constraint_count"
+                    ),
+                "decision_count":
+                    candidate.get(
+                        "decision_count"
+                    ),
+                "open_item_count":
+                    candidate.get(
+                        "open_item_count"
+                    ),
+                "recent_context_count":
+                    candidate.get(
+                        "recent_context_count"
+                    ),
+                "current_user_excluded":
+                    candidate.get(
+                        "current_user_excluded"
+                    ),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+    )
+
 
 
 def register(mcp) -> None:
