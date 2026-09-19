@@ -17,6 +17,111 @@ class ContextService:
         self.builder = ContextPackBuilder(token_budget=token_budget)
         self.retrieval = ContextRetrievalAdapter(bucket_mgr=bucket_mgr, embedding_engine=embedding_engine)
 
+    async def get_candidates(
+        self,
+        query: str = "",
+    ) -> dict[str, Any]:
+        """Return unbudgeted context candidates for unified assembly.
+
+        This reuses the existing State / Plan / Memory retrieval path but
+        deliberately does not apply ContextPackBuilder's token budget.
+        The unified candidate owns the single final budget.
+        """
+        state, state_revision = self.state_service.get()
+
+        buckets = await self.bucket_mgr.list_all(
+            include_archive=False
+        )
+
+        plans = self.builder.select_active_plans(
+            buckets
+        )
+
+        memories: list[dict[str, Any]] = []
+
+        retrieval_candidate_count = 0
+        relevance_rejected = 0
+        anti_echo: dict[str, int] = {}
+        dedup: dict[str, int] = {}
+
+        if query.strip():
+            # EmbeddingEngine may be hot-reloaded after ContextService
+            # initialization. Follow BucketManager's current engine instead
+            # of retaining a stale reference.
+            if hasattr(
+                self.bucket_mgr,
+                "embedding_engine",
+            ):
+                self.retrieval.embedding_engine = (
+                    self.bucket_mgr.embedding_engine
+                )
+
+            memories = await self.retrieval.retrieve(
+                query,
+                max_results=self.builder.max_memories,
+            )
+
+            telemetry = (
+                self.retrieval.last_telemetry
+                or {}
+            )
+
+            retrieval_candidate_count = int(
+                telemetry.get(
+                    "candidate_count",
+                    0,
+                )
+            )
+
+            relevance_rejected = int(
+                telemetry.get(
+                    "relevance_rejected",
+                    0,
+                )
+            )
+
+            anti_echo = {
+                k: int(v)
+                for k, v in telemetry.items()
+                if k.startswith(
+                    "anti_echo_"
+                )
+            }
+
+            dedup = {
+                k: int(v)
+                for k, v in telemetry.items()
+                if k.startswith(
+                    "dedup_"
+                )
+            }
+
+        return {
+            "state":
+                state.to_dict(),
+            "state_revision":
+                state_revision,
+            "plans": [
+                dict(item)
+                for item in plans
+            ],
+            "memories": [
+                dict(item)
+                for item in memories
+                if isinstance(item, dict)
+            ],
+            "telemetry": {
+                "retrieval_candidate_count":
+                    retrieval_candidate_count,
+                "relevance_rejected":
+                    relevance_rejected,
+                "anti_echo":
+                    anti_echo,
+                "dedup":
+                    dedup,
+            },
+        }
+
     async def get_pack(
         self,
         memories: list[Any] | tuple[Any, ...] = (),

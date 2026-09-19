@@ -41,6 +41,9 @@ from ombrebrain.context.conversation_trusted_facts import (
 from ombrebrain.context.conversation_context_candidate import (
     update_conversation_context_candidate,
 )
+from ombrebrain.context.unified_context_candidate import (
+    update_unified_context_candidate_from_runtime,
+)
 from ombrebrain.gateway.gateway_runtime import (
     record_cache_usage,
     resolve_upstream_base,
@@ -443,6 +446,12 @@ def _observe_context_shadow(body: bytes) -> None:
         )
     )
 
+    unified_candidate_enabled = _truthy(
+        os.environ.get(
+            "OMBRE_GATEWAY_CONTEXT_UNIFIED_CANDIDATE_SHADOW"
+        )
+    )
+
     if not (
         context_log_enabled
         or snapshot_enabled
@@ -451,6 +460,7 @@ def _observe_context_shadow(body: bytes) -> None:
         or semantic_state_enabled
         or trusted_facts_enabled
         or candidate_enabled
+        or unified_candidate_enabled
     ):
         return
 
@@ -538,6 +548,7 @@ def _observe_context_shadow(body: bytes) -> None:
         or semantic_state_enabled
         or trusted_facts_enabled
         or candidate_enabled
+        or unified_candidate_enabled
     ):
         return
 
@@ -611,6 +622,7 @@ def _observe_context_shadow(body: bytes) -> None:
         or semantic_state_enabled
         or trusted_facts_enabled
         or candidate_enabled
+        or unified_candidate_enabled
     ):
         return
 
@@ -692,6 +704,7 @@ def _observe_context_shadow(body: bytes) -> None:
     if (
         trusted_facts_enabled
         or candidate_enabled
+        or unified_candidate_enabled
     ):
         try:
             trusted_facts = (
@@ -775,6 +788,7 @@ def _observe_context_shadow(body: bytes) -> None:
         semantic_enabled
         or semantic_state_enabled
         or candidate_enabled
+        or unified_candidate_enabled
     ):
         return
 
@@ -867,6 +881,7 @@ def _observe_context_shadow(body: bytes) -> None:
     if not (
         semantic_state_enabled
         or candidate_enabled
+        or unified_candidate_enabled
     ):
         return
 
@@ -979,8 +994,11 @@ def _observe_context_shadow(body: bytes) -> None:
     ):
         return
 
-    if not candidate_enabled:
-        return
+    if not (
+        candidate_enabled
+        or unified_candidate_enabled
+    ):
+        return conversation_id
 
     # --------------------------------------------------------
     # 7. Conversation Context Candidate
@@ -1082,6 +1100,136 @@ def _observe_context_shadow(body: bytes) -> None:
     )
 
 
+    if not candidate.get(
+        "stored"
+    ):
+        return None
+
+    return conversation_id
+
+
+async def _observe_unified_context_shadow(
+    conversation_id: str | None,
+) -> None:
+
+    if not _truthy(
+        os.environ.get(
+            "OMBRE_GATEWAY_CONTEXT_UNIFIED_CANDIDATE_SHADOW"
+        )
+    ):
+        return
+
+    if not isinstance(
+        conversation_id,
+        str,
+    ):
+        return
+
+    try:
+        unified = await (
+            update_unified_context_candidate_from_runtime(
+                conversation_id
+            )
+        )
+    except Exception as exc:
+        logger.warning(
+            "[gateway.context_unified_candidate] "
+            "store_failed=%s fail_open=true",
+            type(exc).__name__,
+        )
+        return
+
+    # Privacy-safe telemetry only.
+    # No query, plan, memory, fact or conversation text is logged.
+    logger.info(
+        "[gateway.context_unified_candidate] %s",
+        json.dumps(
+            {
+                "stored":
+                    unified.get(
+                        "stored"
+                    ),
+                "conversation_id":
+                    conversation_id,
+                "revision":
+                    unified.get(
+                        "revision"
+                    ),
+                "duplicate":
+                    unified.get(
+                        "duplicate"
+                    ),
+                "estimated_tokens":
+                    unified.get(
+                        "estimated_tokens"
+                    ),
+                "token_budget":
+                    unified.get(
+                        "token_budget"
+                    ),
+                "truncated":
+                    unified.get(
+                        "truncated"
+                    ),
+                "budget_rejected":
+                    unified.get(
+                        "budget_rejected"
+                    ),
+                "dedup_rejected":
+                    unified.get(
+                        "dedup_rejected"
+                    ),
+                "has_current_task":
+                    unified.get(
+                        "has_current_task"
+                    ),
+                "trusted_fact_count":
+                    unified.get(
+                        "trusted_fact_count"
+                    ),
+                "constraint_count":
+                    unified.get(
+                        "constraint_count"
+                    ),
+                "decision_count":
+                    unified.get(
+                        "decision_count"
+                    ),
+                "open_item_count":
+                    unified.get(
+                        "open_item_count"
+                    ),
+                "state_included":
+                    unified.get(
+                        "state_included"
+                    ),
+                "plan_count":
+                    unified.get(
+                        "plan_count"
+                    ),
+                "memory_count":
+                    unified.get(
+                        "memory_count"
+                    ),
+                "recent_context_count":
+                    unified.get(
+                        "recent_context_count"
+                    ),
+                "current_user_excluded":
+                    unified.get(
+                        "current_user_excluded"
+                    ),
+                "retrieval_query_used":
+                    unified.get(
+                        "retrieval_query_used"
+                    ),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+    )
+
+
 
 def register(mcp) -> None:
 
@@ -1127,8 +1275,14 @@ def register(mcp) -> None:
         # Phase 4A-1: observation-only conversation continuity.
         # Important: observe the cache-stabilized body so the stable
         # boundary used for continuity matches what is actually sent upstream.
-        _observe_context_shadow(
-            forward_body
+        context_conversation_id = (
+            _observe_context_shadow(
+                forward_body
+            )
+        )
+
+        await _observe_unified_context_shadow(
+            context_conversation_id
         )
 
         if _truthy(

@@ -60,6 +60,9 @@ from import_memory import ImportEngine
 from migrate_engine import MigrateEngine
 from ombrebrain.state import StateStore, StateService
 from ombrebrain.context import ContextService
+from ombrebrain.context.unified_context_candidate import (
+    bind_context_service,
+)
 from ombrebrain.context.wake import WakeContextBuilder
 from utils import get_version, load_config, setup_logging
 
@@ -235,6 +238,7 @@ state_store = StateStore(config.get("buckets_dir", "buckets"))
 state_store.initialize()
 state_service = StateService(state_store)
 context_service = ContextService(state_service=state_service, bucket_mgr=bucket_mgr, embedding_engine=embedding_engine, token_budget=1000)
+bind_context_service(context_service)
 deletion_requests = DeletionRequestStore(
     config["buckets_dir"], bucket_mgr, embedding_engine
 )
