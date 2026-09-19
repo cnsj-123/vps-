@@ -396,11 +396,10 @@ def _safe_source(
     if revision > compact_revision:
         return None, True, False
 
-    return (
-        payload,
-        False,
-        revision < compact_revision,
-    )
+    if revision < compact_revision:
+        return None, False, True
+
+    return payload, False, False
 
 
 def build_context_candidate(

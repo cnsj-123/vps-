@@ -602,6 +602,105 @@ class ContextCandidateTests(
             ]
         )
 
+    def test_stale_sources_are_not_used(
+        self,
+    ):
+        c = compact(
+            11,
+            [
+                message(
+                    "user",
+                    "继续",
+                    95,
+                )
+            ],
+        )
+
+        s = semantic(
+            10,
+            task={
+                "text":
+                    "陈旧任务",
+                "source_index":
+                    90,
+            },
+            constraints=[
+                {
+                    "id":
+                        "stale_constraint",
+                    "status":
+                        "active",
+                    "text":
+                        "陈旧约束",
+                    "last_source_index":
+                        90,
+                }
+            ],
+        )
+
+        f = facts(
+            10,
+            [
+                {
+                    "id":
+                        "stale_fact",
+                    "status":
+                        "active",
+                    "text":
+                        "陈旧事实",
+                    "last_source_index":
+                        90,
+                }
+            ],
+        )
+
+        result = build_context_candidate(
+            conversation_id=CID,
+            compact=c,
+            semantic_state=s,
+            trusted_facts=f,
+        )
+
+        sections = result[
+            "sections"
+        ]
+
+        self.assertIsNone(
+            sections[
+                "current_task"
+            ]
+        )
+
+        self.assertEqual(
+            sections[
+                "constraints"
+            ],
+            [],
+        )
+
+        self.assertEqual(
+            sections[
+                "trusted_facts"
+            ],
+            [],
+        )
+
+        telemetry = result[
+            "telemetry"
+        ]
+
+        self.assertTrue(
+            telemetry[
+                "semantic_source_stale"
+            ]
+        )
+
+        self.assertTrue(
+            telemetry[
+                "trusted_facts_source_stale"
+            ]
+        )
+
     def test_update_is_idempotent(
         self,
     ):
