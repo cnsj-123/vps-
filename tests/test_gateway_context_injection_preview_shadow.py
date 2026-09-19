@@ -15,7 +15,7 @@ _GATEWAY_PATH = (
 )
 
 _SPEC = importlib.util.spec_from_file_location(
-    "gateway_unified_candidate_test_target",
+    "gateway_injection_preview_test_target",
     _GATEWAY_PATH,
 )
 
@@ -39,53 +39,56 @@ _SPEC.loader.exec_module(
 CID = "ctx_0123456789abcdef"
 
 
-class GatewayUnifiedCandidateTests(
+class GatewayInjectionPreviewTests(
     unittest.IsolatedAsyncioTestCase
 ):
 
-    async def test_unified_observer_runs_when_enabled(
+    async def test_preview_runs_when_enabled(
         self,
     ):
-        env = {
-            "OMBRE_GATEWAY_CONTEXT_UNIFIED_CANDIDATE_SHADOW":
-                "1",
-            "OMBRE_GATEWAY_CONTEXT_INJECTION_PREVIEW_SHADOW":
-                "0",
-        }
+        unified = AsyncMock(
+            return_value={
+                "stored": True,
+                "revision": 5,
+            }
+        )
 
-        updater = AsyncMock(
+        preview = unittest.mock.Mock(
             return_value={
                 "stored": True,
                 "duplicate": False,
                 "revision": 1,
-                "estimated_tokens": 100,
-                "token_budget": 1200,
-                "truncated": False,
-                "budget_rejected": 0,
-                "dedup_rejected": 0,
-                "has_current_task": False,
-                "trusted_fact_count": 0,
-                "constraint_count": 1,
-                "decision_count": 0,
-                "open_item_count": 0,
-                "state_included": True,
-                "plan_count": 1,
-                "memory_count": 2,
-                "recent_context_count": 3,
-                "current_user_excluded": True,
-                "retrieval_query_used": True,
+                "source_revision": 5,
+                "eligible": True,
+                "reason": None,
+                "estimated_tokens": 120,
+                "token_budget": 1000,
+                "section_names": [
+                    "memories",
+                ],
+                "render_sha256":
+                    "abc123",
             }
         )
 
         with patch.dict(
             os.environ,
-            env,
+            {
+                "OMBRE_GATEWAY_CONTEXT_UNIFIED_CANDIDATE_SHADOW":
+                    "0",
+                "OMBRE_GATEWAY_CONTEXT_INJECTION_PREVIEW_SHADOW":
+                    "1",
+            },
             clear=False,
         ):
             with patch.object(
                 gateway,
                 "update_unified_context_candidate_from_runtime",
-                updater,
+                unified,
+            ), patch.object(
+                gateway,
+                "update_context_injection_preview",
+                preview,
             ):
                 await (
                     gateway._observe_unified_context_shadow(
@@ -93,20 +96,31 @@ class GatewayUnifiedCandidateTests(
                     )
                 )
 
-        updater.assert_awaited_once_with(
+        unified.assert_awaited_once_with(
             CID
         )
 
-    async def test_disabled_does_not_run(
+        preview.assert_called_once_with(
+            CID
+        )
+
+    async def test_preview_disabled_does_not_run(
         self,
     ):
-        updater = AsyncMock()
+        unified = AsyncMock(
+            return_value={
+                "stored": True,
+                "revision": 5,
+            }
+        )
+
+        preview = unittest.mock.Mock()
 
         with patch.dict(
             os.environ,
             {
                 "OMBRE_GATEWAY_CONTEXT_UNIFIED_CANDIDATE_SHADOW":
-                    "0",
+                    "1",
                 "OMBRE_GATEWAY_CONTEXT_INJECTION_PREVIEW_SHADOW":
                     "0",
             },
@@ -115,7 +129,11 @@ class GatewayUnifiedCandidateTests(
             with patch.object(
                 gateway,
                 "update_unified_context_candidate_from_runtime",
-                updater,
+                unified,
+            ), patch.object(
+                gateway,
+                "update_context_injection_preview",
+                preview,
             ):
                 await (
                     gateway._observe_unified_context_shadow(
@@ -123,14 +141,21 @@ class GatewayUnifiedCandidateTests(
                     )
                 )
 
-        updater.assert_not_awaited()
+        preview.assert_not_called()
 
-    async def test_failure_is_fail_open(
+    async def test_preview_failure_is_fail_open(
         self,
     ):
-        updater = AsyncMock(
+        unified = AsyncMock(
+            return_value={
+                "stored": True,
+                "revision": 5,
+            }
+        )
+
+        preview = unittest.mock.Mock(
             side_effect=RuntimeError(
-                "synthetic failure"
+                "synthetic preview failure"
             )
         )
 
@@ -139,14 +164,21 @@ class GatewayUnifiedCandidateTests(
             {
                 "OMBRE_GATEWAY_CONTEXT_UNIFIED_CANDIDATE_SHADOW":
                     "1",
+                "OMBRE_GATEWAY_CONTEXT_INJECTION_PREVIEW_SHADOW":
+                    "1",
             },
             clear=False,
         ):
             with patch.object(
                 gateway,
                 "update_unified_context_candidate_from_runtime",
-                updater,
+                unified,
+            ), patch.object(
+                gateway,
+                "update_context_injection_preview",
+                preview,
             ):
+                # Must not propagate.
                 await (
                     gateway._observe_unified_context_shadow(
                         CID

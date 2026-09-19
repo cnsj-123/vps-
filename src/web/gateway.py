@@ -44,6 +44,9 @@ from ombrebrain.context.conversation_context_candidate import (
 from ombrebrain.context.unified_context_candidate import (
     update_unified_context_candidate_from_runtime,
 )
+from ombrebrain.context.context_injection_preview import (
+    update_context_injection_preview,
+)
 from ombrebrain.gateway.gateway_runtime import (
     record_cache_usage,
     resolve_upstream_base,
@@ -452,6 +455,12 @@ def _observe_context_shadow(body: bytes) -> None:
         )
     )
 
+    injection_preview_enabled = _truthy(
+        os.environ.get(
+            "OMBRE_GATEWAY_CONTEXT_INJECTION_PREVIEW_SHADOW"
+        )
+    )
+
     if not (
         context_log_enabled
         or snapshot_enabled
@@ -461,6 +470,7 @@ def _observe_context_shadow(body: bytes) -> None:
         or trusted_facts_enabled
         or candidate_enabled
         or unified_candidate_enabled
+        or injection_preview_enabled
     ):
         return
 
@@ -549,6 +559,7 @@ def _observe_context_shadow(body: bytes) -> None:
         or trusted_facts_enabled
         or candidate_enabled
         or unified_candidate_enabled
+        or injection_preview_enabled
     ):
         return
 
@@ -623,6 +634,7 @@ def _observe_context_shadow(body: bytes) -> None:
         or trusted_facts_enabled
         or candidate_enabled
         or unified_candidate_enabled
+        or injection_preview_enabled
     ):
         return
 
@@ -705,6 +717,7 @@ def _observe_context_shadow(body: bytes) -> None:
         trusted_facts_enabled
         or candidate_enabled
         or unified_candidate_enabled
+        or injection_preview_enabled
     ):
         try:
             trusted_facts = (
@@ -789,6 +802,7 @@ def _observe_context_shadow(body: bytes) -> None:
         or semantic_state_enabled
         or candidate_enabled
         or unified_candidate_enabled
+        or injection_preview_enabled
     ):
         return
 
@@ -882,6 +896,7 @@ def _observe_context_shadow(body: bytes) -> None:
         semantic_state_enabled
         or candidate_enabled
         or unified_candidate_enabled
+        or injection_preview_enabled
     ):
         return
 
@@ -997,6 +1012,7 @@ def _observe_context_shadow(body: bytes) -> None:
     if not (
         candidate_enabled
         or unified_candidate_enabled
+        or injection_preview_enabled
     ):
         return conversation_id
 
@@ -1112,10 +1128,21 @@ async def _observe_unified_context_shadow(
     conversation_id: str | None,
 ) -> None:
 
-    if not _truthy(
+    unified_enabled = _truthy(
         os.environ.get(
             "OMBRE_GATEWAY_CONTEXT_UNIFIED_CANDIDATE_SHADOW"
         )
+    )
+
+    preview_enabled = _truthy(
+        os.environ.get(
+            "OMBRE_GATEWAY_CONTEXT_INJECTION_PREVIEW_SHADOW"
+        )
+    )
+
+    if not (
+        unified_enabled
+        or preview_enabled
     ):
         return
 
@@ -1250,6 +1277,83 @@ async def _observe_unified_context_shadow(
                 "retrieval_metrics":
                     unified.get(
                         "retrieval_metrics"
+                    ),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+    )
+
+
+    if not preview_enabled:
+        return
+
+    if not unified.get(
+        "stored"
+    ):
+        return
+
+    try:
+        preview = (
+            update_context_injection_preview(
+                conversation_id
+            )
+        )
+    except Exception as exc:
+        logger.warning(
+            "[gateway.context_injection_preview] "
+            "store_failed=%s fail_open=true",
+            type(exc).__name__,
+        )
+        return
+
+    # Privacy-safe summary only.
+    # Never log preview["rendered"] or any candidate text.
+    logger.info(
+        "[gateway.context_injection_preview] %s",
+        json.dumps(
+            {
+                "stored":
+                    preview.get(
+                        "stored"
+                    ),
+                "conversation_id":
+                    conversation_id,
+                "revision":
+                    preview.get(
+                        "revision"
+                    ),
+                "source_revision":
+                    preview.get(
+                        "source_revision"
+                    ),
+                "duplicate":
+                    preview.get(
+                        "duplicate"
+                    ),
+                "eligible":
+                    preview.get(
+                        "eligible"
+                    ),
+                "reason":
+                    preview.get(
+                        "reason"
+                    ),
+                "estimated_tokens":
+                    preview.get(
+                        "estimated_tokens"
+                    ),
+                "token_budget":
+                    preview.get(
+                        "token_budget"
+                    ),
+                "section_names":
+                    preview.get(
+                        "section_names"
+                    ),
+                "render_sha256":
+                    preview.get(
+                        "render_sha256"
                     ),
             },
             ensure_ascii=False,
