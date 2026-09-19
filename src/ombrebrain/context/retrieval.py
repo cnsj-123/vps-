@@ -9,6 +9,9 @@ from ombrebrain.context.anti_echo import (
 from ombrebrain.context.dedup import (
     ShadowDedupObserver,
 )
+from ombrebrain.context.retrieval_decision_shadow import (
+    RetrievalDecisionShadowObserver,
+)
 
 
 _SEMANTIC_RECALL_FLOOR = 0.55
@@ -27,6 +30,9 @@ class ContextRetrievalAdapter:
     dedup_observer: ShadowDedupObserver = (
         ShadowDedupObserver()
     )
+    decision_shadow_observer: (
+        RetrievalDecisionShadowObserver
+    ) = RetrievalDecisionShadowObserver()
 
     async def _semantic_scores(
         self,
@@ -153,6 +159,12 @@ class ContextRetrievalAdapter:
 
         dedup = (
             self.dedup_observer.observe(
+                included
+            )
+        )
+
+        decision_shadow = (
+            self.decision_shadow_observer.observe(
                 included
             )
         )
@@ -289,6 +301,11 @@ class ContextRetrievalAdapter:
                 dedup.exact_text_duplicates,
             "dedup_unique":
                 dedup.unique,
+
+            # Hypothetical future filter decisions only.
+            # Retrieval results above are NOT changed.
+            "decision_shadow":
+                decision_shadow.to_dict(),
         }
 
     async def retrieve(

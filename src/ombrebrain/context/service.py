@@ -61,6 +61,28 @@ class ContextService:
                 ),
             "filter_mode":
                 "observe_only",
+            "decision_shadow": {
+                "mode":
+                    "observe_only",
+                "policy":
+                    "conservative.v1",
+                "input_count":
+                    0,
+                "would_keep":
+                    0,
+                "would_drop_total":
+                    0,
+                "would_drop_recent_24h":
+                    0,
+                "would_drop_duplicate_id":
+                    0,
+                "would_drop_exact_text_duplicate":
+                    0,
+                "would_keep_recent_24_72h":
+                    0,
+                "would_keep_missing_last_active":
+                    0,
+            },
             "outcome": "empty_query",
         }
         anti_echo: dict[str, int] = {}
@@ -171,6 +193,13 @@ class ContextService:
                             "filter_mode",
                             "observe_only",
                         )
+                    ),
+                "decision_shadow":
+                    dict(
+                        telemetry.get(
+                            "decision_shadow"
+                        )
+                        or {}
                     ),
                 "outcome":
                     str(
