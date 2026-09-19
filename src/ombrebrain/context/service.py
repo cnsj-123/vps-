@@ -48,10 +48,19 @@ class ContextService:
             "processed_candidate_count": 0,
             "included_count": 0,
             "max_semantic_score": None,
+            "semantic_recall_floor": 0.55,
+            "min_context_relevance": None,
+            "max_context_relevance": None,
+            "context_relevance_threshold":
+                float(
+                    self.retrieval.relevance_threshold
+                ),
             "relevance_threshold":
                 float(
                     self.retrieval.relevance_threshold
                 ),
+            "filter_mode":
+                "observe_only",
             "outcome": "empty_query",
         }
         anti_echo: dict[str, int] = {}
@@ -133,10 +142,35 @@ class ContextService:
                     telemetry.get(
                         "max_semantic_score"
                     ),
+                "semantic_recall_floor":
+                    telemetry.get(
+                        "semantic_recall_floor",
+                        0.55,
+                    ),
+                "min_context_relevance":
+                    telemetry.get(
+                        "min_context_relevance"
+                    ),
+                "max_context_relevance":
+                    telemetry.get(
+                        "max_context_relevance"
+                    ),
+                "context_relevance_threshold":
+                    telemetry.get(
+                        "context_relevance_threshold",
+                        self.retrieval.relevance_threshold,
+                    ),
                 "relevance_threshold":
                     telemetry.get(
                         "relevance_threshold",
                         self.retrieval.relevance_threshold,
+                    ),
+                "filter_mode":
+                    str(
+                        telemetry.get(
+                            "filter_mode",
+                            "observe_only",
+                        )
                     ),
                 "outcome":
                     str(

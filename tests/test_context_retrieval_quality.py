@@ -142,6 +142,41 @@ class ContextRetrievalQualityTests(
             0.9,
         )
 
+        self.assertEqual(
+            t["semantic_recall_floor"],
+            0.55,
+        )
+
+        self.assertEqual(
+            t[
+                "context_relevance_threshold"
+            ],
+            0.65,
+        )
+
+        self.assertGreaterEqual(
+            t[
+                "min_context_relevance"
+            ],
+            t[
+                "context_relevance_threshold"
+            ],
+        )
+
+        self.assertGreaterEqual(
+            t[
+                "max_context_relevance"
+            ],
+            t[
+                "min_context_relevance"
+            ],
+        )
+
+        self.assertEqual(
+            t["filter_mode"],
+            "observe_only",
+        )
+
     async def test_no_search_matches_is_distinguished(
         self,
     ):
@@ -298,6 +333,80 @@ class ContextRetrievalQualityTests(
                 "outcome"
             ],
             "below_relevance_threshold",
+        )
+
+
+    async def test_semantic_floor_maps_to_context_threshold(
+        self,
+    ):
+        bucket_mgr = AsyncMock()
+
+        bucket_mgr.search.return_value = [
+            {
+                "id": "edge",
+                "content": "edge memory",
+                "metadata": {},
+            }
+        ]
+
+        adapter = ContextRetrievalAdapter(
+            bucket_mgr=bucket_mgr,
+            embedding_engine=
+                FakeEngine(
+                    [
+                        (
+                            "edge",
+                            0.5528,
+                        )
+                    ]
+                ),
+        )
+
+        result = await adapter.retrieve(
+            "query"
+        )
+
+        self.assertEqual(
+            len(result),
+            1,
+        )
+
+        t = adapter.last_telemetry
+
+        self.assertEqual(
+            t["max_semantic_score"],
+            0.5528,
+        )
+
+        self.assertEqual(
+            t[
+                "semantic_recall_floor"
+            ],
+            0.55,
+        )
+
+        self.assertEqual(
+            t[
+                "context_relevance_threshold"
+            ],
+            0.65,
+        )
+
+        self.assertGreaterEqual(
+            t[
+                "min_context_relevance"
+            ],
+            0.65,
+        )
+
+        self.assertEqual(
+            t["outcome"],
+            "included",
+        )
+
+        self.assertEqual(
+            t["filter_mode"],
+            "observe_only",
         )
 
 

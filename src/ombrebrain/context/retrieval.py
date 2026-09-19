@@ -11,6 +11,9 @@ from ombrebrain.context.dedup import (
 )
 
 
+_SEMANTIC_RECALL_FLOOR = 0.55
+
+
 @dataclass
 class ContextRetrievalAdapter:
     bucket_mgr: Any
@@ -99,7 +102,9 @@ class ContextRetrievalAdapter:
         if semantic is None:
             return 0.0
 
-        recall_floor = 0.55
+        recall_floor = (
+            _SEMANTIC_RECALL_FLOOR
+        )
 
         if semantic < recall_floor:
             return 0.0
@@ -152,6 +157,43 @@ class ContextRetrievalAdapter:
             )
         )
 
+        context_relevances = [
+            float(
+                item[
+                    "context_relevance"
+                ]
+            )
+            for item in included
+            if isinstance(
+                item,
+                dict,
+            )
+            and isinstance(
+                item.get(
+                    "context_relevance"
+                ),
+                (int, float),
+            )
+            and not isinstance(
+                item.get(
+                    "context_relevance"
+                ),
+                bool,
+            )
+        ]
+
+        min_context_relevance = (
+            min(context_relevances)
+            if context_relevances
+            else None
+        )
+
+        max_context_relevance = (
+            max(context_relevances)
+            if context_relevances
+            else None
+        )
+
         self.last_telemetry = {
             # Retrieval pipeline.
             "embedding_enabled":
@@ -179,10 +221,50 @@ class ContextRetrievalAdapter:
                     is not None
                     else None
                 ),
+
+            # Calibration:
+            # raw semantic score is first mapped through
+            # _context_relevance(), then compared against
+            # relevance_threshold. These values make that
+            # distinction explicit without changing behavior.
+            "semantic_recall_floor":
+                _SEMANTIC_RECALL_FLOOR,
+            "min_context_relevance":
+                (
+                    round(
+                        min_context_relevance,
+                        4,
+                    )
+                    if min_context_relevance
+                    is not None
+                    else None
+                ),
+            "max_context_relevance":
+                (
+                    round(
+                        max_context_relevance,
+                        4,
+                    )
+                    if max_context_relevance
+                    is not None
+                    else None
+                ),
+            "context_relevance_threshold":
+                float(
+                    self.relevance_threshold
+                ),
+
+            # Backward-compatible telemetry key.
             "relevance_threshold":
                 float(
                     self.relevance_threshold
                 ),
+
+            # Explicitly documents that anti-echo/dedup
+            # are still observers and never filters.
+            "filter_mode":
+                "observe_only",
+
             "outcome":
                 outcome,
 
