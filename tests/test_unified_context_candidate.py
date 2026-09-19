@@ -570,6 +570,22 @@ class UnifiedContextCandidateTests(
             second["revision"],
         )
 
+        # Duplicate fast-path must preserve privacy-safe telemetry.
+        self.assertEqual(
+            second["token_budget"],
+            first["token_budget"],
+        )
+
+        self.assertEqual(
+            second["memory_count"],
+            first["memory_count"],
+        )
+
+        self.assertEqual(
+            second["current_user_excluded"],
+            first["current_user_excluded"],
+        )
+
     def test_status_does_not_expose_text(
         self,
     ):

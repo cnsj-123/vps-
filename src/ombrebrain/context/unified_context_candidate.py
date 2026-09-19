@@ -1142,6 +1142,13 @@ def build_unified_context_candidate(
                     "relevance_rejected",
                     0,
                 ),
+            "retrieval_quality":
+                dict(
+                    source_telemetry.get(
+                        "retrieval_quality"
+                    )
+                    or {}
+                ),
             "anti_echo":
                 dict(
                     source_telemetry.get(
@@ -1263,6 +1270,87 @@ def update_unified_context_candidate(
                     telemetry.get(
                         "truncated"
                     ),
+                "budget_rejected":
+                    telemetry.get(
+                        "budget_rejected"
+                    ),
+                "dedup_rejected":
+                    telemetry.get(
+                        "dedup_rejected"
+                    ),
+                "excluded_text_rejected":
+                    telemetry.get(
+                        "excluded_text_rejected"
+                    ),
+                "has_current_task":
+                    telemetry.get(
+                        "has_current_task"
+                    ),
+                "trusted_fact_count":
+                    telemetry.get(
+                        "trusted_fact_count"
+                    ),
+                "constraint_count":
+                    telemetry.get(
+                        "constraint_count"
+                    ),
+                "decision_count":
+                    telemetry.get(
+                        "decision_count"
+                    ),
+                "open_item_count":
+                    telemetry.get(
+                        "open_item_count"
+                    ),
+                "state_included":
+                    telemetry.get(
+                        "state_included"
+                    ),
+                "plan_count":
+                    telemetry.get(
+                        "plan_count"
+                    ),
+                "memory_count":
+                    telemetry.get(
+                        "memory_count"
+                    ),
+                "recent_context_count":
+                    telemetry.get(
+                        "recent_context_count"
+                    ),
+                "current_user_excluded":
+                    telemetry.get(
+                        "current_user_excluded"
+                    ),
+                "retrieval_candidate_count":
+                    telemetry.get(
+                        "retrieval_candidate_count"
+                    ),
+                "relevance_rejected":
+                    telemetry.get(
+                        "relevance_rejected"
+                    ),
+                "retrieval_quality":
+                    dict(
+                        telemetry.get(
+                            "retrieval_quality"
+                        )
+                        or {}
+                    ),
+                "anti_echo":
+                    dict(
+                        telemetry.get(
+                            "anti_echo"
+                        )
+                        or {}
+                    ),
+                "retrieval_dedup":
+                    dict(
+                        telemetry.get(
+                            "retrieval_dedup"
+                        )
+                        or {}
+                    ),
             }
 
         previous_revision = 0
@@ -1379,6 +1467,35 @@ def update_unified_context_candidate(
         "current_user_excluded":
             telemetry.get(
                 "current_user_excluded"
+            ),
+        "retrieval_candidate_count":
+            telemetry.get(
+                "retrieval_candidate_count"
+            ),
+        "relevance_rejected":
+            telemetry.get(
+                "relevance_rejected"
+            ),
+        "retrieval_quality":
+            dict(
+                telemetry.get(
+                    "retrieval_quality"
+                )
+                or {}
+            ),
+        "anti_echo":
+            dict(
+                telemetry.get(
+                    "anti_echo"
+                )
+                or {}
+            ),
+        "retrieval_dedup":
+            dict(
+                telemetry.get(
+                    "retrieval_dedup"
+                )
+                or {}
             ),
     }
 

@@ -41,6 +41,19 @@ class ContextService:
 
         retrieval_candidate_count = 0
         relevance_rejected = 0
+        retrieval_quality: dict[str, Any] = {
+            "embedding_enabled": False,
+            "semantic_score_count": 0,
+            "raw_match_count": 0,
+            "processed_candidate_count": 0,
+            "included_count": 0,
+            "max_semantic_score": None,
+            "relevance_threshold":
+                float(
+                    self.retrieval.relevance_threshold
+                ),
+            "outcome": "empty_query",
+        }
         anti_echo: dict[str, int] = {}
         dedup: dict[str, int] = {}
 
@@ -80,6 +93,60 @@ class ContextService:
                 )
             )
 
+            retrieval_quality = {
+                "embedding_enabled":
+                    bool(
+                        telemetry.get(
+                            "embedding_enabled",
+                            False,
+                        )
+                    ),
+                "semantic_score_count":
+                    int(
+                        telemetry.get(
+                            "semantic_score_count",
+                            0,
+                        )
+                    ),
+                "raw_match_count":
+                    int(
+                        telemetry.get(
+                            "raw_match_count",
+                            0,
+                        )
+                    ),
+                "processed_candidate_count":
+                    int(
+                        telemetry.get(
+                            "processed_candidate_count",
+                            retrieval_candidate_count,
+                        )
+                    ),
+                "included_count":
+                    int(
+                        telemetry.get(
+                            "included_count",
+                            len(memories),
+                        )
+                    ),
+                "max_semantic_score":
+                    telemetry.get(
+                        "max_semantic_score"
+                    ),
+                "relevance_threshold":
+                    telemetry.get(
+                        "relevance_threshold",
+                        self.retrieval.relevance_threshold,
+                    ),
+                "outcome":
+                    str(
+                        telemetry.get(
+                            "outcome",
+                            "unknown",
+                        )
+                    ),
+            }
+
             anti_echo = {
                 k: int(v)
                 for k, v in telemetry.items()
@@ -115,6 +182,8 @@ class ContextService:
                     retrieval_candidate_count,
                 "relevance_rejected":
                     relevance_rejected,
+                "retrieval_quality":
+                    retrieval_quality,
                 "anti_echo":
                     anti_echo,
                 "dedup":

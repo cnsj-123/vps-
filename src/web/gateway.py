@@ -1227,6 +1227,26 @@ async def _observe_unified_context_shadow(
                     unified.get(
                         "retrieval_query_used"
                     ),
+                "retrieval_candidate_count":
+                    unified.get(
+                        "retrieval_candidate_count"
+                    ),
+                "relevance_rejected":
+                    unified.get(
+                        "relevance_rejected"
+                    ),
+                "retrieval_quality":
+                    unified.get(
+                        "retrieval_quality"
+                    ),
+                "anti_echo":
+                    unified.get(
+                        "anti_echo"
+                    ),
+                "retrieval_dedup":
+                    unified.get(
+                        "retrieval_dedup"
+                    ),
             },
             ensure_ascii=False,
             separators=(",", ":"),
