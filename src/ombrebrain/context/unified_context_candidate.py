@@ -9,6 +9,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from ombrebrain.context.retrieval_shadow_metrics import (
+    record_retrieval_shadow_metrics,
+)
+
 
 _VERSION = "unified-context-candidate.v1"
 
@@ -191,6 +195,54 @@ async def update_unified_context_candidate_from_runtime(
     result["retrieval_query_used"] = bool(
         query
     )
+
+    # Privacy-safe rolling metrics only.
+    # This is observation-only and must never affect retrieval,
+    # Unified candidate assembly or upstream forwarding.
+    try:
+        source_telemetry = (
+            context_candidates.get(
+                "telemetry"
+            )
+            if isinstance(
+                context_candidates,
+                dict,
+            )
+            else {}
+        )
+
+        metrics = (
+            record_retrieval_shadow_metrics(
+                conversation_id=
+                    conversation_id,
+                revision=
+                    result.get(
+                        "revision"
+                    ),
+                telemetry=(
+                    source_telemetry
+                    if isinstance(
+                        source_telemetry,
+                        dict,
+                    )
+                    else {}
+                ),
+                retrieval_query_used=
+                    bool(query),
+            )
+        )
+
+    except Exception:
+        # Metrics must remain fail-open.
+        metrics = {
+            "stored": False,
+            "reason":
+                "metrics_store_failed",
+        }
+
+    result[
+        "retrieval_metrics"
+    ] = metrics
 
     return result
 

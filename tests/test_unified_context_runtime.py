@@ -197,6 +197,30 @@ class UnifiedRuntimeTests(
             output,
         )
 
+        self.assertTrue(
+            result[
+                "retrieval_metrics"
+            ][
+                "stored"
+            ]
+        )
+
+        metrics_output = (
+            Path(self.temp.name)
+            / "retrieval_shadow_metrics.json"
+        )
+
+        self.assertTrue(
+            metrics_output.is_file()
+        )
+
+        self.assertNotIn(
+            query,
+            metrics_output.read_text(
+                encoding="utf-8"
+            ),
+        )
+
     async def test_stale_compact_query_is_not_used(
         self,
     ):

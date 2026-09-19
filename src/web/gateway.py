@@ -1247,6 +1247,10 @@ async def _observe_unified_context_shadow(
                     unified.get(
                         "retrieval_dedup"
                     ),
+                "retrieval_metrics":
+                    unified.get(
+                        "retrieval_metrics"
+                    ),
             },
             ensure_ascii=False,
             separators=(",", ":"),
