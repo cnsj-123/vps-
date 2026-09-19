@@ -51,6 +51,8 @@ class GatewayUnifiedCandidateTests(
                 "1",
             "OMBRE_GATEWAY_CONTEXT_INJECTION_PREVIEW_SHADOW":
                 "0",
+            "OMBRE_GATEWAY_CONTEXT_INJECTION_GATE_SHADOW":
+                "0",
         }
 
         updater = AsyncMock(
@@ -108,6 +110,8 @@ class GatewayUnifiedCandidateTests(
                 "OMBRE_GATEWAY_CONTEXT_UNIFIED_CANDIDATE_SHADOW":
                     "0",
                 "OMBRE_GATEWAY_CONTEXT_INJECTION_PREVIEW_SHADOW":
+                    "0",
+                "OMBRE_GATEWAY_CONTEXT_INJECTION_GATE_SHADOW":
                     "0",
             },
             clear=False,

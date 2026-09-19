@@ -47,6 +47,9 @@ from ombrebrain.context.unified_context_candidate import (
 from ombrebrain.context.context_injection_preview import (
     update_context_injection_preview,
 )
+from ombrebrain.context.context_injection_gate import (
+    update_context_injection_gate,
+)
 from ombrebrain.gateway.gateway_runtime import (
     record_cache_usage,
     resolve_upstream_base,
@@ -461,6 +464,12 @@ def _observe_context_shadow(body: bytes) -> None:
         )
     )
 
+    injection_gate_enabled = _truthy(
+        os.environ.get(
+            "OMBRE_GATEWAY_CONTEXT_INJECTION_GATE_SHADOW"
+        )
+    )
+
     if not (
         context_log_enabled
         or snapshot_enabled
@@ -471,6 +480,7 @@ def _observe_context_shadow(body: bytes) -> None:
         or candidate_enabled
         or unified_candidate_enabled
         or injection_preview_enabled
+        or injection_gate_enabled
     ):
         return
 
@@ -560,6 +570,7 @@ def _observe_context_shadow(body: bytes) -> None:
         or candidate_enabled
         or unified_candidate_enabled
         or injection_preview_enabled
+        or injection_gate_enabled
     ):
         return
 
@@ -635,6 +646,7 @@ def _observe_context_shadow(body: bytes) -> None:
         or candidate_enabled
         or unified_candidate_enabled
         or injection_preview_enabled
+        or injection_gate_enabled
     ):
         return
 
@@ -718,6 +730,7 @@ def _observe_context_shadow(body: bytes) -> None:
         or candidate_enabled
         or unified_candidate_enabled
         or injection_preview_enabled
+        or injection_gate_enabled
     ):
         try:
             trusted_facts = (
@@ -803,6 +816,7 @@ def _observe_context_shadow(body: bytes) -> None:
         or candidate_enabled
         or unified_candidate_enabled
         or injection_preview_enabled
+        or injection_gate_enabled
     ):
         return
 
@@ -897,6 +911,7 @@ def _observe_context_shadow(body: bytes) -> None:
         or candidate_enabled
         or unified_candidate_enabled
         or injection_preview_enabled
+        or injection_gate_enabled
     ):
         return
 
@@ -1013,6 +1028,7 @@ def _observe_context_shadow(body: bytes) -> None:
         candidate_enabled
         or unified_candidate_enabled
         or injection_preview_enabled
+        or injection_gate_enabled
     ):
         return conversation_id
 
@@ -1140,9 +1156,16 @@ async def _observe_unified_context_shadow(
         )
     )
 
+    gate_enabled = _truthy(
+        os.environ.get(
+            "OMBRE_GATEWAY_CONTEXT_INJECTION_GATE_SHADOW"
+        )
+    )
+
     if not (
         unified_enabled
         or preview_enabled
+        or gate_enabled
     ):
         return
 
@@ -1285,7 +1308,10 @@ async def _observe_unified_context_shadow(
     )
 
 
-    if not preview_enabled:
+    if not (
+        preview_enabled
+        or gate_enabled
+    ):
         return
 
     if not unified.get(
@@ -1353,6 +1379,103 @@ async def _observe_unified_context_shadow(
                     ),
                 "render_sha256":
                     preview.get(
+                        "render_sha256"
+                    ),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+    )
+
+
+    if not gate_enabled:
+        return
+
+    if not preview.get(
+        "stored"
+    ):
+        return
+
+    try:
+        gate = (
+            update_context_injection_gate(
+                conversation_id
+            )
+        )
+    except Exception as exc:
+        logger.warning(
+            "[gateway.context_injection_gate] "
+            "store_failed=%s fail_open=true",
+            type(exc).__name__,
+        )
+        return
+
+    # Privacy-safe decision summary only.
+    # Never log rendered Preview or candidate text.
+    logger.info(
+        "[gateway.context_injection_gate] %s",
+        json.dumps(
+            {
+                "stored":
+                    gate.get(
+                        "stored"
+                    ),
+                "conversation_id":
+                    conversation_id,
+                "revision":
+                    gate.get(
+                        "revision"
+                    ),
+                "duplicate":
+                    gate.get(
+                        "duplicate"
+                    ),
+                "mode":
+                    gate.get(
+                        "mode"
+                    ),
+                "decision":
+                    gate.get(
+                        "decision"
+                    ),
+                "allowed":
+                    gate.get(
+                        "allowed"
+                    ),
+                "reason":
+                    gate.get(
+                        "reason"
+                    ),
+                "reasons":
+                    gate.get(
+                        "reasons"
+                    ),
+                "source_candidate_revision":
+                    gate.get(
+                        "source_candidate_revision"
+                    ),
+                "source_unified_revision":
+                    gate.get(
+                        "source_unified_revision"
+                    ),
+                "source_preview_revision":
+                    gate.get(
+                        "source_preview_revision"
+                    ),
+                "estimated_tokens":
+                    gate.get(
+                        "estimated_tokens"
+                    ),
+                "token_budget":
+                    gate.get(
+                        "token_budget"
+                    ),
+                "section_names":
+                    gate.get(
+                        "section_names"
+                    ),
+                "render_sha256":
+                    gate.get(
                         "render_sha256"
                     ),
             },

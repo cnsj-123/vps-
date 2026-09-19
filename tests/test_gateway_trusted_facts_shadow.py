@@ -63,6 +63,10 @@ class GatewayTrustedFactsShadowTests(
                 "0",
             "OMBRE_GATEWAY_CONTEXT_UNIFIED_CANDIDATE_SHADOW":
                 "0",
+            "OMBRE_GATEWAY_CONTEXT_INJECTION_PREVIEW_SHADOW":
+                "0",
+            "OMBRE_GATEWAY_CONTEXT_INJECTION_GATE_SHADOW":
+                "0",
         }
 
         with patch.dict(
@@ -149,6 +153,10 @@ class GatewayTrustedFactsShadowTests(
             "OMBRE_GATEWAY_CONTEXT_CANDIDATE_SHADOW":
                 "0",
             "OMBRE_GATEWAY_CONTEXT_UNIFIED_CANDIDATE_SHADOW":
+                "0",
+            "OMBRE_GATEWAY_CONTEXT_INJECTION_PREVIEW_SHADOW":
+                "0",
+            "OMBRE_GATEWAY_CONTEXT_INJECTION_GATE_SHADOW":
                 "0",
         }
 

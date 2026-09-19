@@ -66,6 +66,8 @@ class GatewayContextCandidateTests(
                 "0",
             "OMBRE_GATEWAY_CONTEXT_INJECTION_PREVIEW_SHADOW":
                 "0",
+            "OMBRE_GATEWAY_CONTEXT_INJECTION_GATE_SHADOW":
+                "0",
         }
 
     def test_candidate_drives_full_dependency_chain(
