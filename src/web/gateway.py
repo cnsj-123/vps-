@@ -1179,6 +1179,10 @@ async def _observe_unified_context_shadow(
                     unified.get(
                         "dedup_rejected"
                     ),
+                "excluded_text_rejected":
+                    unified.get(
+                        "excluded_text_rejected"
+                    ),
                 "has_current_task":
                     unified.get(
                         "has_current_task"

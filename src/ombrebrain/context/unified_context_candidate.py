@@ -181,6 +181,11 @@ async def update_unified_context_candidate_from_runtime(
             conversation_id,
         context_candidates=
             context_candidates,
+        excluded_texts=(
+            (query,)
+            if query
+            else ()
+        ),
     )
 
     result["retrieval_query_used"] = bool(
@@ -545,6 +550,7 @@ def build_unified_context_candidate(
     conversation_candidate: dict[str, Any],
     context_candidates: dict[str, Any],
     token_budget: int = _DEFAULT_TOKEN_BUDGET,
+    excluded_texts: tuple[str, ...] | list[str] = (),
 ) -> dict[str, Any]:
 
     _validate_conversation_id(
@@ -623,6 +629,20 @@ def build_unified_context_candidate(
     }
 
     seen = set()
+    excluded_keys = set()
+
+    for excluded in excluded_texts:
+        if (
+            isinstance(excluded, str)
+            and excluded.strip()
+        ):
+            key = _normalize_key(
+                excluded
+            )
+            seen.add(key)
+            excluded_keys.add(key)
+
+    excluded_text_rejected = 0
 
     sections = {
         "current_task": None,
@@ -644,6 +664,7 @@ def build_unified_context_candidate(
         nonlocal used_tokens
         nonlocal budget_rejected
         nonlocal dedup_rejected
+        nonlocal excluded_text_rejected
 
         key = None
 
@@ -660,6 +681,10 @@ def build_unified_context_candidate(
 
             if key in seen:
                 dedup_rejected += 1
+
+                if key in excluded_keys:
+                    excluded_text_rejected += 1
+
                 return False
 
         cost = _estimate_tokens(
@@ -1044,6 +1069,8 @@ def build_unified_context_candidate(
                 budget_rejected,
             "dedup_rejected":
                 dedup_rejected,
+            "excluded_text_rejected":
+                excluded_text_rejected,
             "section_tokens":
                 section_tokens,
             "section_budget_rejected":
@@ -1137,6 +1164,7 @@ def update_unified_context_candidate(
     *,
     conversation_id: str,
     context_candidates: dict[str, Any],
+    excluded_texts: tuple[str, ...] | list[str] = (),
 ) -> dict[str, Any]:
 
     candidate_path = _path(
@@ -1173,6 +1201,8 @@ def update_unified_context_candidate(
                     conversation_candidate,
                 context_candidates=
                     context_candidates,
+                excluded_texts=
+                    excluded_texts,
             )
         )
 
@@ -1182,6 +1212,8 @@ def update_unified_context_candidate(
                     conversation_candidate,
                 "context_candidates":
                     context_candidates,
+                "excluded_texts":
+                    list(excluded_texts),
             }
         )
 
@@ -1303,6 +1335,10 @@ def update_unified_context_candidate(
         "dedup_rejected":
             telemetry.get(
                 "dedup_rejected"
+            ),
+        "excluded_text_rejected":
+            telemetry.get(
+                "excluded_text_rejected"
             ),
         "has_current_task":
             telemetry.get(

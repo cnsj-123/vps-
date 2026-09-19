@@ -144,7 +144,16 @@ class UnifiedRuntimeTests(
             "state": {},
             "state_revision": 1,
             "plans": [],
-            "memories": [],
+            "memories": [
+                {
+                    "id":
+                        "echo_memory",
+                    "content":
+                        query,
+                    "context_relevance":
+                        1.0,
+                }
+            ],
             "telemetry": {},
         }
 
@@ -166,6 +175,13 @@ class UnifiedRuntimeTests(
             result[
                 "retrieval_query_used"
             ]
+        )
+
+        self.assertGreaterEqual(
+            result[
+                "excluded_text_rejected"
+            ],
+            1,
         )
 
         output = (
