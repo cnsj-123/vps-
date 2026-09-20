@@ -67,6 +67,8 @@ class GatewayTrustedFactsShadowTests(
                 "0",
             "OMBRE_GATEWAY_CONTEXT_INJECTION_GATE_SHADOW":
                 "0",
+            "OMBRE_GATEWAY_CONTEXT_REQUEST_MUTATION_SHADOW":
+                "0",
         }
 
         with patch.dict(
@@ -157,6 +159,8 @@ class GatewayTrustedFactsShadowTests(
             "OMBRE_GATEWAY_CONTEXT_INJECTION_PREVIEW_SHADOW":
                 "0",
             "OMBRE_GATEWAY_CONTEXT_INJECTION_GATE_SHADOW":
+                "0",
+            "OMBRE_GATEWAY_CONTEXT_REQUEST_MUTATION_SHADOW":
                 "0",
         }
 

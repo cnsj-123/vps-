@@ -50,6 +50,9 @@ from ombrebrain.context.context_injection_preview import (
 from ombrebrain.context.context_injection_gate import (
     update_context_injection_gate,
 )
+from ombrebrain.context.context_request_mutation_shadow import (
+    build_context_request_mutation_shadow_from_runtime,
+)
 from ombrebrain.gateway.gateway_runtime import (
     record_cache_usage,
     resolve_upstream_base,
@@ -470,6 +473,12 @@ def _observe_context_shadow(body: bytes) -> None:
         )
     )
 
+    request_mutation_shadow_enabled = _truthy(
+        os.environ.get(
+            "OMBRE_GATEWAY_CONTEXT_REQUEST_MUTATION_SHADOW"
+        )
+    )
+
     if not (
         context_log_enabled
         or snapshot_enabled
@@ -481,6 +490,7 @@ def _observe_context_shadow(body: bytes) -> None:
         or unified_candidate_enabled
         or injection_preview_enabled
         or injection_gate_enabled
+        or request_mutation_shadow_enabled
     ):
         return
 
@@ -571,6 +581,7 @@ def _observe_context_shadow(body: bytes) -> None:
         or unified_candidate_enabled
         or injection_preview_enabled
         or injection_gate_enabled
+        or request_mutation_shadow_enabled
     ):
         return
 
@@ -647,6 +658,7 @@ def _observe_context_shadow(body: bytes) -> None:
         or unified_candidate_enabled
         or injection_preview_enabled
         or injection_gate_enabled
+        or request_mutation_shadow_enabled
     ):
         return
 
@@ -731,6 +743,7 @@ def _observe_context_shadow(body: bytes) -> None:
         or unified_candidate_enabled
         or injection_preview_enabled
         or injection_gate_enabled
+        or request_mutation_shadow_enabled
     ):
         try:
             trusted_facts = (
@@ -817,6 +830,7 @@ def _observe_context_shadow(body: bytes) -> None:
         or unified_candidate_enabled
         or injection_preview_enabled
         or injection_gate_enabled
+        or request_mutation_shadow_enabled
     ):
         return
 
@@ -912,6 +926,7 @@ def _observe_context_shadow(body: bytes) -> None:
         or unified_candidate_enabled
         or injection_preview_enabled
         or injection_gate_enabled
+        or request_mutation_shadow_enabled
     ):
         return
 
@@ -1029,6 +1044,7 @@ def _observe_context_shadow(body: bytes) -> None:
         or unified_candidate_enabled
         or injection_preview_enabled
         or injection_gate_enabled
+        or request_mutation_shadow_enabled
     ):
         return conversation_id
 
@@ -1162,10 +1178,17 @@ async def _observe_unified_context_shadow(
         )
     )
 
+    mutation_enabled = _truthy(
+        os.environ.get(
+            "OMBRE_GATEWAY_CONTEXT_REQUEST_MUTATION_SHADOW"
+        )
+    )
+
     if not (
         unified_enabled
         or preview_enabled
         or gate_enabled
+        or mutation_enabled
     ):
         return
 
@@ -1311,6 +1334,7 @@ async def _observe_unified_context_shadow(
     if not (
         preview_enabled
         or gate_enabled
+        or mutation_enabled
     ):
         return
 
@@ -1388,7 +1412,10 @@ async def _observe_unified_context_shadow(
     )
 
 
-    if not gate_enabled:
+    if not (
+        gate_enabled
+        or mutation_enabled
+    ):
         return
 
     if not preview.get(
@@ -1486,6 +1513,65 @@ async def _observe_unified_context_shadow(
 
 
 
+def _observe_context_request_mutation_shadow(
+    conversation_id: str | None,
+    forward_body: bytes,
+) -> None:
+    """Build a hypothetical injected request without sending it."""
+
+    if not _truthy(
+        os.environ.get(
+            "OMBRE_GATEWAY_CONTEXT_REQUEST_MUTATION_SHADOW"
+        )
+    ):
+        return
+
+    if not isinstance(
+        conversation_id,
+        str,
+    ):
+        return
+
+    if not isinstance(
+        forward_body,
+        bytes,
+    ):
+        return
+
+    try:
+        _mutated_body, report = (
+            build_context_request_mutation_shadow_from_runtime(
+                forward_body,
+                conversation_id=
+                    conversation_id,
+            )
+        )
+    except Exception as exc:
+        logger.warning(
+            "[gateway.context_request_mutation_shadow] "
+            "build_failed=%s fail_open=true",
+            type(exc).__name__,
+        )
+        return
+
+    # IMPORTANT:
+    # _mutated_body is intentionally discarded here.
+    # The actual upstream request continues to use forward_body.
+    logger.info(
+        "[gateway.context_request_mutation_shadow] %s",
+        json.dumps(
+            {
+                "conversation_id":
+                    conversation_id,
+                **report,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+    )
+
+
+
 def register(mcp) -> None:
 
     @mcp.custom_route(
@@ -1538,6 +1624,11 @@ def register(mcp) -> None:
 
         await _observe_unified_context_shadow(
             context_conversation_id
+        )
+
+        _observe_context_request_mutation_shadow(
+            context_conversation_id,
+            forward_body,
         )
 
         if _truthy(
