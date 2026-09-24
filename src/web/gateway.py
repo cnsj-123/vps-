@@ -53,6 +53,9 @@ from ombrebrain.context.context_injection_gate import (
 from ombrebrain.context.context_request_mutation_shadow import (
     build_context_request_mutation_shadow_from_runtime,
 )
+from ombrebrain.context.context_real_injection import (
+    select_context_injected_body,
+)
 from ombrebrain.gateway.gateway_runtime import (
     record_cache_usage,
     resolve_upstream_base,
@@ -1572,6 +1575,112 @@ def _observe_context_request_mutation_shadow(
 
 
 
+def _select_context_real_injection(
+    conversation_id: str | None,
+    forward_body: bytes,
+) -> bytes:
+    """Phase 4A-3D limited real injection.
+
+    Returns the body that may be sent upstream.
+
+    This is the only place where a Context-injected body can replace
+    the cache-stabilized forward_body.
+
+    Default-OFF contract:
+      - without OMBRE_GATEWAY_CONTEXT_REAL_INJECTION=1 the selector is
+        not even called and the exact forward_body is returned;
+      - the selector itself re-checks the master flag, the Preview,
+        the Gate and the mutation invariants;
+      - any exception, deny or invalid report returns the exact
+        forward_body;
+      - the request is never blocked and no HTTP error is produced;
+      - only privacy-safe telemetry is logged.
+    """
+
+    if not _truthy(
+        os.environ.get(
+            "OMBRE_GATEWAY_CONTEXT_REAL_INJECTION"
+        )
+    ):
+        return forward_body
+
+    if (
+        not isinstance(
+            conversation_id,
+            str,
+        )
+        or not isinstance(
+            forward_body,
+            bytes,
+        )
+    ):
+        return forward_body
+
+    try:
+        selected_body, report = (
+            select_context_injected_body(
+                forward_body,
+                conversation_id=
+                    conversation_id,
+            )
+        )
+    except Exception as exc:
+        logger.warning(
+            "[gateway.context_real_injection] "
+            "select_failed=%s fail_open=true",
+            type(exc).__name__,
+        )
+        return forward_body
+
+    if (
+        not isinstance(
+            selected_body,
+            bytes,
+        )
+        or not isinstance(
+            report,
+            dict,
+        )
+    ):
+        logger.warning(
+            "[gateway.context_real_injection] "
+            "invalid_selection fail_open=true"
+        )
+        return forward_body
+
+    if (
+        report.get("applied")
+        is not True
+        and selected_body
+        != forward_body
+    ):
+        # Safety net: the body must never change without an
+        # explicit applied=true decision.
+        logger.warning(
+            "[gateway.context_real_injection] "
+            "unapplied_body_change fail_open=true"
+        )
+        return forward_body
+
+    # Privacy-safe telemetry only.
+    # No rendered Context, memory, fact or user text is logged.
+    logger.info(
+        "[gateway.context_real_injection] %s",
+        json.dumps(
+            {
+                "conversation_id":
+                    conversation_id,
+                **report,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+    )
+
+    return selected_body
+
+
+
 def register(mcp) -> None:
 
     @mcp.custom_route(
@@ -1631,6 +1740,17 @@ def register(mcp) -> None:
             forward_body,
         )
 
+        # Phase 4A-3D limited real injection (default-OFF).
+        # Only the already cache-stabilized forward_body may be
+        # selected from. When the master flag is OFF, or on any
+        # deny / exception, selected_body IS forward_body.
+        selected_body = (
+            _select_context_real_injection(
+                context_conversation_id,
+                forward_body,
+            )
+        )
+
         if _truthy(
             os.environ.get(
                 "OMBRE_GATEWAY_CACHE_FINGERPRINT_OBSERVE"
@@ -1677,7 +1797,7 @@ def register(mcp) -> None:
                 method=request.method,
                 url=url,
                 headers=headers,
-                content=forward_body,
+                content=selected_body,
             )
             upstream_response = await client.send(upstream_request, stream=True)
         except Exception as exc:

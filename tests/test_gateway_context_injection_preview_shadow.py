@@ -82,6 +82,8 @@ class GatewayInjectionPreviewTests(
                     "0",
                 "OMBRE_GATEWAY_CONTEXT_REQUEST_MUTATION_SHADOW":
                     "0",
+                "OMBRE_GATEWAY_CONTEXT_REAL_INJECTION":
+                    "0",
             },
             clear=False,
         ):
@@ -131,6 +133,8 @@ class GatewayInjectionPreviewTests(
                     "0",
                 "OMBRE_GATEWAY_CONTEXT_REQUEST_MUTATION_SHADOW":
                     "0",
+                "OMBRE_GATEWAY_CONTEXT_REAL_INJECTION":
+                    "0",
             },
             clear=False,
         ):
@@ -177,6 +181,8 @@ class GatewayInjectionPreviewTests(
                 "OMBRE_GATEWAY_CONTEXT_INJECTION_GATE_SHADOW":
                     "0",
                 "OMBRE_GATEWAY_CONTEXT_REQUEST_MUTATION_SHADOW":
+                    "0",
+                "OMBRE_GATEWAY_CONTEXT_REAL_INJECTION":
                     "0",
             },
             clear=False,
