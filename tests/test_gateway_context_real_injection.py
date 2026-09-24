@@ -2301,6 +2301,449 @@ class GatewayRealInjectionRequestTests(
             body,
         )
 
+    # --------------------------------------------------
+    # call ordering
+    # --------------------------------------------------
+
+    async def test_call_order_is_refresh_then_mutation_then_selector(
+        self,
+    ):
+        # Conversation -> Unified -> Preview -> Gate -> freshness
+        # -> Mutation Shadow -> Real Injection.
+        order = []
+
+        mocks = self._mock_chain()
+
+        async def unified_impl(
+            conversation_id,
+        ):
+            order.append("unified")
+
+            return {
+                "stored": True,
+                "revision": 1,
+            }
+
+        def preview_impl(
+            conversation_id,
+        ):
+            order.append("preview")
+
+            return {
+                "stored": True,
+                "revision": 1,
+            }
+
+        def gate_impl(
+            conversation_id,
+        ):
+            order.append("gate")
+
+            return {
+                "stored": True,
+                "revision": 1,
+                "decision": "allow_shadow",
+            }
+
+        mocks["unified"].side_effect = (
+            unified_impl
+        )
+
+        mocks["preview"].side_effect = (
+            preview_impl
+        )
+
+        mocks["gate"].side_effect = (
+            gate_impl
+        )
+
+        self._patch_chain(
+            mocks
+        )
+
+        body = body_from(
+            base_payload()
+        )
+
+        def mutation_impl(
+            conversation_id,
+            forward_body,
+        ):
+            order.append(
+                "mutation_shadow"
+            )
+
+        def selector_impl(
+            conversation_id,
+            forward_body,
+            *,
+            context_chain_fresh,
+        ):
+            order.append(
+                "real_selector"
+            )
+
+            self.assertIs(
+                context_chain_fresh,
+                True,
+            )
+
+            return forward_body
+
+        with patch.object(
+            gateway,
+            "_observe_context_shadow",
+            Mock(return_value=CID),
+        ), patch.object(
+            gateway,
+            "_observe_context_request_mutation_shadow",
+            Mock(side_effect=mutation_impl),
+        ), patch.object(
+            gateway,
+            "_select_context_real_injection",
+            Mock(side_effect=selector_impl),
+        ):
+            response, client = (
+                await self._call_gateway(
+                    body,
+                    environ=self._env(
+                        real_injection="1"
+                    ),
+                )
+            )
+
+        self.assertEqual(
+            response.status_code,
+            200,
+        )
+
+        self.assertEqual(
+            order,
+            [
+                "unified",
+                "preview",
+                "gate",
+                "mutation_shadow",
+                "real_selector",
+            ],
+        )
+
+        # The mutation shadow must never run before the refresh.
+        self.assertLess(
+            order.index("gate"),
+            order.index(
+                "mutation_shadow"
+            ),
+        )
+
+        self.assertEqual(
+            client.built[0].content,
+            body,
+        )
+
+    # --------------------------------------------------
+    # mutation shadow must not read a stale chain
+    # --------------------------------------------------
+
+    async def test_preview_failure_skips_mutation_shadow(
+        self,
+    ):
+        # A valid old Preview/Gate pair is on disk, but this request
+        # failed to refresh the Preview.
+        self._write_state()
+
+        mocks = self._mock_chain()
+
+        mocks["preview"].side_effect = (
+            RuntimeError(
+                "synthetic preview failure"
+            )
+        )
+
+        self._patch_chain(
+            mocks
+        )
+
+        body = body_from(
+            base_payload()
+        )
+
+        observer = Mock()
+        selector = Mock()
+
+        with patch.object(
+            gateway,
+            "_observe_context_request_mutation_shadow",
+            observer,
+        ), patch.object(
+            gateway,
+            "select_context_injected_body",
+            selector,
+        ):
+            response, client = (
+                await self._call_gateway(
+                    body,
+                    environ=self._env(
+                        real_injection="1"
+                    ),
+                )
+            )
+
+        self.assertEqual(
+            response.status_code,
+            200,
+        )
+
+        observer.assert_not_called()
+
+        selector.assert_not_called()
+
+        self.assertEqual(
+            client.built[0].content,
+            body,
+        )
+
+    async def test_gate_failure_skips_mutation_shadow(
+        self,
+    ):
+        self._write_state()
+
+        mocks = self._mock_chain()
+
+        mocks["gate"].side_effect = (
+            RuntimeError(
+                "synthetic gate failure"
+            )
+        )
+
+        self._patch_chain(
+            mocks
+        )
+
+        body = body_from(
+            base_payload()
+        )
+
+        observer = Mock()
+        selector = Mock()
+
+        with patch.object(
+            gateway,
+            "_observe_context_request_mutation_shadow",
+            observer,
+        ), patch.object(
+            gateway,
+            "select_context_injected_body",
+            selector,
+        ):
+            response, client = (
+                await self._call_gateway(
+                    body,
+                    environ=self._env(
+                        real_injection="1"
+                    ),
+                )
+            )
+
+        self.assertEqual(
+            response.status_code,
+            200,
+        )
+
+        observer.assert_not_called()
+
+        selector.assert_not_called()
+
+        self.assertEqual(
+            client.built[0].content,
+            body,
+        )
+
+    async def test_mutation_shadow_only_does_not_real_inject(
+        self,
+    ):
+        # Mutation Shadow ON / Real Injection OFF: the chain is
+        # refreshed and the observer runs, but nothing is injected.
+        self._write_state()
+
+        mocks = self._mock_chain()
+
+        self._patch_chain(
+            mocks
+        )
+
+        body = body_from(
+            base_payload()
+        )
+
+        builder = Mock(
+            return_value=(
+                body,
+                {
+                    "version":
+                        "context-request-mutation-shadow.v1",
+                    "mode":
+                        "shadow_only",
+                    "built": True,
+                    "safe_to_mutate":
+                        True,
+                    "would_inject":
+                        True,
+                    "upstream_mutated":
+                        False,
+                    "reason":
+                        "shadow_mutation_safe",
+                },
+            )
+        )
+
+        selector = Mock(
+            side_effect=AssertionError(
+                "real selector must not run"
+            )
+        )
+
+        environ = self._env(
+            real_injection="0"
+        )
+
+        environ[
+            "OMBRE_GATEWAY_CONTEXT_REQUEST_MUTATION_SHADOW"
+        ] = "1"
+
+        with patch.object(
+            gateway,
+            "build_context_request_mutation_shadow_from_runtime",
+            builder,
+        ), patch.object(
+            gateway,
+            "select_context_injected_body",
+            selector,
+        ):
+            response, client = (
+                await self._call_gateway(
+                    body,
+                    environ=environ,
+                )
+            )
+
+        self.assertEqual(
+            response.status_code,
+            200,
+        )
+
+        # Chain refreshed by the mutation shadow flag alone.
+        for key in (
+            "unified",
+            "preview",
+            "gate",
+        ):
+            self.assertTrue(
+                mocks[key].called,
+                key,
+            )
+
+        # The observer built the shadow mutation...
+        builder.assert_called_once_with(
+            body,
+            conversation_id=CID,
+        )
+
+        # ...but real injection stayed off.
+        selector.assert_not_called()
+
+        self.assertEqual(
+            client.built[0].content,
+            body,
+        )
+
+    async def test_real_injection_alone_skips_mutation_observer(
+        self,
+    ):
+        # Real Injection ON / Mutation Shadow OFF: the chain is
+        # refreshed, the observer does not build anything, and the
+        # real selector still runs.
+        self._write_state()
+
+        mocks = self._mock_chain()
+
+        self._patch_chain(
+            mocks
+        )
+
+        body = body_from(
+            base_payload()
+        )
+
+        observer_builder = Mock(
+            side_effect=AssertionError(
+                "mutation shadow must not build "
+                "when its flag is off"
+            )
+        )
+
+        environ = self._env(
+            real_injection="1"
+        )
+
+        environ[
+            "OMBRE_GATEWAY_CONTEXT_REQUEST_MUTATION_SHADOW"
+        ] = "0"
+
+        with patch.object(
+            gateway,
+            "build_context_request_mutation_shadow_from_runtime",
+            observer_builder,
+        ):
+            response, client = (
+                await self._call_gateway(
+                    body,
+                    environ=environ,
+                )
+            )
+
+        self.assertEqual(
+            response.status_code,
+            200,
+        )
+
+        for key in (
+            "unified",
+            "preview",
+            "gate",
+        ):
+            self.assertTrue(
+                mocks[key].called,
+                key,
+            )
+
+        # The observer did not build a shadow mutation.
+        observer_builder.assert_not_called()
+
+        # The real selector did run and injected.
+        sent = client.built[0].content
+
+        self.assertNotEqual(
+            sent,
+            body,
+        )
+
+        blocks = json.loads(
+            sent
+        )["messages"][-1]["content"]
+
+        self.assertEqual(
+            blocks[0],
+            {
+                "type":
+                    "text",
+                "text":
+                    preview()[
+                        "rendered"
+                    ],
+            },
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

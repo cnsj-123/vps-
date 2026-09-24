@@ -1842,11 +1842,6 @@ def register(mcp) -> None:
             )
         )
 
-        _observe_context_request_mutation_shadow(
-            context_conversation_id,
-            forward_body,
-        )
-
         # Phase 4A-3D limited real injection (default-OFF).
         # Only the already cache-stabilized forward_body may be
         # selected from. When the master flag is OFF, or on any
@@ -1854,11 +1849,22 @@ def register(mcp) -> None:
         #
         # context_chain_fresh is a per-request latch: real injection
         # may only use Preview/Gate refreshed by THIS request.
+        #
+        # Ordering matters: Conversation -> Unified -> Preview -> Gate
+        # -> freshness -> Mutation Shadow -> Real Injection. The
+        # Mutation Shadow observer must never read Preview/Gate left
+        # on disk by an earlier request.
         context_chain_fresh = (
             await _observe_unified_context_shadow(
                 context_conversation_id
             )
         )
+
+        if context_chain_fresh is True:
+            _observe_context_request_mutation_shadow(
+                context_conversation_id,
+                forward_body,
+            )
 
         selected_body = (
             _select_context_real_injection(
