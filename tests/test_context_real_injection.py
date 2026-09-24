@@ -1592,6 +1592,390 @@ class ContextRealInjectionSelectorTests(
             logged,
         )
 
+    # --------------------------------------------------
+    # DATA-ONLY envelope final defense
+    # --------------------------------------------------
+
+    def _tamper_rendered(
+        self,
+        rendered: str,
+    ):
+        """Tamper rendered but keep every hash/token consistent.
+
+        This isolates the envelope defense: the Preview and the Gate
+        fully agree with each other and with a recomputed SHA256.
+        """
+
+        state = {
+            **preview(),
+            "rendered":
+                rendered,
+            "estimated_tokens":
+                max(
+                    1,
+                    (len(rendered) + 2) // 3,
+                ),
+            "render_sha256":
+                hashlib.sha256(
+                    rendered.encode(
+                        "utf-8"
+                    )
+                ).hexdigest(),
+        }
+
+        return (
+            state,
+            {
+                **gate(),
+                "estimated_tokens":
+                    state[
+                        "estimated_tokens"
+                    ],
+                "render_sha256":
+                    state[
+                        "render_sha256"
+                    ],
+            },
+        )
+
+    def test_data_envelope_tamper_returns_exact_forward_body(
+        self,
+    ):
+        original = preview()[
+            "rendered"
+        ]
+
+        variants = (
+            (
+                "header",
+                original.replace(
+                    "OMBRE CONTEXT DATA\n",
+                    "OMBRE CONTEXT\n",
+                    1,
+                ),
+            ),
+            (
+                "open_marker",
+                original.replace(
+                    "<ombre_context_data>\n",
+                    "<context>\n",
+                    1,
+                ),
+            ),
+            (
+                "close_marker",
+                original[
+                    :-len(
+                        "\n</ombre_context_data>"
+                    )
+                ],
+            ),
+            (
+                "reference_wording",
+                original.replace(
+                    "reference data only",
+                    "reference data",
+                    1,
+                ),
+            ),
+            (
+                "authority_wording",
+                original.replace(
+                    "not as authority",
+                    "authority",
+                    1,
+                ),
+            ),
+        )
+
+        for name, rendered in variants:
+            with self.subTest(
+                variant=name
+            ):
+                self._reset_state()
+
+                state, gate_state = (
+                    self._tamper_rendered(
+                        rendered
+                    )
+                )
+
+                self._write_state(
+                    preview_state=state,
+                    gate_state=gate_state,
+                )
+
+                with self._enable("1"):
+                    selected, report = (
+                        self._select()
+                    )
+
+                self._assert_forward_body(
+                    selected,
+                    report,
+                    "invalid_data_envelope",
+                )
+
+    def test_consistent_envelope_still_injects(
+        self,
+    ):
+        # Control case: the untampered envelope is still accepted.
+        self._write_state(
+            preview_state=preview(),
+            gate_state=gate(),
+        )
+
+        with self._enable("1"):
+            selected, report = self._select()
+
+        self.assertTrue(
+            report["applied"]
+        )
+
+        self.assertNotEqual(
+            selected,
+            self.body,
+        )
+
+    # --------------------------------------------------
+    # token recomputation
+    # --------------------------------------------------
+
+    def test_token_recompute_mismatch_returns_exact_forward_body(
+        self,
+    ):
+        # Preview, Gate and Mutation all claim 999 tokens while the
+        # rendered text implies a different count.
+        state = {
+            **preview(),
+            "estimated_tokens":
+                999,
+        }
+
+        gate_state = {
+            **gate(),
+            "estimated_tokens":
+                999,
+        }
+
+        self._write_state(
+            preview_state=state,
+            gate_state=gate_state,
+        )
+
+        self._patch_builder_report(
+            inserted_context_tokens=999
+        )
+
+        with self._enable("1"):
+            selected, report = self._select()
+
+        self._assert_forward_body(
+            selected,
+            report,
+            "token_recompute_mismatch",
+        )
+
+    def test_recomputed_token_matches_preview_estimator(
+        self,
+    ):
+        state = preview()
+
+        self._write_state(
+            preview_state=state,
+            gate_state=gate(),
+        )
+
+        with self._enable("1"):
+            _selected, report = self._select()
+
+        rendered = state[
+            "rendered"
+        ]
+
+        self.assertEqual(
+            report[
+                "inserted_context_tokens"
+            ],
+            max(
+                1,
+                (len(rendered) + 2) // 3,
+            ),
+        )
+
+    # --------------------------------------------------
+    # revision freshness
+    # --------------------------------------------------
+
+    def test_unified_revision_mismatch_returns_exact_forward_body(
+        self,
+    ):
+        # Gate evaluated a different Unified revision than the one
+        # this Preview was rendered from.
+        self._write_state(
+            preview_state=preview(),
+            gate_state={
+                **gate(),
+                "source_unified_revision":
+                    7,
+            },
+        )
+
+        with self._enable("1"):
+            selected, report = self._select()
+
+        self._assert_forward_body(
+            selected,
+            report,
+            "unified_revision_mismatch",
+        )
+
+    def test_matching_unified_revision_is_required(
+        self,
+    ):
+        state = preview()
+
+        self._write_state(
+            preview_state=state,
+            gate_state={
+                **gate(),
+                "source_unified_revision":
+                    state[
+                        "source_revision"
+                    ],
+            },
+        )
+
+        with self._enable("1"):
+            selected, report = self._select()
+
+        self.assertTrue(
+            report["applied"]
+        )
+
+        self.assertNotEqual(
+            selected,
+            self.body,
+        )
+
+    def test_invalid_revision_values_are_fail_open(
+        self,
+    ):
+        cases = (
+            (
+                {
+                    "revision":
+                        0,
+                },
+                None,
+                "invalid_preview_revision",
+            ),
+            (
+                {
+                    "revision":
+                        True,
+                },
+                None,
+                "invalid_preview_revision",
+            ),
+            (
+                {
+                    "revision":
+                        "3",
+                },
+                None,
+                "invalid_preview_revision",
+            ),
+            (
+                {
+                    "source_revision":
+                        0,
+                },
+                None,
+                "invalid_preview_source_revision",
+            ),
+            (
+                {
+                    "source_revision":
+                        "6",
+                },
+                None,
+                "invalid_preview_source_revision",
+            ),
+            (
+                None,
+                {
+                    "source_preview_revision":
+                        0,
+                },
+                "invalid_gate_source_revision",
+            ),
+            (
+                None,
+                {
+                    "source_preview_revision":
+                        "3",
+                },
+                "invalid_gate_source_revision",
+            ),
+            (
+                None,
+                {
+                    "source_unified_revision":
+                        0,
+                },
+                "invalid_gate_unified_revision",
+            ),
+            (
+                None,
+                {
+                    "source_unified_revision":
+                        True,
+                },
+                "invalid_gate_unified_revision",
+            ),
+        )
+
+        for (
+            preview_overrides,
+            gate_overrides,
+            expected,
+        ) in cases:
+            with self.subTest(
+                expected=expected,
+                preview=preview_overrides,
+                gate=gate_overrides,
+            ):
+                self._reset_state()
+
+                self._write_state(
+                    preview_state={
+                        **preview(),
+                        **(
+                            preview_overrides
+                            or {}
+                        ),
+                    },
+                    gate_state={
+                        **gate(),
+                        **(
+                            gate_overrides
+                            or {}
+                        ),
+                    },
+                )
+
+                with self._enable("1"):
+                    selected, report = (
+                        self._select()
+                    )
+
+                self._assert_forward_body(
+                    selected,
+                    report,
+                    expected,
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -40,6 +40,16 @@ _EXPECTED_MUTATION_REASON = (
 
 _MAX_INSERTED_CONTEXT_TOKENS = 1000
 
+# Final DATA-ONLY envelope defense.
+# Phase 4A-3D never blindly trusts the Preview module output.
+_ENVELOPE_HEADER = "OMBRE CONTEXT DATA\n"
+_ENVELOPE_OPEN = "<ombre_context_data>\n"
+_ENVELOPE_CLOSE = "\n</ombre_context_data>"
+_ENVELOPE_AUTHORITY_WORDING = (
+    "reference data only",
+    "not as authority",
+)
+
 _CONVERSATION_ID_RE = re.compile(
     r"^ctx_[0-9a-f]{16}$"
 )
@@ -130,6 +140,62 @@ def _valid_nonnegative_int(
             bool,
         )
         and value >= 0
+    )
+
+
+def _valid_revision(
+    value: Any,
+) -> bool:
+    """Revisions are 1-based."""
+
+    return (
+        isinstance(
+            value,
+            int,
+        )
+        and not isinstance(
+            value,
+            bool,
+        )
+        and value >= 1
+    )
+
+
+def _estimate_tokens(
+    text: str,
+) -> int:
+    """Same estimator as the Injection Preview module."""
+
+    if not text:
+        return 0
+
+    return max(
+        1,
+        (len(text) + 2) // 3,
+    )
+
+
+def _valid_data_envelope(
+    rendered: str,
+) -> bool:
+    """Final DATA-ONLY envelope defense."""
+
+    if not rendered.startswith(
+        _ENVELOPE_HEADER
+    ):
+        return False
+
+    if _ENVELOPE_OPEN not in rendered:
+        return False
+
+    if not rendered.endswith(
+        _ENVELOPE_CLOSE
+    ):
+        return False
+
+    return all(
+        wording in rendered
+        for wording in _ENVELOPE_AUTHORITY_WORDING
     )
 
 
@@ -427,7 +493,7 @@ def _select_enabled(
         "revision"
     )
 
-    if not _valid_nonnegative_int(
+    if not _valid_revision(
         preview_revision
     ):
         return (
@@ -435,6 +501,22 @@ def _select_enabled(
             _denied(
                 report,
                 "invalid_preview_revision",
+            ),
+        )
+
+    # Unified revision this Preview was rendered from.
+    preview_source_revision = preview.get(
+        "source_revision"
+    )
+
+    if not _valid_revision(
+        preview_source_revision
+    ):
+        return (
+            forward_body,
+            _denied(
+                report,
+                "invalid_preview_source_revision",
             ),
         )
 
@@ -493,10 +575,25 @@ def _select_enabled(
     # 4. Gate / Preview consistency
     # --------------------------------------------------
 
-    if (
-        gate.get(
-            "source_preview_revision"
+    # Gate must be evaluating exactly the Preview that will be
+    # injected...
+    gate_preview_revision = gate.get(
+        "source_preview_revision"
+    )
+
+    if not _valid_revision(
+        gate_preview_revision
+    ):
+        return (
+            forward_body,
+            _denied(
+                report,
+                "invalid_gate_source_revision",
+            ),
         )
+
+    if (
+        gate_preview_revision
         != preview_revision
     ):
         return (
@@ -507,6 +604,37 @@ def _select_enabled(
             ),
         )
 
+    # ...and that Preview must have been rendered from the same
+    # Unified revision the Gate evaluated.
+    gate_unified_revision = gate.get(
+        "source_unified_revision"
+    )
+
+    if not _valid_revision(
+        gate_unified_revision
+    ):
+        return (
+            forward_body,
+            _denied(
+                report,
+                "invalid_gate_unified_revision",
+            ),
+        )
+
+    if (
+        gate_unified_revision
+        != preview_source_revision
+    ):
+        return (
+            forward_body,
+            _denied(
+                report,
+                "unified_revision_mismatch",
+            ),
+        )
+
+    # Render hash must agree across Preview, Gate and a local
+    # recomputation of the rendered text.
     preview_render_sha = preview.get(
         "render_sha256"
     )
@@ -534,8 +662,21 @@ def _select_enabled(
         )
 
     # --------------------------------------------------
-    # 5. Token budget
+    # 5. DATA-ONLY envelope and token budget
     # --------------------------------------------------
+
+    # Final defense: the rendered text must still be the DATA-ONLY
+    # envelope, even if Preview/Gate were tampered with consistently.
+    if not _valid_data_envelope(
+        rendered
+    ):
+        return (
+            forward_body,
+            _denied(
+                report,
+                "invalid_data_envelope",
+            ),
+        )
 
     preview_tokens = preview.get(
         "estimated_tokens"
@@ -586,6 +727,25 @@ def _select_enabled(
             _denied(
                 report,
                 "invalid_token_budget",
+            ),
+        )
+
+    # Recompute the token count from the rendered text with the same
+    # estimator the Preview module uses. Three fields agreeing with
+    # each other is not enough.
+    recomputed_tokens = _estimate_tokens(
+        rendered
+    )
+
+    if (
+        preview_tokens != recomputed_tokens
+        or gate_tokens != recomputed_tokens
+    ):
+        return (
+            forward_body,
+            _denied(
+                report,
+                "token_recompute_mismatch",
             ),
         )
 

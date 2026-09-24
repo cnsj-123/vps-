@@ -482,6 +482,16 @@ def _observe_context_shadow(body: bytes) -> None:
         )
     )
 
+    # Phase 4A-3D: real injection is not an observability flag.
+    # When it is enabled it must drive the same Context pipeline,
+    # otherwise the selector could read stale Preview/Gate state
+    # from disk.
+    real_injection_enabled = _truthy(
+        os.environ.get(
+            "OMBRE_GATEWAY_CONTEXT_REAL_INJECTION"
+        )
+    )
+
     if not (
         context_log_enabled
         or snapshot_enabled
@@ -494,6 +504,7 @@ def _observe_context_shadow(body: bytes) -> None:
         or injection_preview_enabled
         or injection_gate_enabled
         or request_mutation_shadow_enabled
+        or real_injection_enabled
     ):
         return
 
@@ -585,6 +596,7 @@ def _observe_context_shadow(body: bytes) -> None:
         or injection_preview_enabled
         or injection_gate_enabled
         or request_mutation_shadow_enabled
+        or real_injection_enabled
     ):
         return
 
@@ -662,6 +674,7 @@ def _observe_context_shadow(body: bytes) -> None:
         or injection_preview_enabled
         or injection_gate_enabled
         or request_mutation_shadow_enabled
+        or real_injection_enabled
     ):
         return
 
@@ -747,6 +760,7 @@ def _observe_context_shadow(body: bytes) -> None:
         or injection_preview_enabled
         or injection_gate_enabled
         or request_mutation_shadow_enabled
+        or real_injection_enabled
     ):
         try:
             trusted_facts = (
@@ -834,6 +848,7 @@ def _observe_context_shadow(body: bytes) -> None:
         or injection_preview_enabled
         or injection_gate_enabled
         or request_mutation_shadow_enabled
+        or real_injection_enabled
     ):
         return
 
@@ -930,6 +945,7 @@ def _observe_context_shadow(body: bytes) -> None:
         or injection_preview_enabled
         or injection_gate_enabled
         or request_mutation_shadow_enabled
+        or real_injection_enabled
     ):
         return
 
@@ -1048,6 +1064,7 @@ def _observe_context_shadow(body: bytes) -> None:
         or injection_preview_enabled
         or injection_gate_enabled
         or request_mutation_shadow_enabled
+        or real_injection_enabled
     ):
         return conversation_id
 
@@ -1187,11 +1204,23 @@ async def _observe_unified_context_shadow(
         )
     )
 
+    # Phase 4A-3D: an enabled real injection must refresh the
+    # Unified -> Preview -> Gate chain for THIS request, even when
+    # every observability shadow flag is off. The selector itself
+    # re-runs the mutation shadow, so REQUEST_MUTATION_SHADOW is not
+    # required for real injection.
+    real_injection_enabled = _truthy(
+        os.environ.get(
+            "OMBRE_GATEWAY_CONTEXT_REAL_INJECTION"
+        )
+    )
+
     if not (
         unified_enabled
         or preview_enabled
         or gate_enabled
         or mutation_enabled
+        or real_injection_enabled
     ):
         return
 
@@ -1338,6 +1367,7 @@ async def _observe_unified_context_shadow(
         preview_enabled
         or gate_enabled
         or mutation_enabled
+        or real_injection_enabled
     ):
         return
 
@@ -1418,6 +1448,7 @@ async def _observe_unified_context_shadow(
     if not (
         gate_enabled
         or mutation_enabled
+        or real_injection_enabled
     ):
         return
 
