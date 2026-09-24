@@ -77,6 +77,8 @@ class GatewayMutationShadowTests(
             {
                 "OMBRE_GATEWAY_CONTEXT_REQUEST_MUTATION_SHADOW":
                     "1",
+                "OMBRE_GATEWAY_CONTEXT_REAL_INJECTION":
+                    "0",
             },
             clear=False,
         ):
@@ -111,6 +113,8 @@ class GatewayMutationShadowTests(
             {
                 "OMBRE_GATEWAY_CONTEXT_REQUEST_MUTATION_SHADOW":
                     "0",
+                "OMBRE_GATEWAY_CONTEXT_REAL_INJECTION":
+                    "0",
             },
             clear=False,
         ):
@@ -140,6 +144,8 @@ class GatewayMutationShadowTests(
             {
                 "OMBRE_GATEWAY_CONTEXT_REQUEST_MUTATION_SHADOW":
                     "1",
+                "OMBRE_GATEWAY_CONTEXT_REAL_INJECTION":
+                    "0",
             },
             clear=False,
         ):
