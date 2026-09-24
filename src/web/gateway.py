@@ -1178,7 +1178,21 @@ def _observe_context_shadow(body: bytes) -> None:
 
 async def _observe_unified_context_shadow(
     conversation_id: str | None,
-) -> None:
+) -> bool:
+    """Refresh the Unified -> Preview -> Gate chain for this request.
+
+    Returns a per-request freshness latch:
+
+      True  - this request successfully refreshed the chain end to end
+              (Unified stored, Preview stored, Gate stored). A fresh
+              deny is still fresh: freshness means "refreshed now",
+              not "injection allowed".
+      False - the chain was not refreshed for this request, so any
+              Preview/Gate already on disk is stale and must not be
+              used for real injection.
+
+    Shadow-only callers may ignore the return value.
+    """
 
     unified_enabled = _truthy(
         os.environ.get(
@@ -1222,13 +1236,13 @@ async def _observe_unified_context_shadow(
         or mutation_enabled
         or real_injection_enabled
     ):
-        return
+        return False
 
     if not isinstance(
         conversation_id,
         str,
     ):
-        return
+        return False
 
     try:
         unified = await (
@@ -1242,7 +1256,7 @@ async def _observe_unified_context_shadow(
             "store_failed=%s fail_open=true",
             type(exc).__name__,
         )
-        return
+        return False
 
     # Privacy-safe telemetry only.
     # No query, plan, memory, fact or conversation text is logged.
@@ -1369,12 +1383,12 @@ async def _observe_unified_context_shadow(
         or mutation_enabled
         or real_injection_enabled
     ):
-        return
+        return False
 
     if not unified.get(
         "stored"
     ):
-        return
+        return False
 
     try:
         preview = (
@@ -1388,7 +1402,7 @@ async def _observe_unified_context_shadow(
             "store_failed=%s fail_open=true",
             type(exc).__name__,
         )
-        return
+        return False
 
     # Privacy-safe summary only.
     # Never log preview["rendered"] or any candidate text.
@@ -1450,12 +1464,12 @@ async def _observe_unified_context_shadow(
         or mutation_enabled
         or real_injection_enabled
     ):
-        return
+        return False
 
     if not preview.get(
         "stored"
     ):
-        return
+        return False
 
     try:
         gate = (
@@ -1469,7 +1483,7 @@ async def _observe_unified_context_shadow(
             "store_failed=%s fail_open=true",
             type(exc).__name__,
         )
-        return
+        return False
 
     # Privacy-safe decision summary only.
     # Never log rendered Preview or candidate text.
@@ -1545,6 +1559,15 @@ async def _observe_unified_context_shadow(
         ),
     )
 
+    if not gate.get(
+        "stored"
+    ):
+        return False
+
+    # This request refreshed the whole chain. A fresh deny is still
+    # fresh; the selector decides whether injection is allowed.
+    return True
+
 
 
 def _observe_context_request_mutation_shadow(
@@ -1609,6 +1632,8 @@ def _observe_context_request_mutation_shadow(
 def _select_context_real_injection(
     conversation_id: str | None,
     forward_body: bytes,
+    *,
+    context_chain_fresh: bool,
 ) -> bytes:
     """Phase 4A-3D limited real injection.
 
@@ -1626,6 +1651,12 @@ def _select_context_real_injection(
         forward_body;
       - the request is never blocked and no HTTP error is produced;
       - only privacy-safe telemetry is logged.
+
+    Freshness contract:
+      - context_chain_fresh must be True, i.e. this very request must
+        have refreshed Unified -> Preview -> Gate. Otherwise any
+        Preview/Gate on disk belongs to an earlier request and must
+        not be injected, so the selector is not even called.
     """
 
     if not _truthy(
@@ -1645,6 +1676,25 @@ def _select_context_real_injection(
             bytes,
         )
     ):
+        return forward_body
+
+    if context_chain_fresh is not True:
+        # Never read stale Preview/Gate from disk to attempt injection.
+        logger.info(
+            "[gateway.context_real_injection] %s",
+            json.dumps(
+                {
+                    "enabled": True,
+                    "applied": False,
+                    "reason":
+                        "prerequisite_chain_not_fresh",
+                    "conversation_id":
+                        conversation_id,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        )
         return forward_body
 
     try:
@@ -1679,19 +1729,49 @@ def _select_context_real_injection(
         )
         return forward_body
 
-    if (
-        report.get("applied")
-        is not True
-        and selected_body
-        != forward_body
-    ):
-        # Safety net: the body must never change without an
-        # explicit applied=true decision.
-        logger.warning(
-            "[gateway.context_real_injection] "
-            "unapplied_body_change fail_open=true"
-        )
-        return forward_body
+    applied = report.get(
+        "applied"
+    )
+
+    if applied is not True:
+        if selected_body != forward_body:
+            # Safety net: the body must never change without an
+            # explicit applied=true decision.
+            logger.warning(
+                "[gateway.context_real_injection] "
+                "unapplied_body_change fail_open=true"
+            )
+            return forward_body
+    else:
+        # Defense-in-depth: never blindly trust an applied=true
+        # report from the selector.
+        if (
+            selected_body == forward_body
+            or report.get("version")
+            != "context-real-injection.v1"
+            or report.get("enabled")
+            is not True
+            or report.get("reason")
+            != "injection_applied"
+            or report.get(
+                "original_sha256"
+            )
+            != hashlib.sha256(
+                forward_body
+            ).hexdigest()
+            or report.get(
+                "selected_sha256"
+            )
+            != hashlib.sha256(
+                selected_body
+            ).hexdigest()
+        ):
+            logger.warning(
+                "[gateway.context_real_injection] "
+                "invalid_applied_selection "
+                "fail_open=true"
+            )
+            return forward_body
 
     # Privacy-safe telemetry only.
     # No rendered Context, memory, fact or user text is logged.
@@ -1762,10 +1842,6 @@ def register(mcp) -> None:
             )
         )
 
-        await _observe_unified_context_shadow(
-            context_conversation_id
-        )
-
         _observe_context_request_mutation_shadow(
             context_conversation_id,
             forward_body,
@@ -1775,10 +1851,21 @@ def register(mcp) -> None:
         # Only the already cache-stabilized forward_body may be
         # selected from. When the master flag is OFF, or on any
         # deny / exception, selected_body IS forward_body.
+        #
+        # context_chain_fresh is a per-request latch: real injection
+        # may only use Preview/Gate refreshed by THIS request.
+        context_chain_fresh = (
+            await _observe_unified_context_shadow(
+                context_conversation_id
+            )
+        )
+
         selected_body = (
             _select_context_real_injection(
                 context_conversation_id,
                 forward_body,
+                context_chain_fresh=
+                    context_chain_fresh,
             )
         )
 

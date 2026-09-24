@@ -403,6 +403,7 @@ class GatewayRealInjectionSelectionTests(
         *,
         conversation_id=CID,
         body=None,
+        context_chain_fresh=True,
     ):
         return (
             gateway._select_context_real_injection(
@@ -410,6 +411,8 @@ class GatewayRealInjectionSelectionTests(
                 self.body
                 if body is None
                 else body,
+                context_chain_fresh=
+                    context_chain_fresh,
             )
         )
 
@@ -780,6 +783,337 @@ class GatewayRealInjectionSelectionTests(
                 encoding="utf-8",
             )
 
+    # --------------------------------------------------
+    # per-request freshness latch
+    # --------------------------------------------------
+
+    def test_not_fresh_does_not_call_selector(
+        self,
+    ):
+        selector = Mock(
+            side_effect=AssertionError(
+                "selector must not run"
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as root:
+            # A fully valid, mutually consistent Preview/Gate pair is
+            # already on disk and WOULD inject on its own.
+            self._write_state(
+                Path(root)
+            )
+
+            with patch.dict(
+                os.environ,
+                {
+                    **_ISOLATED_ENV,
+                    _REAL_INJECTION_ENV:
+                        "1",
+                    "OMBRE_CONTEXT_STATE_DIR":
+                        root,
+                },
+                clear=False,
+            ):
+                with patch.object(
+                    gateway,
+                    "select_context_injected_body",
+                    selector,
+                ):
+                    with self.assertLogs(
+                        "ombre_brain.gateway",
+                        level="INFO",
+                    ) as captured:
+                        selected = self._select(
+                            context_chain_fresh=
+                                False
+                        )
+
+        self.assertIs(
+            selected,
+            self.body,
+        )
+
+        selector.assert_not_called()
+
+        logged = "\n".join(
+            record.getMessage()
+            for record in captured.records
+        )
+
+        self.assertIn(
+            "[gateway.context_real_injection]",
+            logged,
+        )
+
+        self.assertIn(
+            "prerequisite_chain_not_fresh",
+            logged,
+        )
+
+        self.assertNotIn(
+            "context-secret",
+            logged,
+        )
+
+    def test_not_fresh_never_reads_stale_disk_state(
+        self,
+    ):
+        reader = Mock(
+            side_effect=AssertionError(
+                "stale disk state must not be read"
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as root:
+            self._write_state(
+                Path(root)
+            )
+
+            with patch.dict(
+                os.environ,
+                {
+                    **_ISOLATED_ENV,
+                    _REAL_INJECTION_ENV:
+                        "1",
+                    "OMBRE_CONTEXT_STATE_DIR":
+                        root,
+                },
+                clear=False,
+            ):
+                with patch.object(
+                    gateway,
+                    "select_context_injected_body",
+                    reader,
+                ):
+                    selected = self._select(
+                        context_chain_fresh=
+                            None
+                    )
+
+        self.assertIs(
+            selected,
+            self.body,
+        )
+
+        reader.assert_not_called()
+
+    def test_fresh_chain_allows_selector(
+        self,
+    ):
+        selected_body = self.body + b" "
+
+        selector = Mock(
+            return_value=(
+                selected_body,
+                _applied_report(
+                    self.body,
+                    selected_body,
+                ),
+            )
+        )
+
+        with patch.dict(
+            os.environ,
+            {
+                **_ISOLATED_ENV,
+                _REAL_INJECTION_ENV:
+                    "1",
+            },
+            clear=False,
+        ):
+            with patch.object(
+                gateway,
+                "select_context_injected_body",
+                selector,
+            ):
+                selected = self._select(
+                    context_chain_fresh=
+                        True
+                )
+
+        selector.assert_called_once()
+
+        self.assertEqual(
+            selected,
+            selected_body,
+        )
+
+    def test_freshness_ignored_when_master_flag_off(
+        self,
+    ):
+        selector = Mock(
+            side_effect=AssertionError(
+                "selector must not run"
+            )
+        )
+
+        with patch.dict(
+            os.environ,
+            {
+                **_ISOLATED_ENV,
+                _REAL_INJECTION_ENV:
+                    "0",
+            },
+            clear=False,
+        ):
+            with patch.object(
+                gateway,
+                "select_context_injected_body",
+                selector,
+            ):
+                for fresh in (
+                    True,
+                    False,
+                    None,
+                ):
+                    selected = self._select(
+                        context_chain_fresh=
+                            fresh
+                    )
+
+                    self.assertIs(
+                        selected,
+                        self.body,
+                    )
+
+        selector.assert_not_called()
+
+    # --------------------------------------------------
+    # applied=true reverse defense
+    # --------------------------------------------------
+
+    def test_invalid_applied_selection_is_fail_open(
+        self,
+    ):
+        selected_body = self.body + b" "
+
+        good = _applied_report(
+            self.body,
+            selected_body,
+        )
+
+        cases = (
+            (
+                "same_body",
+                self.body,
+                good,
+            ),
+            (
+                "wrong_version",
+                selected_body,
+                {
+                    **good,
+                    "version":
+                        "context-real-injection.v2",
+                },
+            ),
+            (
+                "enabled_false",
+                selected_body,
+                {
+                    **good,
+                    "enabled":
+                        False,
+                },
+            ),
+            (
+                "wrong_reason",
+                selected_body,
+                {
+                    **good,
+                    "reason":
+                        "other_reason",
+                },
+            ),
+            (
+                "original_sha_mismatch",
+                selected_body,
+                {
+                    **good,
+                    "original_sha256":
+                        "0" * 64,
+                },
+            ),
+            (
+                "selected_sha_mismatch",
+                selected_body,
+                {
+                    **good,
+                    "selected_sha256":
+                        "0" * 64,
+                },
+            ),
+        )
+
+        for name, body, report in cases:
+            with self.subTest(
+                case=name
+            ):
+                selector = Mock(
+                    return_value=(
+                        body,
+                        report,
+                    )
+                )
+
+                with patch.dict(
+                    os.environ,
+                    {
+                        **_ISOLATED_ENV,
+                        _REAL_INJECTION_ENV:
+                            "1",
+                    },
+                    clear=False,
+                ):
+                    with patch.object(
+                        gateway,
+                        "select_context_injected_body",
+                        selector,
+                    ):
+                        selected = self._select()
+
+                self.assertIs(
+                    selected,
+                    self.body,
+                    name,
+                )
+
+    def test_consistent_applied_report_is_accepted(
+        self,
+    ):
+        selected_body = self.body + b" "
+
+        selector = Mock(
+            return_value=(
+                selected_body,
+                _applied_report(
+                    self.body,
+                    selected_body,
+                ),
+            )
+        )
+
+        with patch.dict(
+            os.environ,
+            {
+                **_ISOLATED_ENV,
+                _REAL_INJECTION_ENV:
+                    "1",
+            },
+            clear=False,
+        ):
+            with patch.object(
+                gateway,
+                "select_context_injected_body",
+                selector,
+            ):
+                selected = self._select()
+
+        self.assertEqual(
+            selected,
+            selected_body,
+        )
+
 
 class GatewayRealInjectionRequestTests(
     unittest.IsolatedAsyncioTestCase
@@ -821,15 +1155,24 @@ class GatewayRealInjectionRequestTests(
 
         return environ
 
-    def _write_state(self) -> None:
+    def _write_state(
+        self,
+        *,
+        preview_state=None,
+        gate_state=None,
+    ) -> None:
         for kind, value in (
             (
                 "injection_preview",
-                preview(),
+                preview()
+                if preview_state is None
+                else preview_state,
             ),
             (
                 "injection_gate",
-                gate(),
+                gate()
+                if gate_state is None
+                else gate_state,
             ),
         ):
             path = (
@@ -910,6 +1253,7 @@ class GatewayRealInjectionRequestTests(
         body: bytes,
         *,
         environ: dict,
+        unified_fresh=None,
     ):
         harness = _RouteHarness()
 
@@ -919,23 +1263,49 @@ class GatewayRealInjectionRequestTests(
 
         created: list = []
 
-        with patch.dict(
-            os.environ,
-            environ,
-            clear=False,
-        ):
-            with patch.object(
+        patches = [
+            patch.object(
                 gateway.httpx,
                 "AsyncClient",
                 _fake_client(
                     created
                 ),
-            ):
+            ),
+        ]
+
+        if unified_fresh is not None:
+            # Tests that focus on the selector stub out the
+            # prerequisite chain and declare this request fresh.
+            patches.append(
+                patch.object(
+                    gateway,
+                    "_observe_unified_context_shadow",
+                    AsyncMock(
+                        return_value=
+                            unified_fresh
+                    ),
+                )
+            )
+
+        with patch.dict(
+            os.environ,
+            environ,
+            clear=False,
+        ):
+            for item in patches:
+                item.start()
+
+            try:
                 response = await harness.handler(
                     self._request(
                         body
                     )
                 )
+            finally:
+                for item in reversed(
+                    patches
+                ):
+                    item.stop()
 
         return (
             response,
@@ -1015,6 +1385,7 @@ class GatewayRealInjectionRequestTests(
                     environ=self._env(
                         real_injection="1"
                     ),
+                    unified_fresh=True,
                 )
             )
 
@@ -1052,6 +1423,7 @@ class GatewayRealInjectionRequestTests(
                     environ=self._env(
                         real_injection="1"
                     ),
+                    unified_fresh=True,
                 )
             )
 
@@ -1085,19 +1457,15 @@ class GatewayRealInjectionRequestTests(
             rewritten_body,
         )
 
+        selected_body = b'{"selected":true}'
+
         selector = Mock(
             return_value=(
-                b'{"selected":true}',
-                {
-                    "version":
-                        "context-real-injection.v1",
-                    "enabled":
-                        True,
-                    "applied":
-                        True,
-                    "reason":
-                        "injection_applied",
-                },
+                selected_body,
+                _applied_report(
+                    rewritten_body,
+                    selected_body,
+                ),
             )
         )
 
@@ -1120,6 +1488,7 @@ class GatewayRealInjectionRequestTests(
                     environ=self._env(
                         real_injection="1"
                     ),
+                    unified_fresh=True,
                 )
             )
 
@@ -1130,7 +1499,7 @@ class GatewayRealInjectionRequestTests(
 
         self.assertEqual(
             client.built[0].content,
-            b'{"selected":true}',
+            selected_body,
         )
 
     async def test_on_with_real_selector_injects_context(
@@ -1153,6 +1522,7 @@ class GatewayRealInjectionRequestTests(
                     environ=self._env(
                         real_injection="1"
                     ),
+                    unified_fresh=True,
                 )
             )
 
@@ -1364,7 +1734,7 @@ class GatewayRealInjectionRequestTests(
                 )
             )
 
-            await (
+            fresh = await (
                 gateway._observe_unified_context_shadow(
                     conversation_id
                 )
@@ -1373,6 +1743,11 @@ class GatewayRealInjectionRequestTests(
         self.assertEqual(
             conversation_id,
             CID,
+        )
+
+        self.assertIs(
+            fresh,
+            True,
         )
 
         for key, _name in self._CHAIN_TARGETS:
@@ -1426,7 +1801,7 @@ class GatewayRealInjectionRequestTests(
                 )
             )
 
-            await (
+            fresh = await (
                 gateway._observe_unified_context_shadow(
                     CID
                 )
@@ -1434,6 +1809,11 @@ class GatewayRealInjectionRequestTests(
 
         self.assertIsNone(
             conversation_id
+        )
+
+        self.assertIs(
+            fresh,
+            False,
         )
 
         for key, _name in self._CHAIN_TARGETS:
@@ -1510,6 +1890,415 @@ class GatewayRealInjectionRequestTests(
                         "rendered"
                     ],
             },
+        )
+
+    # --------------------------------------------------
+    # stale disk regression
+    # --------------------------------------------------
+
+    def _stale_disk_env(self) -> dict:
+        return self._chain_env(
+            real_injection="1"
+        )
+
+    def _chain_failure_cases(self):
+        """(name, unified, preview, gate) overrides."""
+
+        exception = RuntimeError(
+            "synthetic updater failure"
+        )
+
+        return (
+            (
+                "A_unified_exception",
+                exception,
+                None,
+                None,
+            ),
+            (
+                "B_preview_exception",
+                None,
+                exception,
+                None,
+            ),
+            (
+                "C_gate_exception",
+                None,
+                None,
+                exception,
+            ),
+            (
+                "D_unified_not_stored",
+                {
+                    "stored": False,
+                },
+                None,
+                None,
+            ),
+            (
+                "E_preview_not_stored",
+                None,
+                {
+                    "stored": False,
+                },
+                None,
+            ),
+            (
+                "F_gate_not_stored",
+                None,
+                None,
+                {
+                    "stored": False,
+                },
+            ),
+        )
+
+    async def _run_stale_disk_case(
+        self,
+        unified_override,
+        preview_override,
+        gate_override,
+    ):
+        # A fully valid, mutually consistent Preview/Gate pair is
+        # already on disk and would inject on its own.
+        self._write_state()
+
+        mocks = self._mock_chain()
+
+        if unified_override is not None:
+            if isinstance(
+                unified_override,
+                Exception,
+            ):
+                mocks[
+                    "unified"
+                ].side_effect = (
+                    unified_override
+                )
+            else:
+                mocks[
+                    "unified"
+                ].return_value = (
+                    unified_override
+                )
+
+        for key, override in (
+            (
+                "preview",
+                preview_override,
+            ),
+            (
+                "gate",
+                gate_override,
+            ),
+        ):
+            if override is None:
+                continue
+
+            if isinstance(
+                override,
+                Exception,
+            ):
+                mocks[key].side_effect = (
+                    override
+                )
+            else:
+                mocks[key].return_value = (
+                    override
+                )
+
+        self._patch_chain(
+            mocks
+        )
+
+        body = body_from(
+            base_payload()
+        )
+
+        response, client = (
+            await self._call_gateway(
+                body,
+                environ=self._stale_disk_env(),
+            )
+        )
+
+        return (
+            body,
+            response,
+            client,
+        )
+
+    async def test_stale_disk_is_never_injected(
+        self,
+    ):
+        for (
+            name,
+            unified_override,
+            preview_override,
+            gate_override,
+        ) in self._chain_failure_cases():
+            with self.subTest(
+                case=name
+            ):
+                (
+                    body,
+                    response,
+                    client,
+                ) = await self._run_stale_disk_case(
+                    unified_override,
+                    preview_override,
+                    gate_override,
+                )
+
+                self.assertEqual(
+                    response.status_code,
+                    200,
+                )
+
+                # Stale-but-valid disk Preview/Gate must not be
+                # injected when this request failed to refresh.
+                self.assertEqual(
+                    client.built[0].content,
+                    body,
+                    name,
+                )
+
+    async def test_stale_disk_never_calls_selector(
+        self,
+    ):
+        for (
+            name,
+            unified_override,
+            preview_override,
+            gate_override,
+        ) in self._chain_failure_cases():
+            with self.subTest(
+                case=name
+            ):
+                self._write_state()
+
+                mocks = self._mock_chain()
+
+                if isinstance(
+                    unified_override,
+                    Exception,
+                ):
+                    mocks[
+                        "unified"
+                    ].side_effect = (
+                        unified_override
+                    )
+                elif unified_override:
+                    mocks[
+                        "unified"
+                    ].return_value = (
+                        unified_override
+                    )
+
+                for key, override in (
+                    (
+                        "preview",
+                        preview_override,
+                    ),
+                    (
+                        "gate",
+                        gate_override,
+                    ),
+                ):
+                    if override is None:
+                        continue
+
+                    if isinstance(
+                        override,
+                        Exception,
+                    ):
+                        mocks[key].side_effect = (
+                            override
+                        )
+                    else:
+                        mocks[key].return_value = (
+                            override
+                        )
+
+                self._patch_chain(
+                    mocks
+                )
+
+                selector = Mock(
+                    side_effect=AssertionError(
+                        "selector must not run on "
+                        "a stale chain"
+                    )
+                )
+
+                body = body_from(
+                    base_payload()
+                )
+
+                with patch.object(
+                    gateway,
+                    "select_context_injected_body",
+                    selector,
+                ):
+                    response, client = (
+                        await self._call_gateway(
+                            body,
+                            environ=
+                                self._stale_disk_env(),
+                        )
+                    )
+
+                selector.assert_not_called()
+
+                self.assertEqual(
+                    response.status_code,
+                    200,
+                )
+
+                self.assertEqual(
+                    client.built[0].content,
+                    body,
+                    name,
+                )
+
+    async def test_fresh_chain_still_injects_with_stale_disk_present(
+        self,
+    ):
+        # Control: the same disk state plus a successful refresh
+        # still injects.
+        self._write_state()
+
+        mocks = self._mock_chain()
+
+        self._patch_chain(
+            mocks
+        )
+
+        body = body_from(
+            base_payload()
+        )
+
+        response, client = (
+            await self._call_gateway(
+                body,
+                environ=self._stale_disk_env(),
+            )
+        )
+
+        self.assertEqual(
+            response.status_code,
+            200,
+        )
+
+        self.assertTrue(
+            mocks["gate"].called
+        )
+
+        sent = client.built[0].content
+
+        self.assertNotEqual(
+            sent,
+            body,
+        )
+
+        blocks = json.loads(
+            sent
+        )["messages"][-1]["content"]
+
+        self.assertEqual(
+            blocks[0],
+            {
+                "type":
+                    "text",
+                "text":
+                    preview()[
+                        "rendered"
+                    ],
+            },
+        )
+
+    async def test_fresh_deny_is_still_fresh(
+        self,
+    ):
+        # A fresh deny is a successful refresh: freshness means
+        # "refreshed now", not "injection allowed". The selector runs
+        # and then refuses, so the exact forward body is sent.
+        deny_gate = {
+            "version":
+                "context-injection-gate.v1",
+            "mode":
+                "shadow_only",
+            "decision":
+                "deny",
+            "allowed":
+                False,
+            "reason":
+                "semantic_stale",
+            "reasons": [
+                "semantic_stale",
+            ],
+            "source_candidate_revision":
+                6,
+            "source_unified_revision":
+                6,
+            "source_preview_revision":
+                3,
+            "estimated_tokens":
+                preview()[
+                    "estimated_tokens"
+                ],
+            "token_budget":
+                1000,
+            "section_names": [
+                "plans",
+            ],
+            "render_sha256":
+                preview()[
+                    "render_sha256"
+                ],
+        }
+
+        self._write_state(
+            gate_state=deny_gate
+        )
+
+        mocks = self._mock_chain()
+
+        mocks["gate"].return_value = {
+            "stored": True,
+            "revision": 1,
+            **deny_gate,
+        }
+
+        self._patch_chain(
+            mocks
+        )
+
+        body = body_from(
+            base_payload()
+        )
+
+        response, client = (
+            await self._call_gateway(
+                body,
+                environ=self._stale_disk_env(),
+            )
+        )
+
+        self.assertEqual(
+            response.status_code,
+            200,
+        )
+
+        # Fresh chain: the selector did run (freshness is not a
+        # decision), but the deny kept the exact forward body.
+        self.assertTrue(
+            mocks["gate"].called
+        )
+
+        self.assertEqual(
+            client.built[0].content,
+            body,
         )
 
 
