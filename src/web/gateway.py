@@ -56,7 +56,7 @@ from ombrebrain.context.context_request_mutation_shadow import (
 from ombrebrain.context.context_real_injection import (
     select_context_injected_body,
 )
-from ombrebrain.context.pipeline_state import (
+from ombrebrain.context.pipeline_events import (
     build_context_chain_event,
 )
 from ombrebrain.gateway.gateway_runtime import (

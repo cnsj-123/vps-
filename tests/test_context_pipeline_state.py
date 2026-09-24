@@ -7,6 +7,7 @@ from ombrebrain.context.pipeline_state import (
     CHAIN_STAGE,
     FRESHNESS_FRESH,
     FRESHNESS_STALE,
+    STAGE_CANDIDATE,
     STAGE_GATE,
     STAGE_PREVIEW,
     STAGE_UNIFIED,
@@ -431,6 +432,378 @@ class ContextChainEventTests(
                 secret,
                 serialized,
             )
+
+
+class PipelineParserTests(
+    unittest.TestCase
+):
+    """Round 2: payload -> state parsing coverage."""
+
+    def test_payload_to_state_field_mapping(
+        self,
+    ):
+        payload = {
+            "conversation_id":
+                CID,
+            "revision":
+                7,
+            "source_revision":
+                6,
+            "sections": {
+                "state": {
+                    "current_focus":
+                        "secret-focus"
+                }
+            },
+            "estimated_tokens":
+                11,
+            "token_budget":
+                22,
+            "telemetry": {
+                "estimated_tokens":
+                    99,
+                "token_budget":
+                    88,
+            },
+        }
+
+        state = from_stage_payload(
+            STAGE_CANDIDATE,
+            payload,
+        )
+
+        self.assertEqual(
+            state.stage,
+            STAGE_CANDIDATE,
+        )
+        self.assertEqual(
+            state.conversation_id,
+            CID,
+        )
+        self.assertEqual(
+            state.revision,
+            7,
+        )
+        self.assertEqual(
+            state.source_revision,
+            6,
+        )
+        self.assertEqual(
+            state.sections,
+            {
+                "state": {
+                    "current_focus":
+                        "secret-focus"
+                }
+            },
+        )
+
+        # Top-level values win over telemetry.
+        self.assertEqual(
+            state.estimated_tokens,
+            11,
+        )
+        self.assertEqual(
+            state.token_budget,
+            22,
+        )
+
+        # Candidate keeps the generic shape only.
+        self.assertIsNone(
+            state.decision
+        )
+        self.assertEqual(
+            state.metadata,
+            {},
+        )
+
+    def test_telemetry_fallback_when_top_level_missing(
+        self,
+    ):
+        state = from_stage_payload(
+            STAGE_UNIFIED,
+            {
+                "telemetry": {
+                    "estimated_tokens":
+                        42,
+                    "token_budget":
+                        1200,
+                }
+            },
+        )
+
+        self.assertEqual(
+            state.estimated_tokens,
+            42,
+        )
+        self.assertEqual(
+            state.token_budget,
+            1200,
+        )
+
+    def test_unified_top_level_source_revision_wins(
+        self,
+    ):
+        payload = unified_payload()
+        payload["source_revision"] = 9
+
+        state = from_stage_payload(
+            STAGE_UNIFIED,
+            payload,
+        )
+
+        self.assertEqual(
+            state.source_revision,
+            9,
+        )
+
+    def test_preview_non_list_section_names_become_empty(
+        self,
+    ):
+        payload = preview_payload()
+        payload["section_names"] = (
+            "trusted_facts"
+        )
+
+        state = from_stage_payload(
+            STAGE_PREVIEW,
+            payload,
+        )
+
+        self.assertEqual(
+            state.metadata[
+                "section_names"
+            ],
+            [],
+        )
+
+    def test_gate_top_level_source_revision_wins(
+        self,
+    ):
+        payload = gate_payload()
+        payload["source_revision"] = 8
+
+        state = from_stage_payload(
+            STAGE_GATE,
+            payload,
+        )
+
+        self.assertEqual(
+            state.source_revision,
+            8,
+        )
+
+    def test_invalid_revision_values_are_dropped(
+        self,
+    ):
+        for bad in (
+            True,
+            "5",
+            -1,
+            1.5,
+            None,
+            [1],
+        ):
+            state = from_stage_payload(
+                STAGE_PREVIEW,
+                {
+                    "revision": bad,
+                    "source_revision": bad,
+                },
+            )
+
+            self.assertIsNone(
+                state.revision,
+                bad,
+            )
+            self.assertIsNone(
+                state.source_revision,
+                bad,
+            )
+
+    def test_zero_revision_is_kept_by_lax_extractor(
+        self,
+    ):
+        # Documents the current behavior: the parser's _as_int
+        # accepts any non-negative int, including 0. Strict 1-based
+        # validation lives in the freshness validator.
+        state = from_stage_payload(
+            STAGE_PREVIEW,
+            {"revision": 0},
+        )
+
+        self.assertEqual(
+            state.revision,
+            0,
+        )
+
+    def test_candidate_stage_has_no_stage_specific_fields(
+        self,
+    ):
+        state = from_stage_payload(
+            STAGE_CANDIDATE,
+            unified_payload(),
+        )
+
+        self.assertIsNone(
+            state.decision
+        )
+        self.assertEqual(
+            state.metadata,
+            {},
+        )
+
+    def test_replace_does_not_mutate_original(
+        self,
+    ):
+        state = from_stage_payload(
+            STAGE_PREVIEW,
+            preview_payload(),
+        )
+
+        updated = state.replace(
+            revision=99
+        )
+
+        self.assertEqual(
+            updated.revision,
+            99,
+        )
+        self.assertEqual(
+            state.revision,
+            5,
+        )
+
+    def test_split_module_import_paths(self):
+        # The canonical homes after the Round 2 split...
+        from ombrebrain.context import (
+            pipeline_events,
+            pipeline_parser,
+        )
+        from ombrebrain.context.pipeline_events import (
+            to_event,
+        )
+
+        # ...expose the very same objects as the compat imports.
+        self.assertIs(
+            pipeline_parser.from_stage_payload,
+            from_stage_payload,
+        )
+        self.assertIs(
+            pipeline_events.build_context_chain_event,
+            build_context_chain_event,
+        )
+
+        state = from_stage_payload(
+            STAGE_PREVIEW,
+            preview_payload(),
+        )
+
+        event = to_event(
+            state,
+            reason="observed",
+        )
+
+        self.assertEqual(
+            event["stage"],
+            STAGE_PREVIEW,
+        )
+        self.assertEqual(
+            event["decision"],
+            "eligible",
+        )
+        self.assertEqual(
+            event["revision"],
+            5,
+        )
+        self.assertEqual(
+            event["reason"],
+            "observed",
+        )
+
+    def test_compat_reexports_from_pipeline_state(self):
+        import ombrebrain.context.pipeline_state as pipeline_state
+
+        # Old import path keeps working...
+        self.assertTrue(
+            callable(
+                pipeline_state.from_stage_payload
+            )
+        )
+        self.assertTrue(
+            callable(
+                pipeline_state.build_context_chain_event
+            )
+        )
+
+        # ...and unknown attributes still fail normally.
+        with self.assertRaises(
+            AttributeError
+        ):
+            pipeline_state.does_not_exist
+
+
+class ChainEventRound2Tests(
+    unittest.TestCase
+):
+    """Round 2: same-revision chain and module-level to_event."""
+
+    def test_same_revision_chain_is_fresh(
+        self,
+    ):
+        event = build_context_chain_event(
+            unified=unified_payload(
+                revision=2,
+                conversation_candidate=1,
+            ),
+            preview=preview_payload(
+                revision=1,
+                source_revision=2,
+            ),
+            gate=gate_payload(
+                revision=1,
+                source_preview_revision=1,
+            ),
+        )
+
+        self.assertEqual(
+            event["decision"],
+            FRESHNESS_FRESH,
+        )
+        self.assertIsNone(
+            event["reason"]
+        )
+
+        freshness = event[
+            "metrics"
+        ]["freshness"]
+
+        self.assertTrue(
+            freshness["valid"]
+        )
+        self.assertEqual(
+            freshness[
+                "checked_revision"
+            ],
+            2,
+        )
+        self.assertEqual(
+            freshness[
+                "expected_revision"
+            ],
+            2,
+        )
+
+        stages = event["metrics"][
+            "stages"
+        ]
+
+        self.assertEqual(
+            stages[STAGE_PREVIEW][
+                "freshness_state"
+            ],
+            FRESHNESS_FRESH,
+        )
 
 
 if __name__ == "__main__":
