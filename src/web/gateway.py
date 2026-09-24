@@ -56,6 +56,9 @@ from ombrebrain.context.context_request_mutation_shadow import (
 from ombrebrain.context.context_real_injection import (
     select_context_injected_body,
 )
+from ombrebrain.context.pipeline_state import (
+    build_context_chain_event,
+)
 from ombrebrain.gateway.gateway_runtime import (
     record_cache_usage,
     resolve_upstream_base,
@@ -1563,6 +1566,25 @@ async def _observe_unified_context_shadow(
         "stored"
     ):
         return False
+
+    # Unified internal Context event. Observation-only: it re-reads
+    # nothing from disk and never affects forwarding, so it stays
+    # fail-open. Existing per-stage logs are unchanged.
+    try:
+        logger.info(
+            "[gateway.context_event] %s",
+            json.dumps(
+                build_context_chain_event(
+                    unified=unified,
+                    preview=preview,
+                    gate=gate,
+                ),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        )
+    except Exception:
+        pass
 
     # This request refreshed the whole chain. A fresh deny is still
     # fresh; the selector decides whether injection is allowed.
