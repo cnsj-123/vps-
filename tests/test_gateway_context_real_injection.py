@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import (
+    AsyncMock,
     Mock,
     patch,
 )
@@ -1209,6 +1210,306 @@ class GatewayRealInjectionRequestTests(
         self.assertEqual(
             sent_payload["tools"],
             original["tools"],
+        )
+
+    # --------------------------------------------------
+    # prerequisite freshness
+    # --------------------------------------------------
+
+    _CHAIN_TARGETS = (
+        (
+            "conversation",
+            "observe_conversation_shadow",
+        ),
+        (
+            "snapshot",
+            "update_conversation_snapshot",
+        ),
+        (
+            "compact",
+            "update_conversation_compact",
+        ),
+        (
+            "trusted_facts",
+            "update_conversation_trusted_facts",
+        ),
+        (
+            "semantic",
+            "update_conversation_semantic",
+        ),
+        (
+            "semantic_state",
+            "update_semantic_state",
+        ),
+        (
+            "candidate",
+            "update_conversation_context_candidate",
+        ),
+        (
+            "unified",
+            "update_unified_context_candidate_from_runtime",
+        ),
+        (
+            "preview",
+            "update_context_injection_preview",
+        ),
+        (
+            "gate",
+            "update_context_injection_gate",
+        ),
+    )
+
+    def _mock_chain(self) -> dict:
+        mocks = {
+            "conversation":
+                Mock(
+                    return_value={
+                        "observed":
+                            True,
+                        "conversation_id":
+                            CID,
+                        "boundary_prefix_sha256":
+                            "a" * 64,
+                        "round":
+                            1,
+                        "new_conversation":
+                            False,
+                        "duplicate":
+                            False,
+                        "continuity":
+                            "same",
+                        "messages_count":
+                            3,
+                    }
+                ),
+            "unified":
+                AsyncMock(
+                    return_value={
+                        "stored": True,
+                        "revision": 1,
+                    }
+                ),
+        }
+
+        for key, _name in self._CHAIN_TARGETS:
+            if key in mocks:
+                continue
+
+            mocks[key] = Mock(
+                return_value={
+                    "stored": True,
+                    "revision": 1,
+                    "decision":
+                        "allow_shadow",
+                }
+            )
+
+        return mocks
+
+    def _patch_chain(
+        self,
+        mocks: dict,
+    ) -> None:
+        for key, name in self._CHAIN_TARGETS:
+            self.enterContext(
+                patch.object(
+                    gateway,
+                    name,
+                    mocks[key],
+                )
+            )
+
+    def _chain_env(
+        self,
+        *,
+        real_injection: str,
+    ) -> dict:
+        return {
+            **_ISOLATED_ENV,
+            _REAL_INJECTION_ENV:
+                real_injection,
+            "OMBRE_GATEWAY_UPSTREAM":
+                "https://upstream.invalid",
+            "OMBRE_GATEWAY_STATE_DIR":
+                self.root,
+            "OMBRE_CONTEXT_STATE_DIR":
+                self.root,
+        }
+
+    async def test_real_injection_alone_drives_context_chain(
+        self,
+    ):
+        # Every observability shadow flag is 0. Real Injection alone
+        # must refresh conversation -> ... -> gate for this request.
+        mocks = self._mock_chain()
+
+        self._patch_chain(
+            mocks
+        )
+
+        body = body_from(
+            base_payload()
+        )
+
+        with patch.dict(
+            os.environ,
+            self._chain_env(
+                real_injection="1"
+            ),
+            clear=False,
+        ):
+            conversation_id = (
+                gateway._observe_context_shadow(
+                    body
+                )
+            )
+
+            await (
+                gateway._observe_unified_context_shadow(
+                    conversation_id
+                )
+            )
+
+        self.assertEqual(
+            conversation_id,
+            CID,
+        )
+
+        for key, _name in self._CHAIN_TARGETS:
+            with self.subTest(
+                stage=key
+            ):
+                self.assertTrue(
+                    mocks[key].called,
+                    key,
+                )
+
+        mocks["conversation"].assert_called_once_with(
+            body
+        )
+
+        mocks["unified"].assert_awaited_once_with(
+            CID
+        )
+
+        mocks["preview"].assert_called_once_with(
+            CID
+        )
+
+        mocks["gate"].assert_called_once_with(
+            CID
+        )
+
+    async def test_disabled_real_injection_runs_no_context_chain(
+        self,
+    ):
+        mocks = self._mock_chain()
+
+        self._patch_chain(
+            mocks
+        )
+
+        body = body_from(
+            base_payload()
+        )
+
+        with patch.dict(
+            os.environ,
+            self._chain_env(
+                real_injection="0"
+            ),
+            clear=False,
+        ):
+            conversation_id = (
+                gateway._observe_context_shadow(
+                    body
+                )
+            )
+
+            await (
+                gateway._observe_unified_context_shadow(
+                    CID
+                )
+            )
+
+        self.assertIsNone(
+            conversation_id
+        )
+
+        for key, _name in self._CHAIN_TARGETS:
+            with self.subTest(
+                stage=key
+            ):
+                self.assertFalse(
+                    mocks[key].called,
+                    key,
+                )
+
+    async def test_real_injection_works_with_mutation_shadow_off(
+        self,
+    ):
+        # REQUEST_MUTATION_SHADOW is explicitly 0 in the isolated env.
+        self.assertEqual(
+            _ISOLATED_ENV[
+                "OMBRE_GATEWAY_CONTEXT_REQUEST_MUTATION_SHADOW"
+            ],
+            "0",
+        )
+
+        self._write_state()
+
+        mocks = self._mock_chain()
+
+        self._patch_chain(
+            mocks
+        )
+
+        body = body_from(
+            base_payload()
+        )
+
+        response, client = (
+            await self._call_gateway(
+                body,
+                environ=self._chain_env(
+                    real_injection="1"
+                ),
+            )
+        )
+
+        self.assertEqual(
+            response.status_code,
+            200,
+        )
+
+        # Prerequisite chain was refreshed by real injection alone.
+        self.assertTrue(
+            mocks["gate"].called
+        )
+
+        # The selector still ran and injected, even though the
+        # mutation shadow logging flag is off.
+        sent = client.built[0].content
+
+        self.assertNotEqual(
+            sent,
+            body,
+        )
+
+        blocks = json.loads(
+            sent
+        )["messages"][-1]["content"]
+
+        self.assertEqual(
+            blocks[0],
+            {
+                "type":
+                    "text",
+                "text":
+                    preview()[
+                        "rendered"
+                    ],
+            },
         )
 
 
