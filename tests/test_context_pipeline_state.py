@@ -806,5 +806,259 @@ class ChainEventRound2Tests(
         )
 
 
+class PipelineNormalizationGapsTests(
+    unittest.TestCase
+):
+    """Supplemental coverage: payload normalization edges."""
+
+    def test_unknown_stage_returns_common_fields_only(
+        self,
+    ):
+        payload = unified_payload()
+
+        state = from_stage_payload(
+            "not_a_real_stage",
+            payload,
+        )
+
+        self.assertEqual(
+            state.stage,
+            "not_a_real_stage",
+        )
+
+        # Unrecognized stages skip stage-specific parsing, so the
+        # Unified-only fields are not lifted out of the payload.
+        self.assertIsNone(state.decision)
+        self.assertEqual(state.metadata, {})
+
+        # Common fields still normalize.
+        self.assertEqual(
+            state.conversation_id,
+            CID,
+        )
+        self.assertEqual(state.revision, 3)
+        self.assertEqual(
+            state.sections,
+            payload["sections"],
+        )
+
+    def test_non_dict_telemetry_is_ignored(
+        self,
+    ):
+        for bad in ("x", 5, [], None, True):
+            state = from_stage_payload(
+                STAGE_PREVIEW,
+                {
+                    "telemetry": bad,
+                    "eligible": True,
+                },
+            )
+
+            self.assertIsNone(
+                state.estimated_tokens,
+                bad,
+            )
+            self.assertIsNone(
+                state.token_budget,
+                bad,
+            )
+
+    def test_non_dict_sections_become_empty(
+        self,
+    ):
+        for bad in ("x", 5, [], None, True):
+            state = from_stage_payload(
+                STAGE_UNIFIED,
+                {"sections": bad},
+            )
+
+            self.assertEqual(
+                state.sections,
+                {},
+                bad,
+            )
+
+    def test_preview_eligible_with_reason_stays_eligible(
+        self,
+    ):
+        # The parser records raw fields; it does not adjudicate
+        # Preview self-consistency. Documents current behavior.
+        state = from_stage_payload(
+            STAGE_PREVIEW,
+            preview_payload(
+                eligible=True,
+                reason="some_reason",
+            ),
+        )
+
+        self.assertEqual(
+            state.decision,
+            "eligible",
+        )
+        self.assertEqual(
+            state.metadata["reason"],
+            "some_reason",
+        )
+
+    def test_large_revision_values_are_kept(
+        self,
+    ):
+        big = 2 ** 53
+
+        state = from_stage_payload(
+            STAGE_GATE,
+            gate_payload(revision=big),
+        )
+
+        self.assertEqual(state.revision, big)
+
+    def test_stage_metrics_is_privacy_safe(
+        self,
+    ):
+        state = from_stage_payload(
+            STAGE_PREVIEW,
+            preview_payload(),
+        )
+
+        metrics = state.stage_metrics()
+
+        self.assertEqual(
+            set(metrics),
+            {
+                "conversation_id",
+                "revision",
+                "source_revision",
+                "estimated_tokens",
+                "token_budget",
+                "decision",
+                "freshness_state",
+            },
+        )
+
+        serialized = json.dumps(
+            metrics,
+            ensure_ascii=False,
+        )
+
+        for secret in (
+            "secret-render",
+            "OMBRE CONTEXT DATA",
+            "secret-fact",
+        ):
+            self.assertNotIn(
+                secret,
+                serialized,
+            )
+
+        # The raw sections container never leaks into the summary.
+        self.assertNotIn(
+            "sections",
+            metrics,
+        )
+
+    def test_preview_rendered_text_is_not_hoisted(
+        self,
+    ):
+        state = from_stage_payload(
+            STAGE_PREVIEW,
+            preview_payload(),
+        )
+
+        # The Preview payload carries rendered text on disk, but the
+        # normalized state never exposes it as a field.
+        self.assertFalse(
+            hasattr(state, "rendered")
+        )
+        self.assertEqual(state.sections, {})
+
+
+class ToEventGapsTests(
+    unittest.TestCase
+):
+    """Supplemental coverage: to_event without a freshness report."""
+
+    def test_event_key_set_is_stable(
+        self,
+    ):
+        from ombrebrain.context.pipeline_events import (
+            to_event,
+        )
+
+        state = from_stage_payload(
+            STAGE_GATE,
+            gate_payload(),
+        )
+
+        event = to_event(state, reason="r")
+
+        self.assertEqual(
+            set(event),
+            {
+                "stage",
+                "decision",
+                "revision",
+                "estimated_tokens",
+                "reason",
+                "metrics",
+            },
+        )
+        self.assertEqual(event["stage"], STAGE_GATE)
+        self.assertEqual(
+            event["decision"],
+            "allow_shadow",
+        )
+        self.assertEqual(event["reason"], "r")
+
+    def test_freshness_key_absent_when_not_supplied(
+        self,
+    ):
+        from ombrebrain.context.pipeline_events import (
+            to_event,
+        )
+
+        state = from_stage_payload(
+            STAGE_PREVIEW,
+            preview_payload(),
+        )
+
+        event = to_event(state)
+
+        self.assertNotIn(
+            "freshness",
+            event["metrics"],
+        )
+
+    def test_freshness_report_is_copied_not_aliased(
+        self,
+    ):
+        from ombrebrain.context.pipeline_events import (
+            to_event,
+        )
+
+        state = from_stage_payload(
+            STAGE_PREVIEW,
+            preview_payload(),
+        )
+
+        freshness = {
+            "valid": True,
+            "reason": None,
+        }
+
+        event = to_event(
+            state,
+            freshness=freshness,
+        )
+
+        self.assertEqual(
+            event["metrics"]["freshness"],
+            freshness,
+        )
+        self.assertIsNot(
+            event["metrics"]["freshness"],
+            freshness,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
