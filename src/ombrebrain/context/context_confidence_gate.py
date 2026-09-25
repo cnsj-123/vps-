@@ -115,15 +115,24 @@ _KNOWN_RETRIEVAL_OUTCOMES = frozenset(
     )
 )
 
-# Reasons that mean the observation itself is structurally broken or
-# was interrupted by a concurrent request (revision / source-chain),
-# not "the evidence is consistent but not trustworthy enough".
-# These are reported as deny_shadow but are NEVER persisted: they are
-# not valid evidence decisions. Every other deny reason (staleness,
-# current_user_not_excluded, malformed telemetry, ...) is a normal
-# shadow decision and keeps being persisted.
+# Reasons that mean the observation itself is not a trustworthy
+# evidence decision: either its identity/version is invalid, or its
+# revision / source chain was broken or interrupted by a concurrent
+# request. These are reported as deny_shadow but are NEVER
+# persisted: they are not valid evidence decisions.
+#
+# Every other deny reason (stale carried-forward sources, current
+# user not excluded, retrieval observation unavailable, no usable
+# context evidence, malformed telemetry, ...) is a normal
+# evidence-quality shadow decision and keeps being persisted.
 _NON_PERSISTABLE_REASONS = frozenset(
     (
+        # identity / version / conversation binding
+        "invalid_conversation_candidate",
+        "invalid_unified_candidate",
+        "conversation_candidate_conversation_mismatch",
+        "unified_conversation_mismatch",
+        # revision / source chain
         "invalid_candidate_revision",
         "invalid_candidate_source_revision",
         "invalid_unified_revision",

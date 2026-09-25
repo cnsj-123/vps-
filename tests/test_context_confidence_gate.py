@@ -2291,6 +2291,303 @@ class ConfidenceGatePersistenceTests(
             self._state_path().is_file()
         )
 
+    # --------------------------------------------------
+    # structural identity / version errors
+    # --------------------------------------------------
+
+    def test_invalid_candidate_version_is_not_persisted(
+        self,
+    ):
+        self._write(
+            "context_candidate",
+            {
+                **candidate(),
+                "version":
+                    "other",
+            },
+        )
+
+        self._write(
+            "unified_context_candidate",
+            unified(),
+        )
+
+        report = self._update(
+            expected_unified_revision=3
+        )
+
+        self.assertIs(
+            report["stored"],
+            False,
+        )
+
+        self.assertEqual(
+            report["decision"],
+            "deny_shadow",
+        )
+
+        self.assertEqual(
+            report["reason"],
+            "invalid_conversation_candidate",
+        )
+
+        self.assertFalse(
+            self._state_path().is_file()
+        )
+
+    def test_invalid_unified_version_is_not_persisted(
+        self,
+    ):
+        self._write(
+            "context_candidate",
+            candidate(),
+        )
+
+        self._write(
+            "unified_context_candidate",
+            {
+                **unified(),
+                "version":
+                    "other",
+            },
+        )
+
+        report = self._update(
+            expected_unified_revision=3
+        )
+
+        self.assertIs(
+            report["stored"],
+            False,
+        )
+
+        self.assertEqual(
+            report["decision"],
+            "deny_shadow",
+        )
+
+        self.assertEqual(
+            report["reason"],
+            "invalid_unified_candidate",
+        )
+
+        self.assertFalse(
+            self._state_path().is_file()
+        )
+
+    def test_candidate_conversation_mismatch_is_not_persisted(
+        self,
+    ):
+        broken = candidate()
+
+        broken["conversation_id"] = (
+            "ctx_ffffffffffffffff"
+        )
+
+        self._write(
+            "context_candidate",
+            broken,
+        )
+
+        self._write(
+            "unified_context_candidate",
+            unified(),
+        )
+
+        report = self._update(
+            expected_unified_revision=3
+        )
+
+        self.assertIs(
+            report["stored"],
+            False,
+        )
+
+        self.assertEqual(
+            report["decision"],
+            "deny_shadow",
+        )
+
+        self.assertEqual(
+            report["reason"],
+            "conversation_candidate_conversation_mismatch",
+        )
+
+        self.assertFalse(
+            self._state_path().is_file()
+        )
+
+    def test_unified_conversation_mismatch_is_not_persisted(
+        self,
+    ):
+        broken = unified()
+
+        broken["conversation_id"] = (
+            "ctx_ffffffffffffffff"
+        )
+
+        self._write(
+            "context_candidate",
+            candidate(),
+        )
+
+        self._write(
+            "unified_context_candidate",
+            broken,
+        )
+
+        report = self._update(
+            expected_unified_revision=3
+        )
+
+        self.assertIs(
+            report["stored"],
+            False,
+        )
+
+        self.assertEqual(
+            report["decision"],
+            "deny_shadow",
+        )
+
+        self.assertEqual(
+            report["reason"],
+            "unified_conversation_mismatch",
+        )
+
+        self.assertFalse(
+            self._state_path().is_file()
+        )
+
+    def test_structural_identity_error_preserves_existing_state(
+        self,
+    ):
+        self._write(
+            "context_candidate",
+            candidate(),
+        )
+
+        self._write(
+            "unified_context_candidate",
+            unified(),
+        )
+
+        first = self._update(
+            expected_unified_revision=3
+        )
+
+        self.assertIs(
+            first["stored"],
+            True,
+        )
+
+        self.assertEqual(
+            first["revision"],
+            1,
+        )
+
+        before = self._state_path().read_text(
+            encoding="utf-8"
+        )
+
+        bad_candidate_version = candidate()
+
+        bad_candidate_version["version"] = (
+            "other"
+        )
+
+        bad_unified_version = unified()
+
+        bad_unified_version["version"] = (
+            "other"
+        )
+
+        bad_candidate_id = candidate()
+
+        bad_candidate_id["conversation_id"] = (
+            "ctx_ffffffffffffffff"
+        )
+
+        bad_unified_id = unified()
+
+        bad_unified_id["conversation_id"] = (
+            "ctx_ffffffffffffffff"
+        )
+
+        cases = (
+            (
+                "candidate_version",
+                "context_candidate",
+                bad_candidate_version,
+            ),
+            (
+                "unified_version",
+                "unified_context_candidate",
+                bad_unified_version,
+            ),
+            (
+                "candidate_conversation",
+                "context_candidate",
+                bad_candidate_id,
+            ),
+            (
+                "unified_conversation",
+                "unified_context_candidate",
+                bad_unified_id,
+            ),
+        )
+
+        for name, kind, payload in cases:
+            with self.subTest(
+                case=name
+            ):
+                self._write(
+                    "context_candidate",
+                    candidate(),
+                )
+
+                self._write(
+                    "unified_context_candidate",
+                    unified(),
+                )
+
+                self._write(
+                    kind,
+                    payload,
+                )
+
+                report = self._update(
+                    expected_unified_revision=3
+                )
+
+                self.assertIs(
+                    report["stored"],
+                    False,
+                )
+
+                self.assertEqual(
+                    report["decision"],
+                    "deny_shadow",
+                )
+
+                # Byte-for-byte unchanged and the Confidence
+                # revision did not move.
+                self.assertEqual(
+                    self._state_path().read_text(
+                        encoding="utf-8"
+                    ),
+                    before,
+                )
+
+        persisted = json.loads(
+            before
+        )
+
+        self.assertEqual(
+            persisted["revision"],
+            1,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
