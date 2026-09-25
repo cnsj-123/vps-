@@ -317,6 +317,121 @@ class ContextInjectionGateTests(
             result["reasons"],
         )
 
+    def test_missing_revision_is_denied(
+        self,
+    ):
+        # A missing revision anywhere in the chain must deny. It is
+        # never "fresh" just because both sides are absent.
+        cases = (
+            (
+                "candidate_revision",
+                "candidate",
+                "revision",
+            ),
+            (
+                "unified_candidate_source_revision",
+                "unified_source",
+                "conversation_candidate",
+            ),
+            (
+                "conversation_source_revision",
+                "candidate",
+                "source_revision",
+            ),
+            (
+                "preview_source_revision",
+                "preview",
+                "source_revision",
+            ),
+            (
+                "unified_revision",
+                "unified",
+                "revision",
+            ),
+        )
+
+        for label, target, field in cases:
+            with self.subTest(
+                label=label
+            ):
+                c = candidate()
+                u = unified()
+                p = preview()
+
+                if target == "candidate":
+                    c[field] = None
+                elif target == "unified":
+                    u[field] = None
+                elif target == "preview":
+                    p[field] = None
+                elif target == "unified_source":
+                    u["source_revisions"][
+                        field
+                    ] = None
+
+                result = (
+                    evaluate_context_injection_gate(
+                        conversation_id=CID,
+                        conversation_candidate=c,
+                        unified=u,
+                        preview=p,
+                    )
+                )
+
+                self.assertEqual(
+                    result["decision"],
+                    "deny",
+                    label,
+                )
+
+                self.assertFalse(
+                    result["allowed"],
+                    label,
+                )
+
+                self.assertTrue(
+                    result["reasons"],
+                    label,
+                )
+
+    def test_none_equals_none_is_not_fresh(
+        self,
+    ):
+        # Regression: a revision-less chain used to pass the plain
+        # equality check (None == None). It must now deny.
+        c = candidate()
+
+        c["revision"] = None
+
+        u = unified()
+
+        u["source_revisions"][
+            "conversation_candidate"
+        ] = None
+
+        result = (
+            evaluate_context_injection_gate(
+                conversation_id=CID,
+                conversation_candidate=c,
+                unified=u,
+                preview=preview(),
+            )
+        )
+
+        self.assertEqual(
+            result["decision"],
+            "deny",
+        )
+
+        self.assertFalse(
+            result["allowed"]
+        )
+
+        self.assertIn(
+            "candidate_revision_invalid",
+            result["reasons"],
+        )
+
 
 class ContextInjectionGateStorageTests(
     unittest.TestCase

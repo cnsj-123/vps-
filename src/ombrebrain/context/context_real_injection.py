@@ -10,6 +10,10 @@ from typing import Any
 from ombrebrain.context.context_request_mutation_shadow import (
     build_context_request_mutation_shadow_from_runtime,
 )
+from ombrebrain.context.validators.freshness import (
+    is_valid_revision,
+    validate_context_freshness,
+)
 
 
 _VERSION = "context-real-injection.v1"
@@ -140,24 +144,6 @@ def _valid_nonnegative_int(
             bool,
         )
         and value >= 0
-    )
-
-
-def _valid_revision(
-    value: Any,
-) -> bool:
-    """Revisions are 1-based."""
-
-    return (
-        isinstance(
-            value,
-            int,
-        )
-        and not isinstance(
-            value,
-            bool,
-        )
-        and value >= 1
     )
 
 
@@ -493,7 +479,7 @@ def _select_enabled(
         "revision"
     )
 
-    if not _valid_revision(
+    if not is_valid_revision(
         preview_revision
     ):
         return (
@@ -509,7 +495,7 @@ def _select_enabled(
         "source_revision"
     )
 
-    if not _valid_revision(
+    if not is_valid_revision(
         preview_source_revision
     ):
         return (
@@ -576,60 +562,67 @@ def _select_enabled(
     # --------------------------------------------------
 
     # Gate must be evaluating exactly the Preview that will be
-    # injected...
-    gate_preview_revision = gate.get(
-        "source_preview_revision"
-    )
-
-    if not _valid_revision(
-        gate_preview_revision
-    ):
-        return (
-            forward_body,
-            _denied(
-                report,
-                "invalid_gate_source_revision",
+    # injected. Shared freshness validator is the single source of
+    # truth for this revision-chain rule.
+    gate_preview_freshness = (
+        validate_context_freshness(
+            checked_revision=gate.get(
+                "source_preview_revision"
+            ),
+            expected_revision=(
+                preview_revision
+            ),
+            invalid_reason=(
+                "invalid_gate_source_revision"
+            ),
+            mismatch_reason=(
+                "preview_revision_mismatch"
             ),
         )
+    )
 
-    if (
-        gate_preview_revision
-        != preview_revision
-    ):
+    if not gate_preview_freshness[
+        "valid"
+    ]:
         return (
             forward_body,
             _denied(
                 report,
-                "preview_revision_mismatch",
+                gate_preview_freshness[
+                    "reason"
+                ],
             ),
         )
 
     # ...and that Preview must have been rendered from the same
     # Unified revision the Gate evaluated.
-    gate_unified_revision = gate.get(
-        "source_unified_revision"
-    )
-
-    if not _valid_revision(
-        gate_unified_revision
-    ):
-        return (
-            forward_body,
-            _denied(
-                report,
-                "invalid_gate_unified_revision",
+    gate_unified_freshness = (
+        validate_context_freshness(
+            checked_revision=gate.get(
+                "source_unified_revision"
+            ),
+            expected_revision=(
+                preview_source_revision
+            ),
+            invalid_reason=(
+                "invalid_gate_unified_revision"
+            ),
+            mismatch_reason=(
+                "unified_revision_mismatch"
             ),
         )
+    )
 
-    if (
-        gate_unified_revision
-        != preview_source_revision
-    ):
+    if not gate_unified_freshness[
+        "valid"
+    ]:
         return (
             forward_body,
             _denied(
                 report,
-                "unified_revision_mismatch",
+                gate_unified_freshness[
+                    "reason"
+                ],
             ),
         )
 

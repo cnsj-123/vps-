@@ -472,6 +472,64 @@ class ContextRequestMutationShadowTests(
             "render_hash_mismatch",
         )
 
+    def test_missing_preview_revision_is_rejected(
+        self,
+    ):
+        # Shared freshness validator: a None revision is invalid, not
+        # "fresh". The mutation must not proceed.
+        body = body_from(
+            base_payload()
+        )
+
+        g = gate()
+        g["source_preview_revision"] = None
+
+        mutated, report = (
+            build_context_request_mutation_shadow(
+                body,
+                preview=preview(),
+                gate=g,
+            )
+        )
+
+        self.assertEqual(
+            mutated,
+            body,
+        )
+
+        self.assertEqual(
+            report["reason"],
+            "preview_revision_invalid",
+        )
+
+    def test_mismatched_preview_revision_is_rejected(
+        self,
+    ):
+        body = body_from(
+            base_payload()
+        )
+
+        g = gate()
+        g["source_preview_revision"] = 999
+
+        mutated, report = (
+            build_context_request_mutation_shadow(
+                body,
+                preview=preview(),
+                gate=g,
+            )
+        )
+
+        self.assertEqual(
+            mutated,
+            body,
+        )
+
+        self.assertEqual(
+            report["reason"],
+            "preview_revision_mismatch",
+        )
+
     def test_existing_context_is_not_added_twice(
         self,
     ):

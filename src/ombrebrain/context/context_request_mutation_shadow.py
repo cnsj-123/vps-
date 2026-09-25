@@ -14,6 +14,9 @@ from ombrebrain.gateway.cache_fingerprint import (
 from ombrebrain.gateway.operit_adapter import (
     OperitAdapter,
 )
+from ombrebrain.context.validators.freshness import (
+    validate_context_freshness,
+)
 
 
 _VERSION = "context-request-mutation-shadow.v1"
@@ -208,16 +211,29 @@ def build_context_request_mutation_shadow(
         )
         return body, report
 
-    if (
-        gate.get(
-            "source_preview_revision"
+    # Shared freshness rule: the Gate must have evaluated exactly the
+    # Preview we are about to mutate with. A missing revision on
+    # either side is invalid, not "fresh".
+    preview_freshness = (
+        validate_context_freshness(
+            checked_revision=gate.get(
+                "source_preview_revision"
+            ),
+            expected_revision=preview.get(
+                "revision"
+            ),
+            invalid_reason=(
+                "preview_revision_invalid"
+            ),
+            mismatch_reason=(
+                "preview_revision_mismatch"
+            ),
         )
-        != preview.get(
-            "revision"
-        )
-    ):
+    )
+
+    if not preview_freshness["valid"]:
         report["reason"] = (
-            "preview_revision_mismatch"
+            preview_freshness["reason"]
         )
         return body, report
 

@@ -3,6 +3,9 @@ from typing import Any
 from ombrebrain.context.pack import ContextPack, ContextPackBuilder
 from ombrebrain.state.service import StateService
 from ombrebrain.context.retrieval import ContextRetrievalAdapter
+from ombrebrain.context.retrieval.quality import (
+    RetrievalQualityShadow,
+)
 
 class ContextService:
     def __init__(
@@ -16,6 +19,64 @@ class ContextService:
         self.bucket_mgr = bucket_mgr
         self.builder = ContextPackBuilder(token_budget=token_budget)
         self.retrieval = ContextRetrievalAdapter(bucket_mgr=bucket_mgr, embedding_engine=embedding_engine)
+        # Retrieval v2 shadow pipeline. Observation-only: it
+        # never changes the retrieval result returned below.
+        self.retrieval_shadow_v2 = RetrievalQualityShadow()
+
+    def _observe_retrieval_shadow_v2(
+        self,
+        legacy_selected: list[Any],
+        observation: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Run the Retrieval v2 shadow next to the live result.
+
+        The shadow observes the *pre-selection* candidate pool of THIS
+        request, taken from the observation returned by
+        ``retrieve_with_observation()`` — never from a shared instance
+        field, so concurrent requests cannot mix pools.
+        ``legacy_selected`` is passed only so the shadow can measure
+        whether V2 ordering would differ.
+
+        Fail-open: any error degrades to a neutral event and never
+        affects the real retrieval result.
+        """
+
+        try:
+            event = (
+                self.retrieval_shadow_v2
+                .observe(
+                    observation.get(
+                        "candidates"
+                    )
+                    or [],
+                    vector_scores=(
+                        observation.get(
+                            "vector_scores"
+                        )
+                    ),
+                    legacy_selected=(
+                        legacy_selected
+                    ),
+                )
+            )
+        except Exception:
+            # Shadow-only fail-open: telemetry must never break
+            # the live retrieval path.
+            return (
+                RetrievalQualityShadow
+                .observe_failed()
+            )
+
+        try:
+            self.retrieval_shadow_v2.emit(
+                event
+            )
+        except Exception:
+            # Shadow-only fail-open: logging must never break
+            # the live retrieval path.
+            pass
+
+        return event
 
     async def get_candidates(
         self,
@@ -83,6 +144,9 @@ class ContextService:
                 "would_keep_missing_last_active":
                     0,
             },
+            # Retrieval v2 shadow event. Empty when no query
+            # was run, so the telemetry shape stays stable.
+            "retrieval_quality_v2": {},
             "outcome": "empty_query",
         }
         anti_echo: dict[str, int] = {}
@@ -100,13 +164,29 @@ class ContextService:
                     self.bucket_mgr.embedding_engine
                 )
 
-            memories = await self.retrieval.retrieve(
-                query,
-                max_results=self.builder.max_memories,
+            memories, retrieval_observation = (
+                await self.retrieval
+                .retrieve_with_observation(
+                    query,
+                    max_results=(
+                        self.builder.max_memories
+                    ),
+                )
+            )
+
+            # Retrieval v2 shadow. Runs next to the old result
+            # above; the returned memories are never modified.
+            retrieval_quality_v2 = (
+                self._observe_retrieval_shadow_v2(
+                    memories,
+                    retrieval_observation,
+                )
             )
 
             telemetry = (
-                self.retrieval.last_telemetry
+                retrieval_observation.get(
+                    "telemetry"
+                )
                 or {}
             )
 
@@ -201,6 +281,10 @@ class ContextService:
                         )
                         or {}
                     ),
+                # Retrieval v2 shadow event (counts and score
+                # statistics only, never text, ids or query).
+                "retrieval_quality_v2":
+                    retrieval_quality_v2,
                 "outcome":
                     str(
                         telemetry.get(
@@ -267,8 +351,8 @@ class ContextService:
         anti_echo = {}
         dedup = {}
         if query.strip() and not memories:
-            memories = await self.retrieval.retrieve(query, max_results=self.builder.max_memories)
-            telemetry = self.retrieval.last_telemetry or {}
+            memories, retrieval_observation = await self.retrieval.retrieve_with_observation(query, max_results=self.builder.max_memories)
+            telemetry = retrieval_observation.get("telemetry") or {}
             retrieval_candidate_count = int(telemetry.get("candidate_count", 0))
             relevance_rejected = int(telemetry.get("relevance_rejected", 0))
             anti_echo = {k: int(v) for k, v in telemetry.items() if k.startswith("anti_echo_")}
