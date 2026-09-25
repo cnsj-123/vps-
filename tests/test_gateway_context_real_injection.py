@@ -45,8 +45,6 @@ _SPEC.loader.exec_module(
     gateway
 )
 
-<<<<<<< HEAD
-=======
 # Context pipeline orchestration now lives in the context
 # coordinator; the gateway only calls into it and forwards the
 # body the coordinator returns. Conversation observation stages
@@ -58,7 +56,6 @@ from ombrebrain.context import (
     context_pipeline_coordinator as coordinator,
 )
 
->>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
 
 CID = "ctx_0123456789abcdef"
 
@@ -420,11 +417,7 @@ class GatewayRealInjectionSelectionTests(
         context_chain_fresh=True,
     ):
         return (
-<<<<<<< HEAD
-            gateway._select_context_real_injection(
-=======
             coordinator.select_real_injection(
->>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
                 conversation_id,
                 self.body
                 if body is None
@@ -454,11 +447,7 @@ class GatewayRealInjectionSelectionTests(
             )
 
             with patch.object(
-<<<<<<< HEAD
-                gateway,
-=======
                 coordinator,
->>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
                 "select_context_injected_body",
                 selector,
             ):
@@ -486,11 +475,7 @@ class GatewayRealInjectionSelectionTests(
             clear=False,
         ):
             with patch.object(
-<<<<<<< HEAD
-                gateway,
-=======
                 coordinator,
->>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
                 "select_context_injected_body",
                 selector,
             ):
@@ -529,11 +514,7 @@ class GatewayRealInjectionSelectionTests(
             clear=False,
         ):
             with patch.object(
-<<<<<<< HEAD
-                gateway,
-=======
                 coordinator,
->>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
                 "select_context_injected_body",
                 selector,
             ):
@@ -580,11 +561,7 @@ class GatewayRealInjectionSelectionTests(
             clear=False,
         ):
             with patch.object(
-<<<<<<< HEAD
-                gateway,
-=======
                 coordinator,
->>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
                 "select_context_injected_body",
                 selector,
             ):
@@ -614,11 +591,7 @@ class GatewayRealInjectionSelectionTests(
             clear=False,
         ):
             with patch.object(
-<<<<<<< HEAD
-                gateway,
-=======
                 coordinator,
->>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
                 "select_context_injected_body",
                 selector,
             ):
@@ -654,11 +627,7 @@ class GatewayRealInjectionSelectionTests(
                     clear=False,
                 ):
                     with patch.object(
-<<<<<<< HEAD
-                        gateway,
-=======
                         coordinator,
->>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
                         "select_context_injected_body",
                         selector,
                     ):
@@ -688,11 +657,7 @@ class GatewayRealInjectionSelectionTests(
             clear=False,
         ):
             with patch.object(
-<<<<<<< HEAD
-                gateway,
-=======
                 coordinator,
->>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
                 "select_context_injected_body",
                 selector,
             ):
@@ -861,11 +826,7 @@ class GatewayRealInjectionSelectionTests(
                 clear=False,
             ):
                 with patch.object(
-<<<<<<< HEAD
-                    gateway,
-=======
                     coordinator,
->>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
                     "select_context_injected_body",
                     selector,
                 ):
@@ -931,11 +892,7 @@ class GatewayRealInjectionSelectionTests(
                 clear=False,
             ):
                 with patch.object(
-<<<<<<< HEAD
-                    gateway,
-=======
                     coordinator,
->>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
                     "select_context_injected_body",
                     reader,
                 ):
@@ -976,11 +933,7 @@ class GatewayRealInjectionSelectionTests(
             clear=False,
         ):
             with patch.object(
-<<<<<<< HEAD
-                gateway,
-=======
                 coordinator,
->>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
                 "select_context_injected_body",
                 selector,
             ):
@@ -1015,11 +968,7 @@ class GatewayRealInjectionSelectionTests(
             clear=False,
         ):
             with patch.object(
-<<<<<<< HEAD
-                gateway,
-=======
                 coordinator,
->>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
                 "select_context_injected_body",
                 selector,
             ):
@@ -1128,11 +1077,7 @@ class GatewayRealInjectionSelectionTests(
                     clear=False,
                 ):
                     with patch.object(
-<<<<<<< HEAD
-                        gateway,
-=======
                         coordinator,
->>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
                         "select_context_injected_body",
                         selector,
                     ):
@@ -1169,11 +1114,7 @@ class GatewayRealInjectionSelectionTests(
             clear=False,
         ):
             with patch.object(
-<<<<<<< HEAD
-                gateway,
-=======
                 coordinator,
->>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
                 "select_context_injected_body",
                 selector,
             ):
@@ -1348,13 +1289,8 @@ class GatewayRealInjectionRequestTests(
             # prerequisite chain and declare this request fresh.
             patches.append(
                 patch.object(
-<<<<<<< HEAD
-                    gateway,
-                    "_observe_unified_context_shadow",
-=======
                     coordinator,
                     "observe_unified_preview_gate",
->>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
                     AsyncMock(
                         return_value=
                             unified_fresh
@@ -1401,11 +1337,7 @@ class GatewayRealInjectionRequestTests(
         )
 
         with patch.object(
-<<<<<<< HEAD
-            gateway,
-=======
             coordinator,
->>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
             "select_context_injected_body",
             selector,
         ):
@@ -1450,21 +1382,12 @@ class GatewayRealInjectionRequestTests(
         )
 
         with patch.object(
-<<<<<<< HEAD
-            gateway,
-            "select_context_injected_body",
-            selector,
-        ), patch.object(
-            gateway,
-            "_observe_context_shadow",
-=======
             coordinator,
             "select_context_injected_body",
             selector,
         ), patch.object(
             coordinator,
             "observe_context_sources",
->>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
             Mock(return_value=CID),
         ):
             response, client = (
@@ -1501,11 +1424,7 @@ class GatewayRealInjectionRequestTests(
         )
 
         with patch.object(
-<<<<<<< HEAD
-            gateway,
-=======
             coordinator,
->>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
             "select_context_injected_body",
             selector,
         ):
@@ -1566,21 +1485,12 @@ class GatewayRealInjectionRequestTests(
             "_rewrite_upstream_body",
             Mock(return_value=rewritten_body),
         ), patch.object(
-<<<<<<< HEAD
-            gateway,
-            "select_context_injected_body",
-            selector,
-        ), patch.object(
-            gateway,
-            "_observe_context_shadow",
-=======
             coordinator,
             "select_context_injected_body",
             selector,
         ), patch.object(
             coordinator,
             "observe_context_sources",
->>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
             Mock(return_value=CID),
         ):
             _response, client = (
@@ -1613,13 +1523,8 @@ class GatewayRealInjectionRequestTests(
         )
 
         with patch.object(
-<<<<<<< HEAD
-            gateway,
-            "_observe_context_shadow",
-=======
             coordinator,
             "observe_context_sources",
->>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
             Mock(return_value=CID),
         ):
             response, client = (
@@ -1692,11 +1597,6 @@ class GatewayRealInjectionRequestTests(
     # prerequisite freshness
     # --------------------------------------------------
 
-<<<<<<< HEAD
-    _CHAIN_TARGETS = (
-        (
-            "conversation",
-=======
     # (key, module, attribute). The conversation observation stages
     # live in context_observation_pipeline; the Unified -> Preview ->
     # Gate stages live in the context coordinator.
@@ -1704,79 +1604,51 @@ class GatewayRealInjectionRequestTests(
         (
             "conversation",
             observation,
->>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
             "observe_conversation_shadow",
         ),
         (
             "snapshot",
-<<<<<<< HEAD
-=======
             observation,
->>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
             "update_conversation_snapshot",
         ),
         (
             "compact",
-<<<<<<< HEAD
-=======
             observation,
->>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
             "update_conversation_compact",
         ),
         (
             "trusted_facts",
-<<<<<<< HEAD
-=======
             observation,
->>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
             "update_conversation_trusted_facts",
         ),
         (
             "semantic",
-<<<<<<< HEAD
-=======
             observation,
->>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
             "update_conversation_semantic",
         ),
         (
             "semantic_state",
-<<<<<<< HEAD
-=======
             observation,
->>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
             "update_semantic_state",
         ),
         (
             "candidate",
-<<<<<<< HEAD
-=======
             observation,
->>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
             "update_conversation_context_candidate",
         ),
         (
             "unified",
-<<<<<<< HEAD
-=======
             coordinator,
->>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
             "update_unified_context_candidate_from_runtime",
         ),
         (
             "preview",
-<<<<<<< HEAD
-=======
             coordinator,
->>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
             "update_context_injection_preview",
         ),
         (
             "gate",
-<<<<<<< HEAD
-=======
             coordinator,
->>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
             "update_context_injection_gate",
         ),
     )
@@ -1813,11 +1685,7 @@ class GatewayRealInjectionRequestTests(
                 ),
         }
 
-<<<<<<< HEAD
-        for key, _name in self._CHAIN_TARGETS:
-=======
         for key, _module, _name in self._CHAIN_TARGETS:
->>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
             if key in mocks:
                 continue
 
@@ -1836,17 +1704,10 @@ class GatewayRealInjectionRequestTests(
         self,
         mocks: dict,
     ) -> None:
-<<<<<<< HEAD
-        for key, name in self._CHAIN_TARGETS:
-            self.enterContext(
-                patch.object(
-                    gateway,
-=======
         for key, module, name in self._CHAIN_TARGETS:
             self.enterContext(
                 patch.object(
                     module,
->>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
                     name,
                     mocks[key],
                 )
@@ -1892,21 +1753,13 @@ class GatewayRealInjectionRequestTests(
             clear=False,
         ):
             conversation_id = (
-<<<<<<< HEAD
-                gateway._observe_context_shadow(
-=======
                 observation.observe_context_sources(
->>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
                     body
                 )
             )
 
             fresh = await (
-<<<<<<< HEAD
-                gateway._observe_unified_context_shadow(
-=======
                 coordinator.observe_unified_preview_gate(
->>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
                     conversation_id
                 )
             )
@@ -1921,11 +1774,7 @@ class GatewayRealInjectionRequestTests(
             True,
         )
 
-<<<<<<< HEAD
-        for key, _name in self._CHAIN_TARGETS:
-=======
         for key, _module, _name in self._CHAIN_TARGETS:
->>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
             with self.subTest(
                 stage=key
             ):
@@ -1971,21 +1820,13 @@ class GatewayRealInjectionRequestTests(
             clear=False,
         ):
             conversation_id = (
-<<<<<<< HEAD
-                gateway._observe_context_shadow(
-=======
                 observation.observe_context_sources(
->>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
                     body
                 )
             )
 
             fresh = await (
-<<<<<<< HEAD
-                gateway._observe_unified_context_shadow(
-=======
                 coordinator.observe_unified_preview_gate(
->>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
                     CID
                 )
             )
@@ -1999,11 +1840,7 @@ class GatewayRealInjectionRequestTests(
             False,
         )
 
-<<<<<<< HEAD
-        for key, _name in self._CHAIN_TARGETS:
-=======
         for key, _module, _name in self._CHAIN_TARGETS:
->>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
             with self.subTest(
                 stage=key
             ):
@@ -2323,11 +2160,7 @@ class GatewayRealInjectionRequestTests(
                 )
 
                 with patch.object(
-<<<<<<< HEAD
-                    gateway,
-=======
                     coordinator,
->>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
                     "select_context_injected_body",
                     selector,
                 ):
@@ -2496,25 +2329,15 @@ class GatewayRealInjectionRequestTests(
     # call ordering
     # --------------------------------------------------
 
-<<<<<<< HEAD
-    async def test_call_order_is_refresh_then_mutation_then_selector(
-        self,
-    ):
-        # Conversation -> Unified -> Preview -> Gate -> freshness
-        # -> Mutation Shadow -> Real Injection.
-=======
     async def test_context_pipeline_full_stage_order(
         self,
     ):
         # Conversation sources -> Unified -> Preview -> Gate
         # -> freshness -> Mutation Shadow -> Real Injection.
->>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
         order = []
 
         mocks = self._mock_chain()
 
-<<<<<<< HEAD
-=======
         def sources_impl(
             forward_body,
         ):
@@ -2522,7 +2345,6 @@ class GatewayRealInjectionRequestTests(
 
             return CID
 
->>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
         async def unified_impl(
             conversation_id,
         ):
@@ -2600,18 +2422,6 @@ class GatewayRealInjectionRequestTests(
             return forward_body
 
         with patch.object(
-<<<<<<< HEAD
-            gateway,
-            "_observe_context_shadow",
-            Mock(return_value=CID),
-        ), patch.object(
-            gateway,
-            "_observe_context_request_mutation_shadow",
-            Mock(side_effect=mutation_impl),
-        ), patch.object(
-            gateway,
-            "_select_context_real_injection",
-=======
             coordinator,
             "observe_context_sources",
             Mock(side_effect=sources_impl),
@@ -2622,7 +2432,6 @@ class GatewayRealInjectionRequestTests(
         ), patch.object(
             coordinator,
             "select_real_injection",
->>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
             Mock(side_effect=selector_impl),
         ):
             response, client = (
@@ -2642,10 +2451,7 @@ class GatewayRealInjectionRequestTests(
         self.assertEqual(
             order,
             [
-<<<<<<< HEAD
-=======
                 "sources",
->>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
                 "unified",
                 "preview",
                 "gate",
@@ -2698,19 +2504,11 @@ class GatewayRealInjectionRequestTests(
         selector = Mock()
 
         with patch.object(
-<<<<<<< HEAD
-            gateway,
-            "_observe_context_request_mutation_shadow",
-            observer,
-        ), patch.object(
-            gateway,
-=======
             coordinator,
             "observe_request_mutation",
             observer,
         ), patch.object(
             coordinator,
->>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
             "select_context_injected_body",
             selector,
         ):
@@ -2762,19 +2560,11 @@ class GatewayRealInjectionRequestTests(
         selector = Mock()
 
         with patch.object(
-<<<<<<< HEAD
-            gateway,
-            "_observe_context_request_mutation_shadow",
-            observer,
-        ), patch.object(
-            gateway,
-=======
             coordinator,
             "observe_request_mutation",
             observer,
         ), patch.object(
             coordinator,
->>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
             "select_context_injected_body",
             selector,
         ):
@@ -2854,19 +2644,11 @@ class GatewayRealInjectionRequestTests(
         ] = "1"
 
         with patch.object(
-<<<<<<< HEAD
-            gateway,
-            "build_context_request_mutation_shadow_from_runtime",
-            builder,
-        ), patch.object(
-            gateway,
-=======
             coordinator,
             "build_context_request_mutation_shadow_from_runtime",
             builder,
         ), patch.object(
             coordinator,
->>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
             "select_context_injected_body",
             selector,
         ):
@@ -2941,11 +2723,7 @@ class GatewayRealInjectionRequestTests(
         ] = "0"
 
         with patch.object(
-<<<<<<< HEAD
-            gateway,
-=======
             coordinator,
->>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
             "build_context_request_mutation_shadow_from_runtime",
             observer_builder,
         ):
@@ -2999,8 +2777,6 @@ class GatewayRealInjectionRequestTests(
         )
 
 
-<<<<<<< HEAD
-=======
 class GatewayCoordinatorDelegationTests(
     unittest.IsolatedAsyncioTestCase
 ):
@@ -3178,6 +2954,5 @@ class GatewayCoordinatorDelegationTests(
         )
 
 
->>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
 if __name__ == "__main__":
     unittest.main()
