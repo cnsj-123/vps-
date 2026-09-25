@@ -1552,6 +1552,32 @@ def update_unified_context_candidate(
     }
 
 
+def read_unified_context_candidate(
+    conversation_id: str,
+) -> dict[str, Any] | None:
+    """Read the persisted Unified artifact for shadow observers.
+
+    Read-only and total: returns the full stored artifact (``sections``
+    included) or None. It never changes candidate selection and exists
+    only so the shadow Memory Flash / Exposure Ledger observers can
+    consume the retrieval observation this request already produced.
+    """
+
+    try:
+        _validate_conversation_id(
+            conversation_id
+        )
+    except ValueError:
+        return None
+
+    return _read_json(
+        _path(
+            "unified_context_candidate",
+            conversation_id,
+        )
+    )
+
+
 def unified_context_candidate_status(
     conversation_id: str,
 ) -> dict[str, Any]:
