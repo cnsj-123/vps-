@@ -5,6 +5,9 @@ import json
 import logging
 import os
 
+from ombrebrain.context.context_confidence_gate import (
+    update_context_confidence_gate,
+)
 from ombrebrain.context.context_injection_gate import (
     update_context_injection_gate,
 )
@@ -33,12 +36,13 @@ from ombrebrain.context.unified_context_candidate import (
 # src/web/gateway.py:
 #
 #   Unified
-#     -> Preview
-#       -> Gate
-#         -> per-request freshness latch
-#           -> Mutation Shadow
-#             -> Real Injection selector
-#               -> selected_body
+#     -> Confidence Gate (shadow only)
+#       -> Preview
+#         -> Gate
+#           -> per-request freshness latch
+#             -> Mutation Shadow
+#               -> Real Injection selector
+#                 -> selected_body
 #
 # The gateway only forwards the bytes returned by
 # ``run_context_pipeline()``. It no longer decides when a stage
@@ -50,6 +54,8 @@ from ombrebrain.context.unified_context_candidate import (
 #   - every stage is fail-open: the live request keeps forward_body;
 #   - the Mutation Shadow and the Real Injection selector may only
 #     read Preview/Gate refreshed by THIS request;
+#   - the Confidence Gate is an observer: its decision is never a
+#     prerequisite and never changes the forwarded body;
 #   - no HTTP error is produced and the request is never blocked;
 #   - only privacy-safe telemetry (counts, revisions, hashes,
 #     booleans, reason codes) is logged — never query, memory,
@@ -63,6 +69,64 @@ logger = logging.getLogger("ombre_brain.gateway")
 
 def _truthy(value) -> bool:
     return str(value or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def observe_context_confidence(
+    conversation_id: str | None,
+) -> None:
+    """Observe only whether existing Context evidence is trustworthy.
+
+    Confidence Gate, shadow-only first version:
+
+      - it evaluates evidence already produced by the Context chain
+        (Conversation Candidate + Unified telemetry), it does not
+        re-run retrieval, re-embed or copy Context text;
+      - its decision is NOT a prerequisite: a deny_shadow never stops
+        the Preview / Injection Gate / Mutation Shadow / Real
+        Injection stages and never changes the forwarded body;
+      - it is fail-open: a failure here logs only the exception type
+        and the existing pipeline behaviour is unchanged;
+      - only privacy-safe telemetry (revisions, counts, booleans,
+        enums, reason codes) is logged.
+    """
+
+    if not _truthy(
+        os.environ.get(
+            "OMBRE_GATEWAY_CONTEXT_CONFIDENCE_GATE_SHADOW"
+        )
+    ):
+        return
+
+    if not isinstance(
+        conversation_id,
+        str,
+    ):
+        return
+
+    try:
+        report = update_context_confidence_gate(
+            conversation_id
+        )
+    except Exception as exc:
+        logger.warning(
+            "[gateway.context_confidence_gate] "
+            "build_failed=%s fail_open=true",
+            type(exc).__name__,
+        )
+        return
+
+    logger.info(
+        "[gateway.context_confidence_gate] %s",
+        json.dumps(
+            {
+                "conversation_id":
+                    conversation_id,
+                **report,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+    )
 
 
 async def observe_unified_preview_gate(
@@ -107,6 +171,12 @@ async def observe_unified_preview_gate(
         )
     )
 
+    confidence_enabled = _truthy(
+        os.environ.get(
+            "OMBRE_GATEWAY_CONTEXT_CONFIDENCE_GATE_SHADOW"
+        )
+    )
+
     # Phase 4A-3D: an enabled real injection must refresh the
     # Unified -> Preview -> Gate chain for THIS request, even when
     # every observability shadow flag is off. The selector itself
@@ -123,6 +193,7 @@ async def observe_unified_preview_gate(
         or preview_enabled
         or gate_enabled
         or mutation_enabled
+        or confidence_enabled
         or real_injection_enabled
     ):
         return False
@@ -265,6 +336,16 @@ async def observe_unified_preview_gate(
         ),
     )
 
+    # Confidence Gate shadow observer. It sits right after Unified and
+    # before Preview, but it is an observer only: its decision never
+    # gates the Preview, the Injection Gate, the Mutation Shadow or
+    # Real Injection, and it never changes the forwarded body.
+    if unified.get(
+        "stored"
+    ):
+        observe_context_confidence(
+            conversation_id
+        )
 
     if not (
         preview_enabled

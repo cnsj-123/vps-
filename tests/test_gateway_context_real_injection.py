@@ -2332,8 +2332,9 @@ class GatewayRealInjectionRequestTests(
     async def test_context_pipeline_full_stage_order(
         self,
     ):
-        # Conversation sources -> Unified -> Preview -> Gate
-        # -> freshness -> Mutation Shadow -> Real Injection.
+        # Conversation sources -> Unified -> Confidence Gate shadow
+        # -> Preview -> Gate -> freshness -> Mutation Shadow
+        # -> Real Injection.
         order = []
 
         mocks = self._mock_chain()
@@ -2353,6 +2354,19 @@ class GatewayRealInjectionRequestTests(
             return {
                 "stored": True,
                 "revision": 1,
+            }
+
+        def confidence_impl(
+            conversation_id,
+        ):
+            order.append(
+                "confidence_shadow"
+            )
+
+            return {
+                "stored": True,
+                "revision": 1,
+                "decision": "allow_shadow",
             }
 
         def preview_impl(
@@ -2427,6 +2441,10 @@ class GatewayRealInjectionRequestTests(
             Mock(side_effect=sources_impl),
         ), patch.object(
             coordinator,
+            "update_context_confidence_gate",
+            Mock(side_effect=confidence_impl),
+        ), patch.object(
+            coordinator,
             "observe_request_mutation",
             Mock(side_effect=mutation_impl),
         ), patch.object(
@@ -2438,7 +2456,11 @@ class GatewayRealInjectionRequestTests(
                 await self._call_gateway(
                     body,
                     environ=self._env(
-                        real_injection="1"
+                        real_injection="1",
+                        extra={
+                            "OMBRE_GATEWAY_CONTEXT_CONFIDENCE_GATE_SHADOW":
+                                "1",
+                        },
                     ),
                 )
             )
@@ -2453,6 +2475,7 @@ class GatewayRealInjectionRequestTests(
             [
                 "sources",
                 "unified",
+                "confidence_shadow",
                 "preview",
                 "gate",
                 "mutation_shadow",
@@ -2466,6 +2489,22 @@ class GatewayRealInjectionRequestTests(
             order.index(
                 "mutation_shadow"
             ),
+        )
+
+        # The Confidence Gate observer must sit between Unified and
+        # Preview but must not control the later stages.
+        self.assertLess(
+            order.index("unified"),
+            order.index(
+                "confidence_shadow"
+            ),
+        )
+
+        self.assertLess(
+            order.index(
+                "confidence_shadow"
+            ),
+            order.index("preview"),
         )
 
         self.assertEqual(
