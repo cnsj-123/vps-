@@ -2358,9 +2358,16 @@ class GatewayRealInjectionRequestTests(
 
         def confidence_impl(
             conversation_id,
+            *,
+            expected_unified_revision=None,
         ):
             order.append(
                 "confidence_shadow"
+            )
+
+            self.assertEqual(
+                expected_unified_revision,
+                1,
             )
 
             return {

@@ -185,6 +185,20 @@ def _evaluate(
     )
 
 
+def _unified_without(*fields) -> dict:
+    """Unified fixture with the given telemetry fields removed."""
+
+    value = unified()
+
+    for field in fields:
+        value["telemetry"].pop(
+            field,
+            None,
+        )
+
+    return value
+
+
 class ConfidenceGateDecisionTests(
     unittest.TestCase,
 ):
@@ -1025,6 +1039,179 @@ class ConfidenceGateDecisionTests(
                     report["reasons"],
                 )
 
+    # --------------------------------------------------
+    # telemetry completeness (stable Unified contract)
+    # --------------------------------------------------
+
+    def test_missing_evidence_count_field_is_deny(
+        self,
+    ):
+        for field in (
+            "trusted_fact_count",
+            "constraint_count",
+            "decision_count",
+            "open_item_count",
+            "plan_count",
+            "memory_count",
+            "recent_context_count",
+        ):
+            with self.subTest(
+                field=field
+            ):
+                report = _evaluate(
+                    unified_candidate=(
+                        _unified_without(
+                            field
+                        )
+                    )
+                )
+
+                self.assertEqual(
+                    report["decision"],
+                    "deny_shadow",
+                )
+
+                self.assertIn(
+                    "malformed_telemetry",
+                    report["reasons"],
+                )
+
+    def test_missing_evidence_bool_field_is_deny(
+        self,
+    ):
+        for field in (
+            "has_current_task",
+            "state_included",
+        ):
+            with self.subTest(
+                field=field
+            ):
+                report = _evaluate(
+                    unified_candidate=(
+                        _unified_without(
+                            field
+                        )
+                    )
+                )
+
+                self.assertEqual(
+                    report["decision"],
+                    "deny_shadow",
+                )
+
+                self.assertIn(
+                    "malformed_telemetry",
+                    report["reasons"],
+                )
+
+                # Not guessed as False.
+                self.assertIsNone(
+                    report[field]
+                )
+
+    def test_missing_numeric_field_is_deny(
+        self,
+    ):
+        for field in (
+            "retrieval_candidate_count",
+            "estimated_tokens",
+            "token_budget",
+        ):
+            with self.subTest(
+                field=field
+            ):
+                report = _evaluate(
+                    unified_candidate=(
+                        _unified_without(
+                            field
+                        )
+                    )
+                )
+
+                self.assertEqual(
+                    report["decision"],
+                    "deny_shadow",
+                )
+
+                self.assertIn(
+                    "malformed_telemetry",
+                    report["reasons"],
+                )
+
+                self.assertIsNone(
+                    report[field]
+                )
+
+    def test_malformed_numeric_field_is_deny(
+        self,
+    ):
+        cases = (
+            ("retrieval_candidate_count", "3"),
+            ("retrieval_candidate_count", True),
+            ("retrieval_candidate_count", -1),
+            ("retrieval_candidate_count", []),
+            ("estimated_tokens", "80"),
+            ("estimated_tokens", False),
+            ("estimated_tokens", -1),
+            ("estimated_tokens", {}),
+            ("token_budget", 0),
+            ("token_budget", True),
+            ("token_budget", -5),
+            ("token_budget", "1200"),
+        )
+
+        for field, value in cases:
+            with self.subTest(
+                field=field,
+                value=value,
+            ):
+                report = _evaluate(
+                    unified_candidate=unified(
+                        **{field: value}
+                    )
+                )
+
+                self.assertEqual(
+                    report["decision"],
+                    "deny_shadow",
+                )
+
+                self.assertIn(
+                    "malformed_telemetry",
+                    report["reasons"],
+                )
+
+                self.assertIsNone(
+                    report[field]
+                )
+
+    def test_missing_field_not_masked_by_other_evidence(
+        self,
+    ):
+        # trusted_fact_count=1 must not mask a missing plan_count.
+        report = _evaluate(
+            unified_candidate=(
+                _unified_without(
+                    "plan_count"
+                )
+            )
+        )
+
+        self.assertEqual(
+            report["decision"],
+            "deny_shadow",
+        )
+
+        self.assertIn(
+            "malformed_telemetry",
+            report["reasons"],
+        )
+
+        self.assertIs(
+            report["usable_context_evidence"],
+            True,
+        )
+
     def test_no_usable_context_evidence_is_deny(
         self,
     ):
@@ -1196,7 +1383,11 @@ class ConfidenceGatePersistenceTests(
             encoding="utf-8",
         )
 
-    def _update(self) -> dict:
+    def _update(
+        self,
+        *,
+        expected_unified_revision=3,
+    ) -> dict:
         import os
 
         from unittest.mock import patch
@@ -1210,12 +1401,28 @@ class ConfidenceGatePersistenceTests(
             clear=False,
         ):
             return update_context_confidence_gate(
-                CID
+                CID,
+                expected_unified_revision=
+                    expected_unified_revision,
             )
+
+    def _state_path(self) -> Path:
+        return (
+            self.root
+            / "confidence_gate"
+            / (CID + ".json")
+        )
 
     def test_missing_candidate_is_deny(
         self,
     ):
+        # Unified exists and matches this request; the Candidate does
+        # not.
+        self._write(
+            "unified_context_candidate",
+            unified(),
+        )
+
         report = self._update()
 
         self.assertIs(
@@ -1251,6 +1458,10 @@ class ConfidenceGatePersistenceTests(
         self.assertEqual(
             report["reason"],
             "unified_candidate_not_found",
+        )
+
+        self.assertFalse(
+            self._state_path().is_file()
         )
 
     def test_valid_state_persists_allow(
@@ -1301,6 +1512,302 @@ class ConfidenceGatePersistenceTests(
         self.assertEqual(
             written["conversation_id"],
             CID,
+        )
+
+        # The binding is auditable in state.
+        self.assertEqual(
+            written[
+                "expected_unified_revision"
+            ],
+            3,
+        )
+
+        self.assertEqual(
+            written[
+                "source_unified_revision"
+            ],
+            3,
+        )
+
+        self.assertEqual(
+            report[
+                "expected_unified_revision"
+            ],
+            3,
+        )
+
+    # --------------------------------------------------
+    # per-request Unified revision binding
+    # --------------------------------------------------
+
+    def test_expected_revision_malformed_is_deny(
+        self,
+    ):
+        self._write(
+            "context_candidate",
+            candidate(),
+        )
+
+        self._write(
+            "unified_context_candidate",
+            unified(),
+        )
+
+        for value in (
+            None,
+            True,
+            False,
+            0,
+            -1,
+            "3",
+            3.0,
+            [],
+            {},
+        ):
+            with self.subTest(
+                expected=value
+            ):
+                report = self._update(
+                    expected_unified_revision=
+                        value
+                )
+
+                self.assertIs(
+                    report["stored"],
+                    False,
+                )
+
+                self.assertEqual(
+                    report["decision"],
+                    "deny_shadow",
+                )
+
+                self.assertEqual(
+                    report["reason"],
+                    "invalid_expected_unified_revision",
+                )
+
+        # Nothing was ever persisted for any malformed expectation.
+        self.assertFalse(
+            self._state_path().is_file()
+        )
+
+    def test_stale_unified_revision_is_deny(
+        self,
+    ):
+        # Request A produced Unified revision 3, but the disk file has
+        # already moved on to revision 4.
+        self._write(
+            "context_candidate",
+            candidate(),
+        )
+
+        newer = unified()
+
+        newer["revision"] = 4
+
+        self._write(
+            "unified_context_candidate",
+            newer,
+        )
+
+        report = self._update(
+            expected_unified_revision=3
+        )
+
+        self.assertIs(
+            report["stored"],
+            False,
+        )
+
+        self.assertEqual(
+            report["decision"],
+            "deny_shadow",
+        )
+
+        self.assertEqual(
+            report["reason"],
+            "confidence_unified_request_revision_mismatch",
+        )
+
+        self.assertEqual(
+            report[
+                "expected_unified_revision"
+            ],
+            3,
+        )
+
+        self.assertEqual(
+            report[
+                "observed_unified_revision"
+            ],
+            4,
+        )
+
+        # A mismatched observation is not a valid decision, so no
+        # state is written.
+        self.assertFalse(
+            self._state_path().is_file()
+        )
+
+    def test_malformed_observed_unified_revision_is_deny(
+        self,
+    ):
+        self._write(
+            "context_candidate",
+            candidate(),
+        )
+
+        for value in (
+            None,
+            True,
+            0,
+            -1,
+            "3",
+        ):
+            with self.subTest(
+                observed=value
+            ):
+                broken = unified()
+
+                broken["revision"] = value
+
+                self._write(
+                    "unified_context_candidate",
+                    broken,
+                )
+
+                report = self._update(
+                    expected_unified_revision=3
+                )
+
+                self.assertEqual(
+                    report["decision"],
+                    "deny_shadow",
+                )
+
+                self.assertIs(
+                    report["stored"],
+                    False,
+                )
+
+                self.assertEqual(
+                    report["reason"],
+                    "invalid_observed_unified_revision",
+                )
+
+        self.assertFalse(
+            self._state_path().is_file()
+        )
+
+    def test_cross_request_interleaving_is_not_claimed(
+        self,
+    ):
+        # Regression: request A successfully observes its own
+        # revision 3 and persists a decision...
+        self._write(
+            "context_candidate",
+            candidate(),
+        )
+
+        self._write(
+            "unified_context_candidate",
+            unified(),
+        )
+
+        first = self._update(
+            expected_unified_revision=3
+        )
+
+        self.assertIs(
+            first["stored"],
+            True,
+        )
+
+        self.assertEqual(
+            first["decision"],
+            "allow_shadow",
+        )
+
+        before = self._state_path().read_text(
+            encoding="utf-8"
+        )
+
+        # ...then request B overwrites the disk Unified with
+        # revision 4 before A's observer runs.
+        newer = unified()
+
+        newer["revision"] = 4
+
+        self._write(
+            "unified_context_candidate",
+            newer,
+        )
+
+        stale = self._update(
+            expected_unified_revision=3
+        )
+
+        # A must not treat B's Unified as its own evidence.
+        self.assertIs(
+            stale["stored"],
+            False,
+        )
+
+        self.assertEqual(
+            stale["decision"],
+            "deny_shadow",
+        )
+
+        self.assertEqual(
+            stale["reason"],
+            "confidence_unified_request_revision_mismatch",
+        )
+
+        # ...and the interleave must not overwrite the existing
+        # confidence state.
+        self.assertEqual(
+            self._state_path().read_text(
+                encoding="utf-8"
+            ),
+            before,
+        )
+
+    def test_matching_expected_revision_allows_shadow(
+        self,
+    ):
+        self._write(
+            "context_candidate",
+            candidate(),
+        )
+
+        self._write(
+            "unified_context_candidate",
+            unified(),
+        )
+
+        report = self._update(
+            expected_unified_revision=3
+        )
+
+        self.assertIs(
+            report["stored"],
+            True,
+        )
+
+        self.assertEqual(
+            report["decision"],
+            "allow_shadow",
+        )
+
+        self.assertEqual(
+            report["reasons"],
+            [],
+        )
+
+        self.assertIs(
+            report["duplicate"],
+            False,
         )
 
     def test_duplicate_evidence_does_not_bump_revision(

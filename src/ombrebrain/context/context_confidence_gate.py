@@ -34,6 +34,12 @@ from ombrebrain.context.validators.freshness import (
 # It never validates Preview, the Injection Gate or the mutation
 # chain.
 #
+# Per-request binding: the gate is told the Unified revision THIS
+# request just produced, then reads the persisted Unified file and
+# requires that revision to match. A mismatch means a concurrent
+# request already overwrote it, so the observation is reported with
+# stored=False and is never persisted as a decision.
+#
 # This first version is deliberately rule / reason based:
 #   - deterministic, read-only, no model call, no LLM judge,
 #     no external API, no new database, no live selector;
@@ -248,6 +254,22 @@ def _valid_nonnegative_int(
             bool,
         )
         and value >= 0
+    )
+
+
+def _valid_positive_int(
+    value: Any,
+) -> bool:
+    return (
+        isinstance(
+            value,
+            int,
+        )
+        and not isinstance(
+            value,
+            bool,
+        )
+        and value >= 1
     )
 
 
@@ -668,7 +690,9 @@ def evaluate_context_confidence(
     # 8. Section evidence
     # --------------------------------------------------
 
-    section_counts: dict[str, int] = {}
+    # The stable Unified writer always emits every evidence count, so a
+    # missing count is a malformed observation, never a silent 0.
+    section_counts: dict[str, int | None] = {}
 
     for field in _EVIDENCE_COUNT_FIELDS:
         value = unified_telemetry.get(
@@ -681,21 +705,24 @@ def evaluate_context_confidence(
             section_counts[field] = value
 
         else:
-            section_counts[field] = 0
+            section_counts[field] = None
 
-            if value is not None:
-                reasons.append(
-                    "malformed_telemetry"
-                )
+            reasons.append(
+                "malformed_telemetry"
+            )
 
-    # Boolean presence flags are strict: when present they must be a
-    # real bool. "true" / "yes" / 1 / 0 / [] / {} are malformed and
-    # must never be silently coerced to False.
-    section_presence: dict[str, bool] = {}
+    # The stable Unified writer always emits these flags, so a
+    # missing flag is malformed too. When present they must be a real
+    # bool: "true" / "yes" / 1 / 0 / [] / {} are never coerced.
+    section_presence: dict[str, bool | None] = {}
 
     for field in _EVIDENCE_BOOL_FIELDS:
         if field not in unified_telemetry:
-            section_presence[field] = False
+            section_presence[field] = None
+
+            reasons.append(
+                "malformed_telemetry"
+            )
 
             continue
 
@@ -705,7 +732,7 @@ def evaluate_context_confidence(
             value,
             bool,
         ):
-            section_presence[field] = False
+            section_presence[field] = None
 
             reasons.append(
                 "malformed_telemetry"
@@ -716,17 +743,73 @@ def evaluate_context_confidence(
 
     usable_context_evidence = (
         any(
-            count > 0
+            isinstance(count, int)
+            and count > 0
             for count in section_counts.values()
         )
         or any(
-            section_presence.values()
+            value is True
+            for value in section_presence.values()
         )
     )
 
     if not usable_context_evidence:
         reasons.append(
             "no_usable_context_evidence"
+        )
+
+    # --------------------------------------------------
+    # 9. Numeric telemetry contract
+    #
+    # Only the numeric fields Confidence itself uses for its decision
+    # and report are validated. This is deliberately not a generic
+    # Unified schema framework: anti_echo / retrieval_dedup and the
+    # like are left untouched.
+    # --------------------------------------------------
+
+    retrieval_candidate_count = (
+        unified_telemetry.get(
+            "retrieval_candidate_count"
+        )
+    )
+
+    if not _valid_nonnegative_int(
+        retrieval_candidate_count
+    ):
+        retrieval_candidate_count = None
+
+        reasons.append(
+            "malformed_telemetry"
+        )
+
+    estimated_tokens = (
+        unified_telemetry.get(
+            "estimated_tokens"
+        )
+    )
+
+    if not _valid_nonnegative_int(
+        estimated_tokens
+    ):
+        estimated_tokens = None
+
+        reasons.append(
+            "malformed_telemetry"
+        )
+
+    token_budget = (
+        unified_telemetry.get(
+            "token_budget"
+        )
+    )
+
+    if not _valid_positive_int(
+        token_budget
+    ):
+        token_budget = None
+
+        reasons.append(
+            "malformed_telemetry"
         )
 
     # --------------------------------------------------
@@ -743,17 +826,6 @@ def evaluate_context_confidence(
         if not reasons
         else "deny_shadow"
     )
-
-    retrieval_candidate_count = (
-        unified_telemetry.get(
-            "retrieval_candidate_count"
-        )
-    )
-
-    if not _valid_nonnegative_int(
-        retrieval_candidate_count
-    ):
-        retrieval_candidate_count = None
 
     return {
         "version":
@@ -812,36 +884,29 @@ def evaluate_context_confidence(
             ],
         **section_counts,
         "estimated_tokens":
-            (
-                unified_telemetry.get(
-                    "estimated_tokens"
-                )
-                if _valid_nonnegative_int(
-                    unified_telemetry.get(
-                        "estimated_tokens"
-                    )
-                )
-                else None
-            ),
+            estimated_tokens,
         "token_budget":
-            (
-                unified_telemetry.get(
-                    "token_budget"
-                )
-                if _valid_nonnegative_int(
-                    unified_telemetry.get(
-                        "token_budget"
-                    )
-                )
-                else None
-            ),
+            token_budget,
     }
 
 
 def update_context_confidence_gate(
     conversation_id: str,
+    *,
+    expected_unified_revision: Any = None,
 ) -> dict[str, Any]:
     """Evaluate and persist a privacy-safe confidence shadow report.
+
+    Per-request binding: the caller must pass the Unified revision
+    THIS request just produced. The persisted Unified file is read
+    first and its revision must equal ``expected_unified_revision``;
+    otherwise a concurrent request has already overwritten it and the
+    observation belongs to someone else.
+
+    A cross-request mismatch / malformed revision is NOT a valid
+    evidence decision: it is reported with ``stored=False`` and is
+    never written to the confidence_gate state. It also never raises,
+    so the caller stays fail-open.
 
     Read-only over the existing Context state. The persisted file
     follows the same directory / atomic-write / monotonic revision
@@ -852,6 +917,113 @@ def update_context_confidence_gate(
     _validate_conversation_id(
         conversation_id
     )
+
+    if not is_valid_revision(
+        expected_unified_revision
+    ):
+        return {
+            "stored":
+                False,
+            "mode":
+                _MODE,
+            "decision":
+                "deny_shadow",
+            "allowed":
+                False,
+            "reason":
+                "invalid_expected_unified_revision",
+            "reasons": [
+                "invalid_expected_unified_revision",
+            ],
+            "expected_unified_revision":
+                None,
+            "observed_unified_revision":
+                None,
+            "conversation_id":
+                conversation_id,
+        }
+
+    # Read order: Unified first, verify it belongs to this request,
+    # then the Candidate. If the Candidate is refreshed afterwards,
+    # the existing Candidate -> Unified source chain check denies it.
+    unified = _read_json(
+        _path(
+            "unified_context_candidate",
+            conversation_id,
+        )
+    )
+
+    if unified is None:
+        return {
+            "stored":
+                False,
+            "mode":
+                _MODE,
+            "decision":
+                "deny_shadow",
+            "allowed":
+                False,
+            "reason":
+                "unified_candidate_not_found",
+            "reasons": [
+                "unified_candidate_not_found",
+            ],
+            "expected_unified_revision":
+                expected_unified_revision,
+            "observed_unified_revision":
+                None,
+            "conversation_id":
+                conversation_id,
+        }
+
+    observed_unified_revision = (
+        unified.get(
+            "revision"
+        )
+        if isinstance(
+            unified,
+            dict,
+        )
+        else None
+    )
+
+    observed_freshness = (
+        validate_context_freshness(
+            checked_revision=
+                observed_unified_revision,
+            expected_revision=
+                expected_unified_revision,
+            invalid_reason=(
+                "invalid_observed_unified_revision"
+            ),
+            mismatch_reason=(
+                "confidence_unified_request_revision_mismatch"
+            ),
+        )
+    )
+
+    if not observed_freshness["valid"]:
+        return {
+            "stored":
+                False,
+            "mode":
+                _MODE,
+            "decision":
+                "deny_shadow",
+            "allowed":
+                False,
+            "reason":
+                observed_freshness["reason"],
+            "reasons": [
+                observed_freshness["reason"],
+            ],
+            "expected_unified_revision":
+                expected_unified_revision,
+            "observed_unified_revision":
+                observed_unified_revision,
+            "conversation_id":
+                conversation_id,
+        }
 
     candidate = _read_json(
         _path(
@@ -864,6 +1036,8 @@ def update_context_confidence_gate(
         return {
             "stored":
                 False,
+            "mode":
+                _MODE,
             "decision":
                 "deny_shadow",
             "allowed":
@@ -873,30 +1047,10 @@ def update_context_confidence_gate(
             "reasons": [
                 "conversation_candidate_not_found",
             ],
-            "conversation_id":
-                conversation_id,
-        }
-
-    unified = _read_json(
-        _path(
-            "unified_context_candidate",
-            conversation_id,
-        )
-    )
-
-    if unified is None:
-        return {
-            "stored":
-                False,
-            "decision":
-                "deny_shadow",
-            "allowed":
-                False,
-            "reason":
-                "unified_candidate_not_found",
-            "reasons": [
-                "unified_candidate_not_found",
-            ],
+            "expected_unified_revision":
+                expected_unified_revision,
+            "observed_unified_revision":
+                observed_unified_revision,
             "conversation_id":
                 conversation_id,
         }
@@ -1001,6 +1155,8 @@ def update_context_confidence_gate(
             **result,
             "conversation_id":
                 conversation_id,
+            "expected_unified_revision":
+                expected_unified_revision,
             "revision":
                 previous_revision + 1,
             "created_at":

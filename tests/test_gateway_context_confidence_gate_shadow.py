@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -166,7 +167,8 @@ class ConfidenceGateCoordinatorTests(
         )
 
         confidence.assert_called_once_with(
-            CID
+            CID,
+            expected_unified_revision=5,
         )
 
         # No Preview/Gate flags are on, so the chain stops after the
@@ -377,7 +379,8 @@ class ConfidenceGateCoordinatorTests(
                 )
 
         confidence.assert_called_once_with(
-            CID
+            CID,
+            expected_unified_revision=5,
         )
 
         # Even though confidence denied, Preview and Gate still ran
@@ -587,6 +590,22 @@ class ConfidenceGatePipelineTests(
                                 True,
                             "state_included":
                                 False,
+                            "trusted_fact_count":
+                                1,
+                            "constraint_count":
+                                0,
+                            "decision_count":
+                                0,
+                            "open_item_count":
+                                0,
+                            "plan_count":
+                                0,
+                            "memory_count":
+                                0,
+                            "recent_context_count":
+                                0,
+                            "retrieval_candidate_count":
+                                0,
                             "estimated_tokens":
                                 80,
                             "token_budget":
@@ -631,7 +650,8 @@ class ConfidenceGatePipelineTests(
                     level="INFO",
                 ) as captured:
                     coordinator.observe_context_confidence(
-                        CID
+                        CID,
+                        expected_unified_revision=3,
                     )
 
         logged = "\n".join(
@@ -717,6 +737,10 @@ class ConfidenceGatePipelineTests(
                 80,
             "token_budget":
                 1200,
+            "expected_unified_revision":
+                3,
+            "observed_unified_revision":
+                3,
             # These must never reach the log.
             "conversation_id":
                 CID,
@@ -751,7 +775,8 @@ class ConfidenceGatePipelineTests(
                     level="INFO",
                 ) as captured:
                     coordinator.observe_context_confidence(
-                        CID
+                        CID,
+                        expected_unified_revision=3,
                     )
 
         logged = "\n".join(
@@ -845,7 +870,8 @@ class ConfidenceGatePipelineTests(
                 )
 
         deny.assert_called_once_with(
-            CID
+            CID,
+            expected_unified_revision=1,
         )
 
         # Real injection stays OFF by default, so the selector is
@@ -855,6 +881,238 @@ class ConfidenceGatePipelineTests(
         self.assertIs(
             selected,
             body,
+        )
+
+    async def _run_real_injection_with_confidence(
+        self,
+        body,
+        *,
+        confidence_on,
+    ):
+        selected_body = body + b" "
+
+        report = {
+            "version":
+                "context-real-injection.v1",
+            "enabled":
+                True,
+            "applied":
+                True,
+            "reason":
+                "injection_applied",
+            "conversation_id":
+                CID,
+            "original_sha256":
+                hashlib.sha256(
+                    body
+                ).hexdigest(),
+            "selected_sha256":
+                hashlib.sha256(
+                    selected_body
+                ).hexdigest(),
+        }
+
+        confidence_calls: list = []
+        mutation_calls: list = []
+        selector_freshness: list = []
+
+        real_select = (
+            coordinator.select_real_injection
+        )
+
+        def mutation_impl(
+            conversation_id,
+            forward_body,
+        ):
+            mutation_calls.append(
+                conversation_id
+            )
+
+        def selector_impl(
+            conversation_id,
+            forward_body,
+            *,
+            context_chain_fresh,
+        ):
+            selector_freshness.append(
+                context_chain_fresh
+            )
+
+            return real_select(
+                conversation_id,
+                forward_body,
+                context_chain_fresh=
+                    context_chain_fresh,
+            )
+
+        confidence = Mock(
+            side_effect=lambda *args, **kwargs: (
+                confidence_calls.append(args)
+                or _deny_report()
+            )
+        )
+
+        injector = Mock(
+            return_value=(
+                selected_body,
+                report,
+            )
+        )
+
+        environ = {
+            **_ISOLATED_ENV,
+            "OMBRE_GATEWAY_CONTEXT_REAL_INJECTION":
+                "1",
+            _CONFIDENCE_ENV:
+                "1" if confidence_on else "0",
+        }
+
+        with patch.dict(
+            os.environ,
+            environ,
+            clear=False,
+        ):
+            with patch.object(
+                coordinator,
+                "observe_context_sources",
+                Mock(return_value=CID),
+            ), patch.object(
+                coordinator,
+                "update_unified_context_candidate_from_runtime",
+                AsyncMock(
+                    return_value={
+                        "stored": True,
+                        "revision": 5,
+                    }
+                ),
+            ), patch.object(
+                coordinator,
+                "update_context_injection_preview",
+                Mock(
+                    return_value={
+                        "stored": True,
+                        "revision": 1,
+                        "source_revision": 5,
+                    }
+                ),
+            ), patch.object(
+                coordinator,
+                "update_context_injection_gate",
+                Mock(
+                    return_value={
+                        "stored": True,
+                        "revision": 1,
+                        "decision":
+                            "allow_shadow",
+                        "allowed": True,
+                    }
+                ),
+            ), patch.object(
+                coordinator,
+                "update_context_confidence_gate",
+                confidence,
+            ), patch.object(
+                coordinator,
+                "observe_request_mutation",
+                Mock(side_effect=mutation_impl),
+            ), patch.object(
+                coordinator,
+                "select_real_injection",
+                Mock(side_effect=selector_impl),
+            ), patch.object(
+                coordinator,
+                "select_context_injected_body",
+                injector,
+            ):
+                selected = await (
+                    coordinator.run_context_pipeline(
+                        body
+                    )
+                )
+
+        return (
+            selected,
+            confidence_calls,
+            mutation_calls,
+            selector_freshness,
+        )
+
+    async def test_confidence_deny_does_not_block_real_injection(
+        self,
+    ):
+        # Strict shadow-only proof: with Real Injection ON, a fresh
+        # chain and an allowing Gate, a Confidence deny must not stop
+        # the Mutation observer or the Real Injection selector, and
+        # the resulting body must equal the run with Confidence OFF.
+        body = b'{"messages":[{"role":"user","content":"hi"}]}'
+
+        (
+            selected_with,
+            confidence_calls,
+            mutation_with,
+            freshness_with,
+        ) = await (
+            self._run_real_injection_with_confidence(
+                body,
+                confidence_on=True,
+            )
+        )
+
+        (
+            selected_without,
+            confidence_off_calls,
+            mutation_without,
+            freshness_without,
+        ) = await (
+            self._run_real_injection_with_confidence(
+                body,
+                confidence_on=False,
+            )
+        )
+
+        # Confidence ran and denied...
+        self.assertEqual(
+            len(confidence_calls),
+            1,
+        )
+
+        self.assertEqual(
+            confidence_off_calls,
+            [],
+        )
+
+        # ...but neither the Mutation observer nor the Real
+        # Injection selector was skipped...
+        self.assertEqual(
+            mutation_with,
+            [CID],
+        )
+
+        self.assertEqual(
+            mutation_without,
+            [CID],
+        )
+
+        self.assertEqual(
+            freshness_with,
+            [True],
+        )
+
+        self.assertEqual(
+            freshness_without,
+            [True],
+        )
+
+        # ...and the injected body is identical to the run without
+        # Confidence.
+        self.assertNotEqual(
+            selected_with,
+            body,
+        )
+
+        self.assertEqual(
+            selected_with,
+            selected_without,
         )
 
 

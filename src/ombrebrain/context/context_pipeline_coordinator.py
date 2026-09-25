@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import os
+from typing import Any
 
 from ombrebrain.context.context_confidence_gate import (
     update_context_confidence_gate,
@@ -73,6 +74,8 @@ def _truthy(value) -> bool:
 
 def observe_context_confidence(
     conversation_id: str | None,
+    *,
+    expected_unified_revision: Any = None,
 ) -> None:
     """Observe only whether existing Context evidence is trustworthy.
 
@@ -81,6 +84,10 @@ def observe_context_confidence(
       - it evaluates evidence already produced by the Context chain
         (Conversation Candidate + Unified telemetry), it does not
         re-run retrieval, re-embed or copy Context text;
+      - it is bound to THIS request: the caller passes the Unified
+        revision this request just produced, so a Unified file
+        already overwritten by a concurrent request is rejected
+        (stored=False) instead of polluting shadow telemetry;
       - its decision is NOT a prerequisite: a deny_shadow never stops
         the Preview / Injection Gate / Mutation Shadow / Real
         Injection stages and never changes the forwarded body;
@@ -105,7 +112,9 @@ def observe_context_confidence(
 
     try:
         report = update_context_confidence_gate(
-            conversation_id
+            conversation_id,
+            expected_unified_revision=
+                expected_unified_revision,
         )
     except Exception as exc:
         logger.warning(
@@ -148,6 +157,14 @@ def observe_context_confidence(
                 "source_unified_revision":
                     report.get(
                         "source_unified_revision"
+                    ),
+                "expected_unified_revision":
+                    report.get(
+                        "expected_unified_revision"
+                    ),
+                "observed_unified_revision":
+                    report.get(
+                        "observed_unified_revision"
                     ),
                 "current_user_excluded":
                     report.get(
@@ -427,11 +444,18 @@ async def observe_unified_preview_gate(
     # before Preview, but it is an observer only: its decision never
     # gates the Preview, the Injection Gate, the Mutation Shadow or
     # Real Injection, and it never changes the forwarded body.
+    #
+    # It is bound to the Unified revision THIS request just produced,
+    # so a concurrent request that already overwrote the persisted
+    # Unified cannot be mistaken for this request's evidence.
     if unified.get(
         "stored"
     ):
         observe_context_confidence(
-            conversation_id
+            conversation_id,
+            expected_unified_revision=(
+                unified.get("revision")
+            ),
         )
 
     if not (
@@ -876,10 +900,14 @@ async def run_context_pipeline(
     orchestrates Unified / Preview / Gate / Mutation / Real
     Injection itself.
 
-    Ordering matters: conversation sources -> Unified -> Preview ->
-    Gate -> freshness -> Mutation Shadow -> Real Injection. The
-    Mutation Shadow must never read Preview/Gate left on disk by an
-    earlier request.
+    Ordering matters: conversation sources -> Unified -> Confidence
+    Shadow -> Preview -> Injection Gate -> freshness -> Mutation
+    Shadow -> Real Injection. The Mutation Shadow must never read
+    Preview/Gate left on disk by an earlier request.
+
+    The Confidence Shadow stage is observation-only: it is bound to
+    the Unified revision this request just produced, and neither its
+    result nor its presence is a prerequisite for any later stage.
 
     Default-OFF and fail-open: with
     OMBRE_GATEWAY_CONTEXT_REAL_INJECTION unset (or on any deny /
