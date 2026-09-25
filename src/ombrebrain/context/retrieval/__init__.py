@@ -1,13 +1,18 @@
 from __future__ import annotations
 
-# Context-layer Retrieval v2 shadow pipeline.
+# Context-layer Retrieval v2 *shadow* package.
+#
+# Canonical retrieval domain (candidate / features / scoring /
+# policy / context compilers) lives in ``ombrebrain.retrieval``.
+# This package must never grow a second retrieval domain: it is a
+# thin adapter + observability layer for the shadow pipeline.
 #
 # Package layout:
-#   candidate.py - RetrievalCandidate + normalize_candidate()
-#   scorer.py    - score_candidate() (fixed weight formula)
-#   reranker.py  - rerank_candidates()
+#   candidate.py - ShadowCandidate (adapter view) + normalize_candidate()
+#   scorer.py    - score_candidate() (fixed shadow formula)
+#   reranker.py  - rank_candidates() (rank only, never selects)
 #   quality.py   - privacy-safe [gateway.retrieval_quality_v2]
-#   legacy.py    - the original ContextRetrievalAdapter
+#   legacy.py    - the original live ContextRetrievalAdapter
 #
 # The original ombrebrain.context.retrieval module moved to
 # legacy.py when this package was introduced (a package and a
@@ -19,42 +24,41 @@ from __future__ import annotations
 # keeps working unchanged.
 #
 # Nothing in this package changes the real retrieval result:
-# it is a shadow-only pipeline observed at the service layer.
+# legacy retrieval is the live source and this is shadow-only.
 
 from ombrebrain.context.retrieval.candidate import (
-    RetrievalCandidate,
+    ShadowCandidate,
     normalize_candidate,
 )
 from ombrebrain.context.retrieval.quality import (
     RetrievalQualityShadow,
 )
 from ombrebrain.context.retrieval.reranker import (
-    RetrievalReranker,
-    rerank_candidates,
+    ShadowRanker,
+    rank_candidates,
 )
 from ombrebrain.context.retrieval.scorer import (
-    RetrievalScorer,
-    RetrievalScorerWeights,
-    RetrievalScoringContext,
+    ShadowScorer,
+    ShadowScoringContext,
+    ShadowScoringWeights,
     score_candidate,
 )
 
-# Backward-compatible re-export. Import after the new modules
-# so legacy.py can import its shadow hook from this package
-# without a cycle.
+# Backward-compatible re-export. Import after the shadow modules
+# so legacy.py can be imported without a cycle.
 from ombrebrain.context.retrieval.legacy import (
     ContextRetrievalAdapter,
 )
 
 __all__ = [
     "ContextRetrievalAdapter",
-    "RetrievalCandidate",
     "RetrievalQualityShadow",
-    "RetrievalReranker",
-    "RetrievalScorer",
-    "RetrievalScorerWeights",
-    "RetrievalScoringContext",
+    "ShadowCandidate",
+    "ShadowRanker",
+    "ShadowScorer",
+    "ShadowScoringContext",
+    "ShadowScoringWeights",
     "normalize_candidate",
-    "rerank_candidates",
+    "rank_candidates",
     "score_candidate",
 ]

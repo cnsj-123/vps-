@@ -81,7 +81,7 @@ class ReportShapeTests(
 
         self.assertEqual(
             report["version"],
-            "retrieval-quality-shadow.v1",
+            "retrieval-quality-shadow.v2",
         )
         self.assertEqual(
             report["mode"],
@@ -92,7 +92,7 @@ class ReportShapeTests(
             2,
         )
         self.assertEqual(
-            report["selected_count"],
+            report["ranked_count"],
             2,
         )
         self.assertTrue(
@@ -128,19 +128,19 @@ class ReportShapeTests(
     def test_distribution_counts(self):
         # semantic-only scorer for exact bucket control
         from ombrebrain.context.retrieval import (
-            RetrievalScorer,
-            RetrievalScorerWeights,
+            ShadowScorer,
+            ShadowScoringWeights,
         )
 
-        # reranker=None -> the shadow builds one that
-        # reuses the custom scorer.
+        # semantic_similarity comes from the raw vector score
+        # map, not from the legacy calibrated relevance.
         shadow = RetrievalQualityShadow(
-            scorer=RetrievalScorer(
-                RetrievalScorerWeights(
+            scorer=ShadowScorer(
+                ShadowScoringWeights(
                     semantic=1.0,
                     recency=0.0,
                     importance=0.0,
-                    context_match=0.0,
+                    relative_semantic=0.0,
                 )
             ),
         )
@@ -168,6 +168,13 @@ class ReportShapeTests(
                     relevance=0.95,
                 ),
             ],
+            vector_scores={
+                "a": 0.10,
+                "b": 0.35,
+                "c": 0.55,
+                "d": 0.75,
+                "e": 0.95,
+            },
             now=NOW,
         )
 
@@ -198,7 +205,7 @@ class ReportShapeTests(
             0,
         )
         self.assertEqual(
-            report["selected_count"],
+            report["ranked_count"],
             0,
         )
         self.assertIsNone(
@@ -210,14 +217,14 @@ class ReportShapeTests(
             ]
         )
         self.assertFalse(
-            report["would_change"]
+            report["order_changed"]
         )
 
-    def test_would_change_detects_reorder(
+    def test_order_changed_detects_reorder(
         self,
     ):
         # Fresh, important memory ranked below a stale one
-        # by the old pipeline order -> shadow would reorder.
+        # by the legacy order -> the shadow ranking differs.
         report = (
             RetrievalQualityShadow()
             .observe(
@@ -235,16 +242,25 @@ class ReportShapeTests(
                         hours_old=0,
                     ),
                 ],
+                vector_scores={
+                    "stale": 0.66,
+                    "fresh": 0.68,
+                },
+                # Legacy live result, in the legacy order.
+                legacy_selected=[
+                    bucket("stale"),
+                    bucket("fresh"),
+                ],
                 now=NOW,
             )
         )
 
         self.assertTrue(
-            report["would_change"]
+            report["order_changed"]
         )
 
         delta = report[
-            "selection_delta"
+            "ranking_delta"
         ]
 
         self.assertEqual(
@@ -252,16 +268,54 @@ class ReportShapeTests(
             2,
         )
         self.assertEqual(
-            delta["added_count"],
-            0,
-        )
-        self.assertEqual(
-            delta["dropped_count"],
-            0,
-        )
-        self.assertEqual(
             delta["reordered_count"],
             2,
+        )
+
+        # Ranking-only: no add/drop claim exists any more.
+        self.assertNotIn(
+            "added_count",
+            delta,
+        )
+        self.assertNotIn(
+            "dropped_count",
+            delta,
+        )
+
+    def test_order_changed_is_false_without_legacy_result(
+        self,
+    ):
+        # With nothing to compare against the shadow makes no
+        # ordering claim at all.
+        report = (
+            RetrievalQualityShadow()
+            .observe(
+                [
+                    bucket(
+                        "stale",
+                        relevance=0.66,
+                        hours_old=2000,
+                    ),
+                    bucket(
+                        "fresh",
+                        relevance=0.90,
+                        hours_old=0,
+                    ),
+                ],
+                vector_scores={
+                    "stale": 0.66,
+                    "fresh": 0.90,
+                },
+                now=NOW,
+            )
+        )
+
+        self.assertFalse(
+            report["order_changed"]
+        )
+        self.assertEqual(
+            report["legacy_selected_count"],
+            0,
         )
 
     def test_no_change_when_order_matches(
@@ -284,16 +338,24 @@ class ReportShapeTests(
                         hours_old=2000,
                     ),
                 ],
+                vector_scores={
+                    "best": 0.9,
+                    "second": 0.7,
+                },
+                legacy_selected=[
+                    bucket("best"),
+                    bucket("second"),
+                ],
                 now=NOW,
             )
         )
 
         self.assertFalse(
-            report["would_change"]
+            report["order_changed"]
         )
 
         self.assertEqual(
-            report["selection_delta"][
+            report["ranking_delta"][
                 "reordered_count"
             ],
             0,
@@ -309,7 +371,7 @@ class ReportShapeTests(
             report["shadow_only"]
         )
         self.assertFalse(
-            report["would_change"]
+            report["order_changed"]
         )
         self.assertEqual(
             report["candidate_count"],
@@ -448,11 +510,12 @@ class PrivacyTests(
         # ...and contains the required fields.
         for key in (
             "candidate_count",
-            "selected_count",
+            "ranked_count",
+            "legacy_selected_count",
             "score_distribution",
             "top_score",
             "average_score",
-            "would_change",
+            "order_changed",
             "shadow_only",
         ):
             self.assertIn(

@@ -25,20 +25,37 @@ class ContextService:
 
     def _observe_retrieval_shadow_v2(
         self,
-        memories: list[Any],
+        legacy_selected: list[Any],
     ) -> dict[str, Any]:
-        """Run the Retrieval v2 shadow next to the old result.
+        """Run the Retrieval v2 shadow next to the live result.
 
-        Fail-open: any error degrades to a neutral event and
-        never affects the real retrieval result.
+        The shadow observes the *pre-selection* candidate pool the
+        legacy adapter published (problem B), not the legacy-selected
+        subset. ``legacy_selected`` is passed only so the shadow can
+        measure whether V2 ordering would differ.
+
+        Fail-open: any error degrades to a neutral event and never
+        affects the real retrieval result.
         """
 
         try:
             event = (
                 self.retrieval_shadow_v2
-                .observe(memories)
+                .observe(
+                    self.retrieval
+                    .last_candidates,
+                    vector_scores=(
+                        self.retrieval
+                        .last_pool_vector_scores
+                    ),
+                    legacy_selected=(
+                        legacy_selected
+                    ),
+                )
             )
         except Exception:
+            # Shadow-only fail-open: telemetry must never break
+            # the live retrieval path.
             return (
                 RetrievalQualityShadow
                 .observe_failed()
@@ -49,6 +66,8 @@ class ContextService:
                 event
             )
         except Exception:
+            # Shadow-only fail-open: logging must never break
+            # the live retrieval path.
             pass
 
         return event

@@ -6,23 +6,28 @@ from datetime import datetime, timezone
 from typing import Any
 
 from ombrebrain.context.retrieval.candidate import (
-    RetrievalCandidate,
     normalize_candidate,
 )
 
-# Shadow-only retrieval scorer (context layer).
+# Shadow-only scoring for the Retrieval v2 observation pipeline.
 #
-# Fixed formula:
+# Canonical scoring domain lives in ``ombrebrain.retrieval``
+# (RetrievalFeatures.candidate_score / PolicyGatedRetrievalScorer).
+# This module is a small, fixed shadow formula; it is NOT a second
+# scoring framework and is named to make that explicit.
+#
+# Formula (unchanged weights):
 #   score =
-#     0.5 * semantic_score
+#     0.5 * semantic_similarity
 #   + 0.2 * recency_score
 #   + 0.2 * importance_score
-#   + 0.1 * context_match_score
+#   + 0.1 * relative_semantic
 #
-# All weights live in RetrievalScorerWeights and default to
-# the formula above. This module is a pure function layer:
-# it never mutates a candidate and never touches the real
-# retrieval path.
+# ``relative_semantic`` is the candidate's raw semantic similarity
+# relative to the best candidate in the same set. It was previously
+# misnamed ``context_match``, which implied an independent context
+# signal. It is not one, so it is named for what it actually is
+# (problem F). Weights are unchanged and still sum to 1.0.
 
 _DEFAULT_RECENCY_HALF_LIFE_HOURS = 72.0
 
@@ -32,28 +37,27 @@ _MISSING_TIMESTAMP_RECENCY = 0.5
 
 
 @dataclass(frozen=True)
-class RetrievalScorerWeights:
-    """Configurable score weights.
-
-    Defaults implement the fixed formula and sum to 1.0.
-    """
+class ShadowScoringWeights:
+    """Fixed shadow weights. Defaults sum to 1.0."""
 
     semantic: float = 0.5
     recency: float = 0.2
     importance: float = 0.2
-    context_match: float = 0.1
+    relative_semantic: float = 0.1
 
     def to_dict(self) -> dict[str, float]:
         return {
             "semantic": float(self.semantic),
             "recency": float(self.recency),
             "importance": float(self.importance),
-            "context_match": float(self.context_match),
+            "relative_semantic": float(
+                self.relative_semantic
+            ),
         }
 
 
 @dataclass(frozen=True)
-class RetrievalScoringContext:
+class ShadowScoringContext:
     """Per-request scoring context.
 
     Carries only what scoring needs. It never contains the
@@ -66,25 +70,19 @@ class RetrievalScoringContext:
         )
     )
 
-    # Best semantic score in the current candidate set.
-    # Used for the relative context-match component.
-    max_semantic_score: float = 0.0
+    # Best raw semantic similarity in the observed set.
+    max_semantic_similarity: float = 0.0
 
 
 def recency_score(
     candidate: Any,
-    context: RetrievalScoringContext,
+    context: ShadowScoringContext,
     *,
     recency_half_life_hours: float = (
         _DEFAULT_RECENCY_HALF_LIFE_HOURS
     ),
 ) -> float:
-    """Exponential decay with a configurable half-life.
-
-    age 0      -> 1.0
-    half-life  -> 0.5
-    older      -> decays toward 0.0
-    """
+    """Exponential decay with a configurable half-life."""
 
     candidate = normalize_candidate(
         candidate
@@ -124,7 +122,7 @@ def recency_score(
 def importance_score(
     candidate: Any,
 ) -> float:
-    """Normalized importance. Already 0..1 on the candidate."""
+    """Normalized importance. Already 0..1 on the view."""
 
     candidate = normalize_candidate(
         candidate
@@ -133,17 +131,15 @@ def importance_score(
     return _clamp01(candidate.importance)
 
 
-def context_match_score(
+def relative_semantic_score(
     candidate: Any,
-    context: RetrievalScoringContext,
+    context: ShadowScoringContext,
 ) -> float:
-    """Relative match against the current query context.
+    """Candidate similarity relative to the best in the set.
 
-    Initial definition: how close this candidate's
-    semantic score is to the best candidate in the same
-    set. Future phases (confidence gate, feedback) can
-    supply a richer value through the context without
-    changing this contract.
+    This is NOT an independent context signal: it is derived
+    purely from ``semantic_similarity``. Formerly named
+    ``context_match_score``.
     """
 
     candidate = normalize_candidate(
@@ -151,44 +147,43 @@ def context_match_score(
     )
 
     best = _clamp01(
-        context.max_semantic_score
+        context.max_semantic_similarity
     )
 
     if best <= 0.0:
         return 0.0
 
     return _clamp01(
-        candidate.semantic_score / best
+        candidate.semantic_similarity / best
     )
 
 
 def score_candidate(
     candidate: Any,
-    context: RetrievalScoringContext,
+    context: ShadowScoringContext,
     *,
-    weights: RetrievalScorerWeights
+    weights: ShadowScoringWeights
     | None = None,
     recency_half_life_hours: float = (
         _DEFAULT_RECENCY_HALF_LIFE_HOURS
     ),
 ) -> float:
-    """Unified scoring entry point. Returns a 0..1 float.
+    """Unified shadow scoring entry point. Returns a 0..1 float.
 
-    Pure function of (candidate, context, weights): the
-    same inputs always produce the same float. It never
-    modifies the candidate and never raises for malformed
-    input.
+    Pure function of (candidate, context, weights): the same
+    inputs always produce the same float. It never modifies the
+    candidate and never raises for malformed input.
     """
 
     candidate = normalize_candidate(
         candidate
     )
 
-    active = weights or RetrievalScorerWeights()
+    active = weights or ShadowScoringWeights()
 
     combined = (
         _clamp01(active.semantic)
-        * _clamp01(candidate.semantic_score)
+        * _clamp01(candidate.semantic_similarity)
         + _clamp01(active.recency)
         * recency_score(
             candidate,
@@ -199,8 +194,8 @@ def score_candidate(
         )
         + _clamp01(active.importance)
         * importance_score(candidate)
-        + _clamp01(active.context_match)
-        * context_match_score(
+        + _clamp01(active.relative_semantic)
+        * relative_semantic_score(
             candidate,
             context,
         )
@@ -209,18 +204,16 @@ def score_candidate(
     return _clamp01(combined)
 
 
-class RetrievalScorer:
-    """Configured scorer.
+class ShadowScorer:
+    """Configured shadow scorer.
 
-    Holds weights / half-life and delegates every
-    computation to the module-level pure functions, so a
-    caller can either inject configuration or call the
-    functions directly.
+    Holds weights / half-life and delegates every computation to
+    the module-level pure functions.
     """
 
     def __init__(
         self,
-        weights: RetrievalScorerWeights
+        weights: ShadowScoringWeights
         | None = None,
         *,
         recency_half_life_hours: float = (
@@ -228,8 +221,7 @@ class RetrievalScorer:
         ),
     ):
         self.weights = (
-            weights
-            or RetrievalScorerWeights()
+            weights or ShadowScoringWeights()
         )
         self.recency_half_life_hours = (
             recency_half_life_hours
@@ -238,7 +230,7 @@ class RetrievalScorer:
     def recency_score(
         self,
         candidate: Any,
-        context: RetrievalScoringContext,
+        context: ShadowScoringContext,
     ) -> float:
         return recency_score(
             candidate,
@@ -254,12 +246,12 @@ class RetrievalScorer:
     ) -> float:
         return importance_score(candidate)
 
-    def context_match_score(
+    def relative_semantic_score(
         self,
         candidate: Any,
-        context: RetrievalScoringContext,
+        context: ShadowScoringContext,
     ) -> float:
-        return context_match_score(
+        return relative_semantic_score(
             candidate,
             context,
         )
@@ -267,7 +259,7 @@ class RetrievalScorer:
     def score(
         self,
         candidate: Any,
-        context: RetrievalScoringContext,
+        context: ShadowScoringContext,
     ) -> float:
         return score_candidate(
             candidate,

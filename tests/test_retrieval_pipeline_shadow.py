@@ -12,11 +12,11 @@ from unittest.mock import AsyncMock
 from ombrebrain.context.retrieval import (
     ContextRetrievalAdapter,
     RetrievalQualityShadow,
-    RetrievalScorer,
-    RetrievalScorerWeights,
-    RetrievalScoringContext,
+    ShadowScorer,
+    ShadowScoringWeights,
+    ShadowScoringContext,
     normalize_candidate,
-    rerank_candidates,
+    rank_candidates,
     score_candidate,
 )
 from ombrebrain.context.retrieval.quality import (
@@ -136,6 +136,235 @@ PAIRS = [
     ("fresh", 0.90),
 ]
 
+VECTOR_SCORES = dict(PAIRS)
+
+
+def views():
+    return [
+        normalize_candidate(
+            item,
+            semantic_similarity=(
+                VECTOR_SCORES.get(
+                    item["id"]
+                )
+            ),
+        )
+        for item in MATCHES
+    ]
+
+
+class CandidatePoolSplitTests(
+    unittest.IsolatedAsyncioTestCase
+):
+    """B. the pool feeds both legacy selection and the shadow."""
+
+    async def test_pool_is_pre_selection(self):
+        adapter = build_old_adapter(
+            MATCHES, PAIRS
+        )
+
+        pool = (
+            await adapter.acquire_candidate_pool(
+                "secret-query"
+            )
+        )
+
+        # The pool is the raw search result, before any
+        # threshold or cap.
+        self.assertEqual(
+            [c["id"] for c in pool["candidates"]],
+            ["stale", "fresh"],
+        )
+        self.assertEqual(
+            pool["vector_scores"],
+            VECTOR_SCORES,
+        )
+
+    async def test_legacy_selection_and_shadow_share_one_pool(
+        self,
+    ):
+        adapter = build_old_adapter(
+            MATCHES, PAIRS
+        )
+
+        pool = (
+            await adapter.acquire_candidate_pool(
+                "secret-query"
+            )
+        )
+
+        # Legacy live selection consumes the pool...
+        selection = (
+            adapter.select_legacy_results(pool)
+        )
+
+        self.assertEqual(
+            [
+                item["id"]
+                for item
+                in selection["results"]
+            ],
+            ["stale", "fresh"],
+        )
+
+        # ...and the shadow observes the very same pool.
+        event = (
+            RetrievalQualityShadow()
+            .observe(
+                pool["candidates"],
+                vector_scores=(
+                    pool["vector_scores"]
+                ),
+                legacy_selected=(
+                    selection["results"]
+                ),
+                now=NOW,
+            )
+        )
+
+        self.assertEqual(
+            event["candidate_count"],
+            2,
+        )
+        self.assertEqual(
+            event["legacy_selected_count"],
+            2,
+        )
+
+        # Selection never mutated the pool.
+        self.assertEqual(
+            [c["id"] for c in pool["candidates"]],
+            ["stale", "fresh"],
+        )
+
+    async def test_retrieve_publishes_the_pool(self):
+        adapter = build_old_adapter(
+            MATCHES, PAIRS
+        )
+
+        await adapter.retrieve(
+            "secret-query"
+        )
+
+        self.assertEqual(
+            [
+                item["id"]
+                for item in adapter.last_candidates
+            ],
+            ["stale", "fresh"],
+        )
+        self.assertEqual(
+            adapter.last_pool_vector_scores,
+            VECTOR_SCORES,
+        )
+
+    async def test_shadow_failure_does_not_change_live_result(
+        self,
+    ):
+        service = build_service(
+            MATCHES, PAIRS
+        )
+
+        def explode(candidates, **kwargs):
+            raise RuntimeError(
+                "synthetic shadow failure"
+            )
+
+        service.retrieval_shadow_v2.observe = (
+            explode
+        )
+
+        payload = await service.get_candidates(
+            "secret-query"
+        )
+
+        self.assertEqual(
+            [
+                item["id"]
+                for item in payload["memories"]
+            ],
+            ["stale", "fresh"],
+        )
+
+
+class LegacyOutputRegressionTests(
+    unittest.IsolatedAsyncioTestCase
+):
+    """B. legacy output is unchanged by the pool split."""
+
+    async def test_context_relevance_is_unchanged(
+        self,
+    ):
+        adapter = build_old_adapter(
+            MATCHES, PAIRS
+        )
+
+        result = await adapter.retrieve(
+            "secret-query"
+        )
+
+        # Exact legacy calibration, frozen on purpose.
+        self.assertEqual(
+            [
+                (
+                    item["id"],
+                    item["context_relevance"],
+                )
+                for item in result
+            ],
+            [
+                ("stale", 0.7356),
+                ("fresh", 0.9222),
+            ],
+        )
+
+    async def test_relevance_threshold_still_applies(
+        self,
+    ):
+        adapter = build_old_adapter(
+            [
+                bucket("good"),
+                bucket("low"),
+            ],
+            [
+                ("good", 0.90),
+                ("low", 0.40),
+            ],
+        )
+
+        result = await adapter.retrieve(
+            "secret-query"
+        )
+
+        self.assertEqual(
+            [item["id"] for item in result],
+            ["good"],
+        )
+
+    async def test_max_results_cap_is_preserved(
+        self,
+    ):
+        adapter = build_old_adapter(
+            [
+                bucket(f"m{index}")
+                for index in range(12)
+            ],
+            [
+                (f"m{index}", 0.9)
+                for index in range(12)
+            ],
+        )
+
+        result = await adapter.retrieve(
+            "secret-query",
+            max_results=3,
+        )
+
+        self.assertEqual(
+            [item["id"] for item in result],
+            ["m0", "m1", "m2"],
+        )
+
 
 class OldRetrievalUnchangedTests(
     unittest.IsolatedAsyncioTestCase
@@ -214,25 +443,33 @@ class ShadowIsolationTests(
 ):
     """2. shadow retrieval does not modify output."""
 
-    def test_shadow_would_reorder_but_output_stays(
+    def test_shadow_reorders_but_output_stays(
         self,
     ):
         shadow = RetrievalQualityShadow()
 
         event = shadow.observe(
             MATCHES,
+            vector_scores=VECTOR_SCORES,
+            legacy_selected=MATCHES,
             now=NOW,
         )
 
         # The shadow does reorder...
         self.assertTrue(
-            event["would_change"]
+            event["order_changed"]
         )
 
-        reranked = shadow.reranked(MATCHES)
+        reranked = rank_candidates(
+            views(),
+            context=ShadowScoringContext(
+                now=NOW,
+                max_semantic_similarity=0.9,
+            ),
+        )
 
         self.assertEqual(
-            [c.id for c in reranked],
+            [c.id for c, _s in reranked],
             ["fresh", "stale"],
         )
 
@@ -242,18 +479,18 @@ class ShadowIsolationTests(
             ["stale", "fresh"],
         )
 
-    def test_rerank_does_not_mutate_inputs(self):
+    def test_rank_does_not_mutate_inputs(self):
         snapshot = json.loads(
             json.dumps(MATCHES)
         )
 
         original = list(MATCHES)
 
-        rerank_candidates(
+        rank_candidates(
             MATCHES,
-            context=RetrievalScoringContext(
+            context=ShadowScoringContext(
                 now=NOW,
-                max_semantic_score=0.9,
+                max_semantic_similarity=0.9,
             ),
         )
 
@@ -273,6 +510,7 @@ class ShadowIsolationTests(
 
         RetrievalQualityShadow().observe(
             MATCHES,
+            vector_scores=VECTOR_SCORES,
             now=NOW,
         )
 
@@ -305,6 +543,7 @@ class QualityPrivacyTests(
     ):
         event = RetrievalQualityShadow().observe(
             MATCHES,
+            vector_scores=VECTOR_SCORES,
             now=NOW,
         )
 
@@ -320,6 +559,7 @@ class QualityPrivacyTests(
     ):
         event = RetrievalQualityShadow().observe(
             MATCHES,
+            vector_scores=VECTOR_SCORES,
             now=NOW,
         )
 
@@ -347,6 +587,7 @@ class QualityPrivacyTests(
     def test_event_is_json_serializable(self):
         event = RetrievalQualityShadow().observe(
             MATCHES,
+            vector_scores=VECTOR_SCORES,
             now=NOW,
         )
 
@@ -366,14 +607,12 @@ class ScoreDeterminismTests(
     """5. score deterministic."""
 
     def test_score_is_repeatable(self):
-        context = RetrievalScoringContext(
+        context = ShadowScoringContext(
             now=NOW,
-            max_semantic_score=0.9,
+            max_semantic_similarity=0.9,
         )
 
-        candidate = normalize_candidate(
-            MATCHES[1]
-        )
+        candidate = views()[1]
 
         first = score_candidate(
             candidate,
@@ -391,27 +630,93 @@ class ScoreDeterminismTests(
 
         # A fresh scorer instance produces the same value.
         self.assertEqual(
-            RetrievalScorer().score(
+            ShadowScorer().score(
                 candidate,
                 context,
             ),
             first,
         )
 
+    def test_malformed_candidate_never_crashes(
+        self,
+    ):
+        context = ShadowScoringContext(
+            now=NOW,
+            max_semantic_similarity=0.9,
+        )
+
+        for bad in (
+            None,
+            5,
+            "x",
+            [],
+            {"id": 1},
+        ):
+            value = score_candidate(
+                bad,
+                context,
+            )
+
+            self.assertGreaterEqual(
+                value,
+                0.0,
+                bad,
+            )
+            self.assertLessEqual(
+                value,
+                1.0,
+                bad,
+            )
+
+    def test_relative_semantic_is_not_an_independent_signal(
+        self,
+    ):
+        from ombrebrain.context.retrieval.scorer import (
+            relative_semantic_score,
+        )
+
+        context = ShadowScoringContext(
+            now=NOW,
+            max_semantic_similarity=0.9,
+        )
+
+        # relative_semantic is purely derived from the raw
+        # semantic similarity, so two candidates with the same
+        # similarity get the same relative score.
+        first = relative_semantic_score(
+            normalize_candidate(
+                MATCHES[0],
+                semantic_similarity=0.45,
+            ),
+            context,
+        )
+        second = relative_semantic_score(
+            normalize_candidate(
+                MATCHES[1],
+                semantic_similarity=0.45,
+            ),
+            context,
+        )
+
+        self.assertEqual(first, second)
+        self.assertAlmostEqual(
+            first,
+            0.5,
+            places=9,
+        )
+
     def test_score_does_not_mutate_candidate(
         self,
     ):
-        candidate = normalize_candidate(
-            MATCHES[1]
-        )
+        candidate = views()[1]
 
         before = candidate.to_dict()
 
         score_candidate(
             candidate,
-            RetrievalScoringContext(
+            ShadowScoringContext(
                 now=NOW,
-                max_semantic_score=0.9,
+                max_semantic_similarity=0.9,
             ),
         )
 
@@ -424,9 +729,9 @@ class ScoreDeterminismTests(
         for item in MATCHES:
             value = score_candidate(
                 normalize_candidate(item),
-                RetrievalScoringContext(
+                ShadowScoringContext(
                     now=NOW,
-                    max_semantic_score=0.9,
+                    max_semantic_similarity=0.9,
                 ),
             )
 
@@ -435,29 +740,29 @@ class ScoreDeterminismTests(
 
     def test_weights_default_formula(self):
         self.assertEqual(
-            RetrievalScorerWeights().to_dict(),
+            ShadowScoringWeights().to_dict(),
             {
                 "semantic": 0.5,
                 "recency": 0.2,
                 "importance": 0.2,
-                "context_match": 0.1,
+                "relative_semantic": 0.1,
             },
         )
 
 
-class RerankDeterminismTests(
+class RankDeterminismTests(
     unittest.TestCase
 ):
-    """4. rerank deterministic."""
+    """4. rank deterministic and selection-free."""
 
-    def test_rerank_is_repeatable(self):
-        context = RetrievalScoringContext(
+    def test_rank_is_repeatable(self):
+        context = ShadowScoringContext(
             now=NOW,
-            max_semantic_score=0.9,
+            max_semantic_similarity=0.9,
         )
 
-        first = rerank_candidates(
-            MATCHES,
+        first = rank_candidates(
+            views(),
             context=context,
         )
 
@@ -465,37 +770,38 @@ class RerankDeterminismTests(
             self.assertEqual(
                 [
                     c.id
-                    for c in rerank_candidates(
-                        MATCHES,
+                    for c, _s
+                    in rank_candidates(
+                        views(),
                         context=context,
                     )
                 ],
-                [c.id for c in first],
+                [c.id for c, _s in first],
             )
 
-    def test_rerank_is_order_independent_for_scores(
+    def test_rank_is_order_independent_for_scores(
         self,
     ):
         # The shadow score depends only on candidate
         # content, not on input position.
-        context = RetrievalScoringContext(
+        context = ShadowScoringContext(
             now=NOW,
-            max_semantic_score=0.9,
+            max_semantic_similarity=0.9,
         )
 
-        forward = rerank_candidates(
-            MATCHES,
+        forward = rank_candidates(
+            views(),
             context=context,
         )
 
-        backward = rerank_candidates(
-            list(reversed(MATCHES)),
+        backward = rank_candidates(
+            list(reversed(views())),
             context=context,
         )
 
         self.assertEqual(
-            [c.id for c in forward],
-            [c.id for c in backward],
+            [c.id for c, _s in forward],
+            [c.id for c, _s in backward],
         )
 
     def test_equal_scores_are_stable(self):
@@ -520,32 +826,34 @@ class RerankDeterminismTests(
             ),
         ]
 
-        result = rerank_candidates(
+        result = rank_candidates(
             tied,
-            context=RetrievalScoringContext(
+            context=ShadowScoringContext(
                 now=NOW,
-                max_semantic_score=0.7,
+                max_semantic_similarity=0.7,
             ),
         )
 
         self.assertEqual(
-            [c.id for c in result],
+            [c.id for c, _s in result],
             ["a", "b", "c"],
         )
 
-    def test_top_k_truncates_after_sort(self):
-        result = rerank_candidates(
+    def test_rank_never_truncates(self):
+        # There is no top_k here any more: every candidate
+        # is ranked and returned.
+        result = rank_candidates(
             MATCHES,
-            top_k=1,
-            context=RetrievalScoringContext(
+            context=ShadowScoringContext(
                 now=NOW,
-                max_semantic_score=0.9,
+                max_semantic_similarity=0.9,
             ),
         )
 
+        self.assertEqual(len(result), 2)
         self.assertEqual(
-            [c.id for c in result],
-            ["fresh"],
+            sorted(c.id for c, _s in result),
+            ["fresh", "stale"],
         )
 
 

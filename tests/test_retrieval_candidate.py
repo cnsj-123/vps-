@@ -9,10 +9,10 @@ from datetime import (
 )
 
 from ombrebrain.context.retrieval import (
-    RetrievalCandidate,
+    ShadowCandidate,
 )
 from ombrebrain.context.retrieval.candidate import (
-    RetrievalCandidate as DirectCandidate,
+    ShadowCandidate as DirectCandidate,
 )
 
 
@@ -59,16 +59,19 @@ class NormalizationTests(
         self,
     ):
         candidate = (
-            RetrievalCandidate
+            ShadowCandidate
             .from_bucket(
                 bucket(
                     id="b-1",
-                    relevance=0.9,
+                    # Legacy calibrated relevance is a
+                    # different concept and must be ignored.
+                    relevance=0.123,
                     importance=10,
                     last_active=(
                         NOW.isoformat()
                     ),
-                )
+                ),
+                semantic_similarity=0.9,
             )
         )
 
@@ -77,7 +80,7 @@ class NormalizationTests(
             "b-1",
         )
         self.assertEqual(
-            candidate.semantic_score,
+            candidate.semantic_similarity,
             0.9,
         )
         self.assertEqual(
@@ -105,7 +108,7 @@ class NormalizationTests(
 
         for raw, expected in cases.items():
             candidate = (
-                RetrievalCandidate
+                ShadowCandidate
                 .from_bucket(
                     bucket(
                         importance=raw
@@ -125,7 +128,7 @@ class NormalizationTests(
     ):
         # last_active wins over created_at
         candidate = (
-            RetrievalCandidate
+            ShadowCandidate
             .from_bucket(
                 bucket(
                     last_active=(
@@ -150,7 +153,7 @@ class NormalizationTests(
 
         # falls back to created_at
         fallback = (
-            RetrievalCandidate
+            ShadowCandidate
             .from_bucket(
                 bucket(
                     created_at=(
@@ -179,7 +182,7 @@ class NormalizationTests(
             12345,
         ):
             candidate = (
-                RetrievalCandidate
+                ShadowCandidate
                 .from_bucket(
                     bucket(
                         last_active=bad
@@ -192,7 +195,7 @@ class NormalizationTests(
                 bad,
             )
 
-    def test_semantic_score_is_clamped(self):
+    def test_semantic_similarity_is_clamped(self):
         for raw, expected in (
             (1.5, 1.0),
             (-0.3, 0.0),
@@ -201,19 +204,39 @@ class NormalizationTests(
             ("abc", 0.0),
         ):
             candidate = (
-                RetrievalCandidate
+                ShadowCandidate
                 .from_bucket(
                     bucket(
-                        relevance=raw
-                    )
+                        relevance=0.8
+                    ),
+                    semantic_similarity=raw,
                 )
             )
 
             self.assertEqual(
-                candidate.semantic_score,
+                candidate.semantic_similarity,
                 expected,
                 raw,
             )
+
+    def test_legacy_calibrated_relevance_is_ignored(
+        self,
+    ):
+        # The legacy live path exposes a *calibrated*
+        # context_relevance. It is not the raw embedding
+        # similarity, so the shadow view must never pick it
+        # up as ``semantic_similarity``.
+        candidate = (
+            ShadowCandidate
+            .from_bucket(
+                bucket(relevance=0.99)
+            )
+        )
+
+        self.assertEqual(
+            candidate.semantic_similarity,
+            0.0,
+        )
 
     def test_malformed_input_never_raises(
         self,
@@ -226,13 +249,13 @@ class NormalizationTests(
             {"id": 123},
         ):
             candidate = (
-                RetrievalCandidate
+                ShadowCandidate
                 .from_bucket(bad)
             )
 
             self.assertIsInstance(
                 candidate,
-                RetrievalCandidate,
+                ShadowCandidate,
                 bad,
             )
 
@@ -253,7 +276,7 @@ class NormalizationTests(
         )
 
         candidate = (
-            RetrievalCandidate
+            ShadowCandidate
             .from_bucket(raw)
         )
 
@@ -291,7 +314,7 @@ class SerializationTests(
 
     def test_round_trip(self):
         original = (
-            RetrievalCandidate
+            ShadowCandidate
             .from_bucket(
                 bucket(
                     id="rt-1",
@@ -303,12 +326,13 @@ class SerializationTests(
                     metadata={
                         "type": "fact"
                     },
-                )
+                ),
+                semantic_similarity=0.75,
             )
         )
 
         restored = (
-            RetrievalCandidate
+            ShadowCandidate
             .from_dict(
                 original.to_dict()
             )
@@ -319,8 +343,8 @@ class SerializationTests(
             original.id,
         )
         self.assertEqual(
-            restored.semantic_score,
-            original.semantic_score,
+            restored.semantic_similarity,
+            original.semantic_similarity,
         )
         self.assertEqual(
             restored.timestamp,
@@ -347,7 +371,7 @@ class SerializationTests(
         self,
     ):
         candidate = (
-            RetrievalCandidate
+            ShadowCandidate
             .from_bucket(
                 bucket(
                     last_active=(
@@ -367,7 +391,7 @@ class SerializationTests(
             set(payload),
             {
                 "id",
-                "semantic_score",
+                "semantic_similarity",
                 "timestamp",
                 "importance",
                 "metadata",
@@ -384,7 +408,7 @@ class SerializationTests(
             [],
         ):
             candidate = (
-                RetrievalCandidate
+                ShadowCandidate
                 .from_dict(bad)
             )
 
@@ -400,7 +424,7 @@ class SerializationTests(
         )
 
         candidate = (
-            RetrievalCandidate
+            ShadowCandidate
             .from_bucket(
                 bucket(
                     last_active=(
@@ -424,7 +448,7 @@ class PackageExportTests(
     def test_candidate_is_exported_once(self):
         self.assertIs(
             DirectCandidate,
-            RetrievalCandidate,
+            ShadowCandidate,
         )
 
 

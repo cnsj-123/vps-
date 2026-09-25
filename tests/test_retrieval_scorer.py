@@ -8,10 +8,10 @@ from datetime import (
 )
 
 from ombrebrain.context.retrieval import (
-    RetrievalCandidate,
-    RetrievalScorer,
-    RetrievalScorerWeights,
-    RetrievalScoringContext,
+    ShadowCandidate,
+    ShadowScorer,
+    ShadowScoringWeights,
+    ShadowScoringContext,
 )
 
 
@@ -38,9 +38,9 @@ def candidate(
         else None
     )
 
-    return RetrievalCandidate(
+    return ShadowCandidate(
         id="c",
-        semantic_score=semantic,
+        semantic_similarity=semantic,
         timestamp=timestamp,
         importance=importance,
     )
@@ -51,9 +51,9 @@ def context(
     max_semantic=0.8,
     now=NOW,
 ):
-    return RetrievalScoringContext(
+    return ShadowScoringContext(
         now=now,
-        max_semantic_score=max_semantic,
+        max_semantic_similarity=max_semantic,
     )
 
 
@@ -62,7 +62,7 @@ class DeterministicScoreTests(
 ):
 
     def test_same_inputs_same_score(self):
-        scorer = RetrievalScorer()
+        scorer = ShadowScorer()
         c = candidate(
             semantic=0.9,
             hours_old=10,
@@ -80,7 +80,7 @@ class DeterministicScoreTests(
         # Repeat with fresh instances.
         self.assertEqual(
             first,
-            RetrievalScorer().score(
+            ShadowScorer().score(
                 candidate(
                     semantic=0.9,
                     hours_old=10,
@@ -93,7 +93,7 @@ class DeterministicScoreTests(
         )
 
     def test_default_formula_weights(self):
-        scorer = RetrievalScorer()
+        scorer = ShadowScorer()
 
         # Fully neutral except semantic.
         c = candidate(
@@ -102,7 +102,7 @@ class DeterministicScoreTests(
             importance=0.0,
         )
 
-        # context_match = 1.0 / 1.0 = 1.0
+        # relative_semantic = 1.0 / 1.0 = 1.0
         # recency (missing timestamp) = 0.5
         expected = (
             0.5 * 1.0
@@ -121,7 +121,7 @@ class DeterministicScoreTests(
         )
 
     def test_score_is_bounded_0_1(self):
-        scorer = RetrievalScorer()
+        scorer = ShadowScorer()
         ctx = context(max_semantic=1.0)
 
         self.assertEqual(
@@ -151,12 +151,12 @@ class DeterministicScoreTests(
     def test_custom_weights_are_respected(
         self,
     ):
-        scorer = RetrievalScorer(
-            RetrievalScorerWeights(
+        scorer = ShadowScorer(
+            ShadowScoringWeights(
                 semantic=1.0,
                 recency=0.0,
                 importance=0.0,
-                context_match=0.0,
+                relative_semantic=0.0,
             )
         )
 
@@ -171,7 +171,7 @@ class DeterministicScoreTests(
 
     def test_weights_to_dict(self):
         weights = (
-            RetrievalScorerWeights()
+            ShadowScoringWeights()
         )
 
         self.assertEqual(
@@ -180,14 +180,17 @@ class DeterministicScoreTests(
                 "semantic": 0.5,
                 "recency": 0.2,
                 "importance": 0.2,
-                "context_match": 0.1,
+                "relative_semantic": 0.1,
             },
         )
 
     def test_score_accepts_raw_bucket(self):
-        scorer = RetrievalScorer()
+        scorer = ShadowScorer()
 
-        # score() normalizes raw dicts on the fly.
+        # score() normalizes raw dicts on the fly. A raw bucket
+        # carries no raw embedding similarity, so only neutral
+        # components contribute; the legacy calibrated
+        # context_relevance above is deliberately never read.
         score = scorer.score(
             {
                 "id": "raw",
@@ -198,7 +201,13 @@ class DeterministicScoreTests(
             context(max_semantic=1.0),
         )
 
-        self.assertGreater(score, 0.0)
+        # Missing timestamp -> neutral recency 0.5, and nothing
+        # else contributes for this raw bucket.
+        self.assertAlmostEqual(
+            score,
+            0.2 * 0.5,
+            places=9,
+        )
 
 
 class BoundaryValueTests(
@@ -206,7 +215,7 @@ class BoundaryValueTests(
 ):
 
     def test_recency_boundaries(self):
-        scorer = RetrievalScorer()
+        scorer = ShadowScorer()
         ctx = context()
 
         # age 0 -> 1.0
@@ -247,7 +256,7 @@ class BoundaryValueTests(
         )
 
         # future timestamp clamps to age 0
-        future = RetrievalCandidate(
+        future = ShadowCandidate(
             id="f",
             timestamp=NOW
             + timedelta(hours=5),
@@ -262,7 +271,7 @@ class BoundaryValueTests(
         )
 
     def test_custom_half_life(self):
-        scorer = RetrievalScorer(
+        scorer = ShadowScorer(
             recency_half_life_hours=24.0,
         )
 
@@ -276,7 +285,7 @@ class BoundaryValueTests(
         )
 
     def test_importance_boundaries(self):
-        scorer = RetrievalScorer()
+        scorer = ShadowScorer()
 
         self.assertEqual(
             scorer.importance_score(
@@ -291,12 +300,12 @@ class BoundaryValueTests(
             1.0,
         )
 
-    def test_context_match_boundaries(self):
-        scorer = RetrievalScorer()
+    def test_relative_semantic_boundaries(self):
+        scorer = ShadowScorer()
 
         # No best score -> 0.0
         self.assertEqual(
-            scorer.context_match_score(
+            scorer.relative_semantic_score(
                 candidate(semantic=0.9),
                 context(max_semantic=0.0),
             ),
@@ -305,7 +314,7 @@ class BoundaryValueTests(
 
         # Best candidate -> 1.0
         self.assertEqual(
-            scorer.context_match_score(
+            scorer.relative_semantic_score(
                 candidate(semantic=0.9),
                 context(max_semantic=0.9),
             ),
@@ -314,7 +323,7 @@ class BoundaryValueTests(
 
         # Half of best -> 0.5
         self.assertAlmostEqual(
-            scorer.context_match_score(
+            scorer.relative_semantic_score(
                 candidate(semantic=0.45),
                 context(max_semantic=0.9),
             ),
@@ -323,12 +332,12 @@ class BoundaryValueTests(
         )
 
     def test_semantic_boundary_scores(self):
-        scorer = RetrievalScorer(
-            RetrievalScorerWeights(
+        scorer = ShadowScorer(
+            ShadowScoringWeights(
                 semantic=1.0,
                 recency=0.0,
                 importance=0.0,
-                context_match=0.0,
+                relative_semantic=0.0,
             )
         )
 
@@ -351,14 +360,14 @@ class BoundaryValueTests(
 
     def test_naive_context_now_default(self):
         # A naive datetime is treated as UTC and never raises.
-        scorer = RetrievalScorer()
+        scorer = ShadowScorer()
 
         naive_ctx = (
-            RetrievalScoringContext(
+            ShadowScoringContext(
                 now=NOW.replace(
                     tzinfo=None
                 ),
-                max_semantic_score=1.0,
+                max_semantic_similarity=1.0,
             )
         )
 

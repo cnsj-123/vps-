@@ -3,44 +3,47 @@ from __future__ import annotations
 from typing import Any, Iterable
 
 from ombrebrain.context.retrieval.candidate import (
-    RetrievalCandidate,
+    ShadowCandidate,
     normalize_candidate,
 )
 from ombrebrain.context.retrieval.scorer import (
-    RetrievalScorer,
-    RetrievalScorerWeights,
-    RetrievalScoringContext,
+    ShadowScorer,
+    ShadowScoringWeights,
+    ShadowScoringContext,
     score_candidate,
 )
 
-# Shadow-only reranker.
+# Shadow-only ranking for the Retrieval v2 observation pipeline.
 #
-# Pipeline: candidate list -> score -> sort -> top_k.
+# RANK ONLY. This module intentionally performs no selection:
+#   input candidates
+#     -> score
+#     -> stable sort
+#     -> return ALL ranked candidates
 #
-# It never accesses a database, never mutates a memory and
-# never changes the real retrieval result: callers use it
-# only to compute what a hypothetical reorder WOULD produce.
+# It does NOT do threshold filtering, top_k truncation, admission
+# decisions, confidence decisions or token-budget selection.
+# Selection stays with the legacy live retrieval path; a future
+# selector will be designed together with confidence / token
+# budget / anti-echo / source balancing and is deliberately not
+# introduced here (problem D).
+#
+# It never accesses a database and never mutates memory.
 
 
-def rerank_candidates(
+def rank_candidates(
     candidates: Iterable[Any],
     *,
-    top_k: int | None = None,
-    score_threshold: float | None = None,
-    context: RetrievalScoringContext | None = None,
-    scorer: RetrievalScorer | None = None,
-    weights: RetrievalScorerWeights | None = None,
-) -> list[RetrievalCandidate]:
-    """Return a NEW sorted candidate list.
+    context: ShadowScoringContext | None = None,
+    scorer: ShadowScorer | None = None,
+    weights: ShadowScoringWeights | None = None,
+) -> list[tuple[ShadowCandidate, float]]:
+    """Return ALL candidates ranked by descending shadow score.
 
-    Steps, in order:
-      1. normalize each input (pure, never raises)
-      2. score with the shadow scorer
-      3. stable descending sort by score
-      4. score_threshold filter (>= threshold)
-      5. top_k truncation
-
-    The input iterable and its items are never mutated.
+    Every input candidate is scored and returned: nothing is
+    dropped and nothing is truncated. Ties keep their input order
+    (stable sort), so identical inputs always produce an identical
+    ranking. The input iterable and its items are never mutated.
     """
 
     normalized = [
@@ -51,11 +54,11 @@ def rerank_candidates(
     active_context = (
         context
         if context is not None
-        else RetrievalScoringContext()
+        else ShadowScoringContext()
     )
 
     def _score(
-        candidate: RetrievalCandidate,
+        candidate: ShadowCandidate,
     ) -> float:
         if scorer is not None:
             return scorer.score(
@@ -74,110 +77,54 @@ def rerank_candidates(
         for candidate in normalized
     ]
 
-    # Stable sort: equal scores keep input order, so the
-    # same inputs always produce the same ordering.
     scored.sort(
         key=lambda pair: pair[1],
         reverse=True,
     )
 
-    limit = _validated_top_k(top_k)
-
-    result: list[RetrievalCandidate] = []
-
-    for candidate, score in scored:
-        if (
-            score_threshold is not None
-            and score < score_threshold
-        ):
-            continue
-
-        result.append(candidate)
-
-        if limit is not None and len(result) >= limit:
-            break
-
-    return result
+    return scored
 
 
-class RetrievalReranker:
-    """Configured reranker.
+def rank_ids(
+    candidates: Iterable[Any],
+    *,
+    context: ShadowScoringContext | None = None,
+    scorer: ShadowScorer | None = None,
+) -> list[str]:
+    """Ordered candidate ids after ranking. Identity stays local."""
 
-    Holds top_k / threshold / scorer and delegates to
-    rerank_candidates(), so a caller can either inject
-    configuration or call the function directly.
+    return [
+        candidate.id
+        for candidate, _score in rank_candidates(
+            candidates,
+            context=context,
+            scorer=scorer,
+        )
+    ]
+
+
+class ShadowRanker:
+    """Configured shadow ranker.
+
+    Holds a scorer and delegates to rank_candidates(). Ranking
+    only: no filtering, no truncation.
     """
 
     def __init__(
         self,
-        scorer: RetrievalScorer | None = None,
-        *,
-        top_k: int | None = None,
-        score_threshold: float | None = None,
+        scorer: ShadowScorer | None = None,
     ):
         self.scorer = (
-            scorer or RetrievalScorer()
+            scorer or ShadowScorer()
         )
-        self.top_k = _validated_top_k(top_k)
-        self.score_threshold = score_threshold
 
     def rank(
         self,
         candidates: Iterable[Any],
-        context: RetrievalScoringContext,
-    ) -> list[tuple[RetrievalCandidate, float]]:
-        """Score every candidate and return (candidate, score)
-        pairs sorted by descending score."""
-
-        normalized = [
-            normalize_candidate(item)
-            for item in candidates or []
-        ]
-
-        scored = [
-            (
-                candidate,
-                self.scorer.score(
-                    candidate,
-                    context,
-                ),
-            )
-            for candidate in normalized
-        ]
-
-        scored.sort(
-            key=lambda pair: pair[1],
-            reverse=True,
-        )
-
-        return scored
-
-    def rerank(
-        self,
-        candidates: Iterable[Any],
-        context: RetrievalScoringContext,
-    ) -> list[RetrievalCandidate]:
-        return rerank_candidates(
+        context: ShadowScoringContext,
+    ) -> list[tuple[ShadowCandidate, float]]:
+        return rank_candidates(
             candidates,
-            top_k=self.top_k,
-            score_threshold=self.score_threshold,
             context=context,
             scorer=self.scorer,
         )
-
-
-def _validated_top_k(
-    value: Any,
-) -> int | None:
-    if value is None:
-        return None
-
-    try:
-        numeric = int(value)
-    except (TypeError, ValueError, OverflowError):
-        return None
-
-    if numeric < 1:
-        return None
-
-    return numeric

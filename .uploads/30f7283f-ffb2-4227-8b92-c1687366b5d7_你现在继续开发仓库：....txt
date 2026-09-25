@@ -1,0 +1,1609 @@
+你现在继续开发仓库：
+
+`cnsj-123/vps-`
+
+本轮不是开发新功能，而是对当前 Retrieval v2 Shadow + Gateway Context Pipeline 做一次严格的：
+
+- Architecture Review
+- Code Review
+- Simplification
+- Responsibility Cleanup
+
+本轮完成后：
+
+**禁止你 push。**
+**禁止你 merge。**
+**禁止你 rebase。**
+**禁止你 cherry-pick。**
+**禁止你修改远程分支。**
+
+你只负责：
+
+1. 检查真实 Git 状态；
+2. 修改本地工作区代码；
+3. 运行测试；
+4. 输出完整 diff/修改报告；
+5. 等人工审查。
+
+最终由人工审查通过以后再决定 commit / push。
+
+不要擅自替人工完成 Git 发布动作。
+
+
+==================================================
+一、开始前必须核对真实 Git 状态
+==================================================
+
+当前已知参考状态：
+
+稳定分支：
+
+`feature/gateway-v2`
+
+已知 HEAD：
+
+`6c1bff8dc173fe415eee5bb3b1917803215a61cf`
+
+commit：
+
+`fix(context): preserve mutation shadow freshness ordering`
+
+
+Trae 开发分支：
+
+`trae/agent-6hzOEI`
+
+上次审查时已知 HEAD：
+
+`b9ccfe7027`
+
+commit：
+
+`refactor(retrieval): make retrieval v2 an independent service-layer shadow`
+
+
+上次 compare 状态：
+
+`trae/agent-6hzOEI`
+
+相对于：
+
+`feature/gateway-v2`
+
+为：
+
+- ahead 14
+- behind 4
+- merge base: `228fcca51b2cdd4cd6d9fa4f025832c37cc3b73c`
+
+
+注意：
+
+以上状态只是开始工作前的参考。
+
+第一步必须实际执行并报告：
+
+```bash
+git status --short
+git branch --show-current
+git rev-parse HEAD
+git log --oneline -15
+git merge-base feature/gateway-v2 HEAD
+git rev-list --left-right --count feature/gateway-v2...HEAD
+```
+
+如果真实状态与上述参考状态不同：
+
+不要自行 reset。
+
+不要自行 checkout 旧 commit。
+
+不要自行 rebase。
+
+继续基于当前真实工作分支审查，但必须在最终报告中明确写出差异。
+
+
+==================================================
+二、本轮最高级架构原则
+==================================================
+
+本项目建立在：
+
+`P0luz/Ombre-Brain`
+
+基础上。
+
+当前上游 Ombre-Brain 已经存在：
+
+```text
+src/ombrebrain/retrieval/
+    __init__.py
+    engine.py
+    planner.py
+    scoring.py
+    bucket_scoring.py
+    context.py
+```
+
+其中已经存在类似：
+
+- RetrievalCandidate
+- RetrievalFeatures
+- RetrievalGates
+- RetrievalScore
+- PolicyGatedRetrievalScorer
+- QueryPlanner
+- RetrievalPlan
+- MemoryContextCompiler
+- SurfaceContextCompiler
+
+因此：
+
+**禁止在 `src/ombrebrain/context/retrieval/` 中继续发展第二套独立 Retrieval Domain。**
+
+以后遵循：
+
+```text
+src/ombrebrain/retrieval/
+    = Retrieval domain / policy / scoring concepts
+
+src/ombrebrain/context/
+    = Retrieval consumer / context assembly / context delivery
+```
+
+Context 层可以有 adapter、shadow observer、telemetry。
+
+Context 层不应该重新定义另一套长期存在的：
+
+- RetrievalCandidate domain
+- Retrieval scoring domain
+- retrieval policy domain
+- selection policy domain
+
+
+本项目另一条最高原则：
+
+```text
+OB 不负责替模型思考。
+```
+
+OB 负责：
+
+- Memory
+- State
+- Plan
+- Retrieval
+- Memory lifecycle
+- Surface candidates
+- Context delivery
+
+模型负责：
+
+- 理解
+- 推理
+- 当前关系判断
+- 当前情绪解释
+- 表达
+- 是否进一步 recall
+
+
+不要把 Retrieval / Context 系统改造成第二个 Agent Runtime。
+
+
+==================================================
+三、本轮明确禁止开发的功能
+==================================================
+
+本轮禁止新增：
+
+- Confidence Gate
+- 新的 Real Injection 行为
+- Memory Lifecycle 新功能
+- Emotion
+- Mood
+- Attachment
+- Desire
+- Wake 新逻辑
+- TTS / Voice
+- Web UI
+- 新 retrieval 算法
+- 新 embedding 算法
+- 新数据库
+- 新存储格式
+- 新 MCP API
+
+也禁止：
+
+- 大规模 rename
+- 无必要目录迁移
+- 为“代码漂亮”重写稳定功能
+- 顺手修无关问题
+- 大量新增 abstraction
+- 建新的第三套 retrieval framework
+
+
+本轮目标只有：
+
+**收敛现有架构。**
+
+
+==================================================
+四、当前已确认的关键问题
+==================================================
+
+你必须针对下面这些问题实际检查代码，而不是只相信本说明。
+
+
+--------------------------------------------------
+问题 A：存在两套 Retrieval abstraction
+--------------------------------------------------
+
+当前新增：
+
+```text
+src/ombrebrain/context/retrieval/
+    candidate.py
+    scorer.py
+    reranker.py
+    quality.py
+    legacy.py
+```
+
+其中又定义：
+
+- RetrievalCandidate
+- RetrievalScorer
+- RetrievalScoringContext
+- RetrievalReranker
+- RetrievalQualityShadow
+
+但上游已经存在：
+
+```text
+src/ombrebrain/retrieval/
+```
+
+及其 RetrievalCandidate / scoring / policy / context contracts。
+
+
+本轮要求：
+
+**不要简单删除 `context/retrieval/`。**
+
+先逐个文件判断：
+
+```text
+context/retrieval/candidate.py
+context/retrieval/scorer.py
+context/retrieval/reranker.py
+context/retrieval/quality.py
+context/retrieval/legacy.py
+```
+
+分别属于：
+
+A. 已被 upstream retrieval domain 覆盖，应复用；
+
+B. Context-specific adapter，可以保留；
+
+C. 纯 observability，可以保留；
+
+D. 重复实现，应删除或收窄。
+
+
+最终原则已经确定：
+
+**Canonical Retrieval Domain = `src/ombrebrain/retrieval/`**
+
+不要自行选择另一条路线。
+
+
+--------------------------------------------------
+问题 B：当前 Retrieval v2 看不到真正的 candidate pool
+--------------------------------------------------
+
+当前实际流程需要重点检查：
+
+```text
+ContextService
+    ↓
+ContextRetrievalAdapter.retrieve()
+    ↓
+embedding
+    ↓
+bucket_mgr.search()
+    ↓
+semantic floor
+    ↓
+context relevance threshold
+    ↓
+max_results
+    ↓
+legacy result
+    ↓
+RetrievalQualityShadow.observe()
+```
+
+如果真实代码仍然如此，则 Retrieval v2 shadow 实际只能观察：
+
+```text
+legacy 已选择结果
+```
+
+而不是：
+
+```text
+pre-selection candidate pool
+```
+
+这不符合 Retrieval v2 的目标。
+
+
+必须改成概念上：
+
+```text
+                  ┌── legacy selection ──→ live result
+candidate pool ───┤
+                  └── v2 score/rank ─────→ shadow metrics
+```
+
+重要：
+
+**不得改变 live retrieval 的用户可见结果。**
+
+也就是说：
+
+legacy path 的：
+
+- relevance threshold
+- semantic floor
+- max_results
+- ordering
+- output structure
+
+本轮都保持当前行为。
+
+你需要做的是：
+
+让 V2 Shadow 能观察同一批 legacy selection 之前的候选，而不是改变 legacy selection。
+
+
+如果为了做到这一点，需要给旧 adapter 提取一个内部 helper：
+
+允许。
+
+例如概念上：
+
+```text
+acquire_candidates()
+select_legacy_results()
+```
+
+但：
+
+不要设计大型新接口体系。
+
+不要重写 BucketManager。
+
+不要重写 embedding engine。
+
+
+--------------------------------------------------
+问题 C：Reranker 现在承担了 Selector 职责
+--------------------------------------------------
+
+当前必须检查：
+
+`src/ombrebrain/context/retrieval/reranker.py`
+
+已知实现存在：
+
+- score
+- sort
+- score_threshold filter
+- top_k truncation
+
+本轮要求已经确定：
+
+**Rank 与 Select 分离。**
+
+Ranker 本轮只能：
+
+```text
+input candidates
+↓
+calculate score
+↓
+stable sort
+↓
+return ALL ranked candidates
+```
+
+Ranker 不允许：
+
+- threshold filter
+- top_k filtering
+- admission decision
+- confidence decision
+- token budget selection
+
+
+因此：
+
+从真正的 ranking path 移除：
+
+```text
+score_threshold
+top_k
+```
+
+如果已有兼容 API 被测试直接使用：
+
+可以暂时保留 deprecated/compatibility wrapper，
+
+但主业务路径不能继续让 reranker 负责 selection。
+
+不得因为兼容方便而保留逻辑重复。
+
+
+--------------------------------------------------
+问题 D：不要现在新增 Selector
+--------------------------------------------------
+
+注意：
+
+把 selection 从 reranker 拿掉以后，
+
+**本轮不要顺手新增一个新的 Selector 类。**
+
+因为：
+
+未来真正 selector 会和：
+
+- Confidence
+- token budget
+- anti-echo
+- source balancing
+- flash policy
+
+共同设计。
+
+本轮只做：
+
+```text
+candidate
+↓
+score
+↓
+rank
+↓
+shadow observation
+```
+
+Selection 暂时继续由现有 legacy live path 负责。
+
+
+--------------------------------------------------
+问题 E：Quality metrics 语义必须修正
+--------------------------------------------------
+
+当前检查：
+
+`RetrievalQualityShadow`
+
+特别检查：
+
+```text
+candidate_count
+selected_count
+selection_delta
+would_change
+```
+
+如果 `selected_count` 实际只是：
+
+```text
+ranked candidate count
+```
+
+则必须修正命名。
+
+本轮建议固定语义：
+
+```text
+candidate_count
+    V2 shadow 实际观察到的 candidate 数
+
+ranked_count
+    V2 成功完成 scoring/ranking 的 candidate 数
+
+legacy_selected_count
+    legacy live path 最终实际选择数量
+
+order_changed
+    V2 ranking 相对于 legacy ordering 是否变化
+```
+
+如果还有：
+
+```text
+selection_delta
+```
+
+只有在真正比较 selected set 时才允许使用。
+
+如果只是顺序变化：
+
+改成更准确的：
+
+```text
+ranking_delta
+```
+
+或删除。
+
+不要让 metrics 名字表达不存在的行为。
+
+
+--------------------------------------------------
+问题 F：scorer 的 context_match 重复 semantic
+--------------------------------------------------
+
+当前已知公式大致为：
+
+```text
+0.5 semantic
++ 0.2 recency
++ 0.2 importance
++ 0.1 context_match
+```
+
+但是当前 `context_match` 如果定义为：
+
+```text
+candidate.semantic_score / max_semantic_score
+```
+
+则它不是独立 Context signal。
+
+它只是：
+
+```text
+relative semantic score
+```
+
+本轮要求：
+
+不要调权重。
+
+不要发明新的 context-match 算法。
+
+只允许两种处理方式：
+
+优先：
+
+```text
+context_match
+→ relative_semantic
+```
+
+重命名，使语义真实。
+
+如果改名造成非常大的无意义兼容成本：
+
+可以暂时删除该 component，
+
+并把对应权重并入已有 semantic 权重，
+
+但必须保持总 score 0..1。
+
+禁止继续把 relative semantic 命名成 context_match。
+
+
+--------------------------------------------------
+问题 G：semantic_score 命名必须检查
+--------------------------------------------------
+
+当前 `context/retrieval/candidate.py` 中：
+
+`semantic_score`
+
+如果实际上来源于：
+
+```text
+bucket["context_relevance"]
+```
+
+而不是 raw embedding similarity，
+
+则这个名字不准确。
+
+本轮不要大范围重命名整个项目。
+
+但必须：
+
+1. 在 adapter boundary 明确区分：
+   - raw semantic similarity
+   - legacy calibrated context relevance
+
+2. V2 scoring 不得误把两者当成同一个概念。
+
+优先复用 upstream `RetrievalFeatures.semantic_similarity` 等已有 contract。
+
+不要再创造第三套信号名称。
+
+
+==================================================
+五、Gateway 必须实际瘦身
+==================================================
+
+当前：
+
+`src/web/gateway.py`
+
+已超过 2000 行。
+
+本轮重点不是为了追求“行数少”，而是职责必须收敛。
+
+
+当前 gateway 中重点检查并迁移：
+
+```text
+_observe_unified_context_shadow()
+_observe_context_request_mutation_shadow()
+_select_context_real_injection()
+```
+
+以及与：
+
+```text
+Unified
+Preview
+Gate
+Mutation Shadow
+Real Injection
+freshness latch
+```
+
+相关的 pipeline orchestration。
+
+
+目标结构固定为：
+
+```text
+gateway.py
+    ↓
+Context Pipeline Coordinator / Service
+    ↓
+Unified
+    ↓
+Preview
+    ↓
+Gate
+    ↓
+Mutation Shadow
+    ↓
+Real Injection selector
+```
+
+Gateway 最终只负责：
+
+- 接收 HTTP request
+- 获取 body/headers
+- 调用现有 request observation
+- 调用 Context coordinator
+- 得到最终 selected_body
+- upstream forwarding
+- response forwarding
+- transport-level fail-open
+
+
+Gateway 不应该自己决定：
+
+- Unified 什么时候跑
+- Preview 什么时候跑
+- Gate 什么时候跑
+- revision 顺序
+- context freshness 规则
+- mutation prerequisite
+- real injection eligibility
+
+
+这些属于 Context pipeline。
+
+
+--------------------------------------------------
+新 coordinator 的约束
+--------------------------------------------------
+
+不要建立大型 framework。
+
+优先在：
+
+```text
+src/ombrebrain/context/
+```
+
+增加一个职责单一的：
+
+```text
+pipeline.py
+```
+
+或：
+
+```text
+pipeline_service.py
+```
+
+二选一即可。
+
+不要同时创建多个 coordinator 文件。
+
+
+它只负责 orchestration。
+
+例如概念 API：
+
+```python
+result = await context_pipeline.process_request(
+    conversation_id=...,
+    forward_body=...,
+)
+```
+
+返回：
+
+```text
+selected_body
++
+privacy-safe telemetry / status
+```
+
+具体命名可根据现有代码最小修改确定，
+
+但禁止让 gateway 再自己串：
+
+```text
+Unified → Preview → Gate → Mutation → Injection
+```
+
+
+==================================================
+六、Context Cleanup 必须真正利用已有模块
+==================================================
+
+当前已经存在：
+
+```text
+pipeline_state.py
+pipeline_parser.py
+pipeline_events.py
+validators/freshness.py
+```
+
+本轮要实际检查这些模块是否真的被使用。
+
+
+重点检查：
+
+`context_real_injection.py`
+
+当前约 1000 行。
+
+不要为了减少 1000 行而机械拆文件。
+
+但必须找出重复逻辑：
+
+- revision validation
+- freshness validation
+- state envelope parsing
+- JSON state loading/parsing
+- source revision ordering
+- event building
+
+如果：
+
+```text
+pipeline_parser.py
+pipeline_state.py
+validators/freshness.py
+```
+
+已有等价逻辑：
+
+必须复用。
+
+不要保留两套略有不同的 freshness/revision 判断。
+
+
+以下 helper 如果只是纯局部 helper，可以保留：
+
+- sha256
+- byte length
+- token estimation
+- report serialization
+
+除非已经有完全一致的共享实现。
+
+不要为了 DRY 把所有 3 行 helper 都抽走。
+
+
+==================================================
+七、Real Injection 行为绝对不能扩大
+==================================================
+
+当前 Real Injection：
+
+必须继续：
+
+```text
+default OFF
+```
+
+必须继续：
+
+```text
+fail-open
+```
+
+任何异常：
+
+```text
+return original forward_body
+```
+
+不得：
+
+- 阻塞请求
+- 返回新的 HTTP error
+- 自动开启 real injection
+- 改默认 env
+- 放宽 freshness
+- 放宽 gate
+- 放宽 preview
+- 绕过 mutation verification
+
+
+本轮只是：
+
+架构整理 + 复用 validation。
+
+不得改变真实 injection eligibility。
+
+
+==================================================
+八、Memory Flash 本轮只做兼容性检查，不实现
+==================================================
+
+项目未来架构已经开始向：
+
+```text
+Memory
+↓
+Candidate retrieval
+↓
+Surface / Memory Flash
+↓
+AI attention
+↓
+optional full recall
+```
+
+发展。
+
+上游当前已经存在：
+
+```text
+src/ombrebrain/retrieval/context.py
+```
+
+以及：
+
+```text
+MemoryContextCompiler
+SurfaceContextCompiler
+```
+
+本轮你必须检查：
+
+当前 Unified Candidate / Injection Preview
+
+是否把完整 Memory content 直接注入 Context。
+
+只做审查和报告。
+
+**本轮不要改造成 Memory Flash。**
+
+不要：
+
+- 新增 recall tool
+- 新增 flash schema
+- 改用户-visible context format
+- 删除现有 full-context pipeline
+
+最终报告中只需列：
+
+```text
+Current full-context behavior:
+Future SurfaceContextCompiler integration opportunity:
+```
+
+不要自行实现。
+
+
+==================================================
+九、Legacy Retrieval 必须继续是真实来源
+==================================================
+
+本轮完成以后：
+
+```text
+legacy retrieval
+```
+
+仍然是 live result source。
+
+Retrieval v2 仍然必须是：
+
+```text
+shadow-only
+```
+
+绝对禁止：
+
+```text
+if v2 score better:
+    return v2 results
+```
+
+也禁止：
+
+```text
+legacy = fallback
+v2 = primary
+```
+
+现在不是切换 live retrieval 的阶段。
+
+
+==================================================
+十、不得破坏上游 Ombre-Brain 原有能力
+==================================================
+
+必须特别注意：
+
+不要破坏：
+
+- bucket_mgr.search
+- breath
+- trace
+- hold
+- plan
+- feel
+- letter
+- SurfacePolicyVM
+- embedding hot reload
+- archive behavior
+- existing MCP tools
+- existing web search
+- existing state storage
+- current Context APIs
+
+
+`src/ombrebrain/retrieval/`
+
+虽然目前很多 contract 可能尚未 live-wire，
+
+也不能因为“没搜到调用”就删除。
+
+这是上游正式架构的一部分。
+
+
+==================================================
+十一、代码质量要求
+==================================================
+
+所有修改必须遵守：
+
+1. 单一职责。
+
+2. 不增加新的巨大函数。
+
+3. 不增加新的 500+ 行文件，除非绝对必要。
+
+4. 不通过大量：
+
+```python
+if flag:
+if shadow:
+if version:
+if mode:
+```
+
+继续堆复杂度。
+
+5. 不复制已有 validator。
+
+6. 不复制已有 candidate/scoring contract。
+
+7. 不写：
+
+```python
+except Exception:
+    pass
+```
+
+除非它属于明确的：
+
+```text
+observability-only / fail-open
+```
+
+路径。
+
+即使允许，也必须有注释说明为什么吞异常。
+
+8. live path 的异常不可静默吞掉。
+
+9. Shadow path 必须保证：
+
+```text
+shadow failure != live request failure
+```
+
+10. 不在日志中输出：
+
+- query 原文
+- memory content
+- conversation text
+- full prompt
+- sensitive Context rendered content
+
+11. 允许日志：
+
+- counts
+- hashes
+- version
+- revision
+- score statistics
+- reason code
+- booleans
+
+
+==================================================
+十二、测试要求
+==================================================
+
+修改完成后首先运行：
+
+```bash
+git diff --check
+```
+
+必须通过。
+
+
+然后运行完整测试：
+
+```bash
+PYTHONPATH=src python -m unittest discover -s tests -v
+```
+
+如果仓库实际测试体系还有 pytest：
+
+检查项目配置后再决定是否额外运行。
+
+不要因为 unittest 已通过就自行引入新的测试工具。
+
+
+--------------------------------------------------
+必须新增/修改的测试覆盖
+--------------------------------------------------
+
+至少覆盖以下行为。
+
+
+A. Candidate pool split
+
+证明：
+
+```text
+raw/pre-selection candidates
+```
+
+可以同时供：
+
+```text
+legacy live selection
+```
+
+和：
+
+```text
+V2 shadow scoring
+```
+
+使用。
+
+并且：
+
+V2 shadow 失败不能改变 legacy live result。
+
+
+B. Legacy output regression
+
+对固定输入：
+
+重构前后 legacy 最终 output：
+
+- 数量
+- 顺序
+- id
+- context_relevance
+
+保持兼容。
+
+
+C. Reranker
+
+证明：
+
+```text
+rank()
+```
+
+不会：
+
+- threshold drop
+- top_k truncate
+
+而是返回所有 candidate 的排序结果。
+
+
+D. Quality metrics
+
+证明：
+
+```text
+candidate_count
+ranked_count
+legacy_selected_count
+order_changed
+```
+
+各自语义正确。
+
+
+E. Scoring
+
+证明：
+
+- malformed candidate 不使 shadow crash
+- score 范围 0..1
+- relative semantic 命名/行为与实现一致
+- deterministic
+
+
+F. Gateway
+
+证明：
+
+gateway 通过 coordinator 获取 selected body。
+
+Gateway 不需要自己串：
+
+```text
+Unified
+Preview
+Gate
+Mutation
+Real Injection
+```
+
+
+G. Freshness
+
+现有 freshness regression 必须全部继续通过：
+
+- stale preview 不可注入
+- stale gate 不可注入
+- per-request freshness 必须保留
+- mutation ordering 必须保留
+
+
+H. Real Injection
+
+必须继续：
+
+- master flag OFF → body 完全不变
+- deny → body 完全不变
+- exception → body 完全不变
+- invalid report → body 完全不变
+- applied=true 必须经过完整 invariant check
+
+
+==================================================
+十三、禁止使用“改测试适配错误实现”
+==================================================
+
+如果现有测试与目标架构冲突：
+
+先判断：
+
+测试是在保护：
+
+A. 用户行为契约
+
+还是：
+
+B. 当前内部实现细节。
+
+
+用户行为契约：
+
+不能为了重构随便改。
+
+
+内部实现测试：
+
+可以调整，
+
+但必须在报告中写明：
+
+```text
+test changed because implementation contract changed from X to Y,
+while user-visible behavior remains unchanged.
+```
+
+不要为了让 CI 绿而弱化安全测试。
+
+
+==================================================
+十四、完成后执行静态检查
+==================================================
+
+至少执行：
+
+```bash
+git diff --check
+python -m compileall src
+```
+
+如果项目已有 ruff 配置并且当前环境可执行：
+
+```bash
+ruff check <本轮修改的 Python 文件>
+```
+
+如果 ruff 不存在：
+
+报告：
+
+```text
+ruff unavailable
+```
+
+不要临时安装大量依赖。
+
+
+==================================================
+十五、完成后不要 commit / push
+==================================================
+
+再次强调：
+
+本轮结束：
+
+**不要运行：**
+
+```bash
+git push
+git merge
+git rebase
+git cherry-pick
+git reset --hard
+git commit
+```
+
+除非人工之后明确单独要求。
+
+保持修改在本地工作区。
+
+人工需要先审：
+
+```bash
+git diff
+```
+
+
+==================================================
+十六、最终必须输出这些信息
+==================================================
+
+不要只说“完成了”。
+
+必须按下面格式完整报告。
+
+
+--------------------------------------------------
+1. Git 状态
+--------------------------------------------------
+
+输出：
+
+```text
+branch:
+original HEAD:
+merge-base with feature/gateway-v2:
+ahead:
+behind:
+working tree before:
+working tree after:
+```
+
+
+--------------------------------------------------
+2. Architecture findings
+--------------------------------------------------
+
+逐条回答：
+
+```text
+A. 是否仍存在两个 RetrievalCandidate domain？
+
+B. 是否仍存在两个独立 scoring domain？
+
+C. Context 层现在保留了哪些 retrieval-specific 职责？
+
+D. canonical retrieval domain 是哪个目录？
+
+E. legacy live retrieval 是否完全保留？
+
+F. V2 是否仍为 shadow-only？
+
+G. V2 是否已经可以观察 legacy selection 前 candidate pool？
+
+H. gateway 是否仍负责 Context pipeline orchestration？
+```
+
+
+--------------------------------------------------
+3. File mapping
+--------------------------------------------------
+
+必须列：
+
+```text
+src/ombrebrain/context/retrieval/candidate.py
+→ 保留 / 删除 / 变 adapter
+→ 原因
+→ canonical replacement
+
+src/ombrebrain/context/retrieval/scorer.py
+→ ...
+
+src/ombrebrain/context/retrieval/reranker.py
+→ ...
+
+src/ombrebrain/context/retrieval/quality.py
+→ ...
+
+src/ombrebrain/context/retrieval/legacy.py
+→ ...
+```
+
+
+--------------------------------------------------
+4. Modified files
+--------------------------------------------------
+
+每个修改文件：
+
+```text
+path
+
+before responsibility:
+after responsibility:
+why changed:
+user-visible behavior changed: yes/no
+```
+
+
+--------------------------------------------------
+5. Gateway cleanup
+--------------------------------------------------
+
+写明：
+
+```text
+gateway.py before line count:
+gateway.py after line count:
+
+moved responsibilities:
+
+remaining responsibilities:
+```
+
+
+不要以行数下降作为唯一成功指标。
+
+
+--------------------------------------------------
+6. Retrieval behavior
+--------------------------------------------------
+
+明确给出最终真实流程。
+
+例如：
+
+```text
+query
+↓
+candidate acquisition
+├─→ legacy live selection
+│      ↓
+│   live memories
+│
+└─→ v2 shadow normalization/scoring/ranking
+       ↓
+    quality telemetry
+```
+
+
+--------------------------------------------------
+7. Metrics contract
+--------------------------------------------------
+
+列出：
+
+```text
+candidate_count =
+ranked_count =
+legacy_selected_count =
+order_changed =
+```
+
+不要只列字段名，要解释定义。
+
+
+--------------------------------------------------
+8. Safety invariants
+--------------------------------------------------
+
+逐项确认：
+
+```text
+real injection default OFF:
+fail-open:
+legacy retrieval live:
+v2 shadow-only:
+freshness preserved:
+request body unchanged when injection denied:
+no raw memory/query logs:
+```
+
+
+--------------------------------------------------
+9. Tests
+--------------------------------------------------
+
+完整报告：
+
+```text
+git diff --check:
+compileall:
+ruff:
+unittest total:
+passed:
+failed:
+errors:
+skipped:
+```
+
+如果失败：
+
+必须贴出失败测试名和真实错误。
+
+不要说“应该能过”。
+
+
+--------------------------------------------------
+10. Diff summary
+--------------------------------------------------
+
+输出：
+
+```bash
+git diff --stat
+```
+
+以及：
+
+```bash
+git status --short
+```
+
+
+--------------------------------------------------
+11. Remaining risks
+--------------------------------------------------
+
+必须主动列：
+
+- 暂时没处理的问题
+- 仍存在的重复职责
+- 未来 Memory Flash / Surface integration 的接口位置
+- 为什么本轮没有实现 Confidence Gate
+
+
+==================================================
+十七、成功标准
+==================================================
+
+本轮只有同时满足以下条件才算完成：
+
+```text
+[ ] 没有开发新功能
+
+[ ] legacy retrieval 行为未改变
+
+[ ] Retrieval v2 仍然 shadow-only
+
+[ ] V2 能观察 pre-selection candidate pool
+
+[ ] Rank 与 Select 已分离
+
+[ ] metrics 语义真实
+
+[ ] context_match 不再伪装成独立 context signal
+
+[ ] canonical retrieval domain 明确为 src/ombrebrain/retrieval/
+
+[ ] Context 层没有继续扩张第二套 Retrieval Domain
+
+[ ] Gateway 不再自己 orchestrate 完整 Context chain
+
+[ ] existing freshness safety 未退化
+
+[ ] Real Injection default OFF / fail-open 未退化
+
+[ ] 所有完整测试通过
+
+[ ] git diff --check 通过
+
+[ ] 没有 commit
+
+[ ] 没有 push
+
+[ ] 没有 merge/rebase
+```
+
+
+==================================================
+十八、最重要的执行原则
+==================================================
+
+不要把这个任务理解成：
+
+“把代码重构得漂亮。”
+
+而要理解成：
+
+**在不改变用户可见行为的前提下，消除重复架构，明确唯一职责边界，为后续 Memory Flash / Confidence Gate 留出干净接口。**
+
+
+不要自行决定下一阶段。
+
+本轮结束以后停止。
+
+输出完整报告和 diff。
+
+等待人工 Architecture + Code Review。
+
+人工 Review 通过以后，才会由人工决定：
+
+- 是否继续修改
+- 是否 commit
+- 是否 push
+- 是否进入 Confidence Gate

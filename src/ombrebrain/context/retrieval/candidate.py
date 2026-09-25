@@ -4,19 +4,26 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
-# Context-layer retrieval candidate.
+# Context-layer shadow projection of a legacy retrieval candidate.
 #
-# This deliberately differs from the engine-layer
-# ombrebrain.retrieval.scoring.RetrievalCandidate:
-#   - engine layer wraps the raw bucket Mapping;
-#   - this context layer exposes ONLY normalized,
-#     storage-independent fields, so downstream
-#     shadow scoring can never depend on bucket
-#     internals.
+# Canonical retrieval domain lives in ``ombrebrain.retrieval``
+# (RetrievalCandidate / RetrievalFeatures / PolicyGatedRetrievalScorer).
+# This module intentionally does NOT define a second candidate
+# domain: it is a read-only *adapter view* used only by the
+# Retrieval v2 shadow pipeline, and it is named accordingly.
 #
-# The candidate id is used internally for identity
-# comparison. It must never be logged or persisted
-# in telemetry.
+# Signal naming (problem G):
+#   semantic_similarity
+#       raw embedding similarity, i.e. the engine's vector score.
+#       Named to match the upstream RetrievalFeatures contract.
+#   legacy_context_relevance
+#       the legacy adapter's *calibrated* value (its
+#       _context_relevance() mapping of the raw score). This is a
+#       different concept and is NOT read here, so the shadow can
+#       never mistake one for the other.
+#
+# The candidate id is used internally for identity comparison.
+# It must never be logged or persisted in telemetry.
 
 _METADATA_WHITELIST = (
     "type",
@@ -26,7 +33,7 @@ _METADATA_WHITELIST = (
 
 _DEFAULT_IMPORTANCE = 5
 
-# importance is stored as 1..10; normalized to 0..1.
+# importance is stored 1..10; normalized to 0..1.
 _MIN_IMPORTANCE = 1
 _MAX_IMPORTANCE = 10
 
@@ -91,15 +98,17 @@ def _safe_metadata(value: Any) -> dict[str, str]:
 
 
 @dataclass(frozen=True)
-class RetrievalCandidate:
-    """Normalized, storage-independent memory candidate.
+class ShadowCandidate:
+    """Shadow-only, storage-independent view of a candidate.
 
-    Shadow-only value object. Never exposes raw bucket
-    content, created_at strings or storage internals.
+    Not a retrieval domain type: the canonical one is
+    ``ombrebrain.retrieval.RetrievalCandidate``. This view never
+    exposes raw bucket content, created_at strings, storage
+    internals or the legacy calibrated relevance.
     """
 
     id: str
-    semantic_score: float = 0.0
+    semantic_similarity: float = 0.0
     timestamp: datetime | None = None
     importance: float = 0.5
     metadata: dict[str, str] = field(default_factory=dict)
@@ -108,11 +117,16 @@ class RetrievalCandidate:
     def from_bucket(
         cls,
         bucket: Any,
-    ) -> "RetrievalCandidate":
-        """Normalize one retrieved memory bucket.
+        *,
+        semantic_similarity: float | None = None,
+    ) -> "ShadowCandidate":
+        """Project one legacy retrieval candidate.
 
-        Never raises: any malformed input degrades to a
-        neutral candidate instead of breaking the shadow.
+        ``semantic_similarity`` must be the raw vector score for
+        this bucket (from the adapter's vector score map), not the
+        legacy calibrated context relevance.
+
+        Never raises: malformed input degrades to a neutral view.
         """
 
         if not isinstance(bucket, Mapping):
@@ -138,13 +152,8 @@ class RetrievalCandidate:
             id=str(
                 bucket.get("id") or ""
             ),
-            # The old pipeline attaches its calibrated
-            # context_relevance to included results; the
-            # shadow builds on that same signal.
-            semantic_score=_clamp01(
-                bucket.get(
-                    "context_relevance"
-                )
+            semantic_similarity=_clamp01(
+                semantic_similarity
             ),
             timestamp=timestamp,
             importance=(
@@ -165,8 +174,8 @@ class RetrievalCandidate:
 
         return {
             "id": self.id,
-            "semantic_score": round(
-                self.semantic_score,
+            "semantic_similarity": round(
+                self.semantic_similarity,
                 6,
             ),
             "timestamp": (
@@ -188,7 +197,7 @@ class RetrievalCandidate:
     def from_dict(
         cls,
         payload: Any,
-    ) -> "RetrievalCandidate":
+    ) -> "ShadowCandidate":
         if not isinstance(payload, Mapping):
             return cls(id="")
 
@@ -196,9 +205,9 @@ class RetrievalCandidate:
             id=str(
                 payload.get("id") or ""
             ),
-            semantic_score=_clamp01(
+            semantic_similarity=_clamp01(
                 payload.get(
-                    "semantic_score"
+                    "semantic_similarity"
                 )
             ),
             timestamp=_parse_timestamp(
@@ -215,20 +224,25 @@ class RetrievalCandidate:
 
 def normalize_candidate(
     value: Any,
-) -> RetrievalCandidate:
-    """Convert one old-retrieval result into a candidate.
+    *,
+    semantic_similarity: float | None = None,
+) -> ShadowCandidate:
+    """Project one legacy candidate into a shadow view.
 
-    Pure and total: never raises, never ranks, never
-    filters, never selects. An already-normalized
-    candidate is returned unchanged.
+    Pure and total: never raises, never ranks, never filters,
+    never selects. An already-projected view is returned
+    unchanged (its similarity is preserved).
     """
 
     if isinstance(
         value,
-        RetrievalCandidate,
+        ShadowCandidate,
     ):
         return value
 
-    return RetrievalCandidate.from_bucket(
-        value
+    return ShadowCandidate.from_bucket(
+        value,
+        semantic_similarity=(
+            semantic_similarity
+        ),
     )

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from ombrebrain.context.anti_echo import (
@@ -33,6 +33,15 @@ class ContextRetrievalAdapter:
     decision_shadow_observer: (
         RetrievalDecisionShadowObserver
     ) = RetrievalDecisionShadowObserver()
+
+    # Published pre-selection pool for the Retrieval v2 shadow.
+    # Observation-only: the live selection below never reads it.
+    last_candidates: list[dict[str, Any]] = field(
+        default_factory=list
+    )
+    last_pool_vector_scores: dict[str, float] = (
+        field(default_factory=dict)
+    )
 
     async def _semantic_scores(
         self,
@@ -308,15 +317,27 @@ class ContextRetrievalAdapter:
                 decision_shadow.to_dict(),
         }
 
-    async def retrieve(
+    async def acquire_candidate_pool(
         self,
         query: str,
         *,
-        max_results: int = 8,
+        limit: int = 20,
         domain_filter: list[str] | None = None,
         query_valence: float | None = None,
         query_arousal: float | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> dict[str, Any]:
+        """Pre-selection candidate pool: search + raw vector scores.
+
+        This is the shared input for BOTH the live selection below
+        and the Retrieval v2 shadow. It performs no threshold, no
+        cap and no ordering decision, so it never chooses anything.
+
+        Returns a plain dict:
+            query              normalized query ("" when empty)
+            embedding_enabled  engine availability at call time
+            vector_scores      bucket id -> raw embedding similarity
+            candidates         raw search matches (pre-selection)
+        """
 
         query = str(
             query or ""
@@ -334,19 +355,13 @@ class ContextRetrievalAdapter:
         )
 
         if not query:
-            self._store_telemetry(
-                embedding_enabled=
+            return {
+                "query": "",
+                "embedding_enabled":
                     embedding_enabled,
-                semantic_score_count=0,
-                raw_match_count=0,
-                processed_candidate_count=0,
-                relevance_rejected=0,
-                included=[],
-                max_semantic_score=None,
-                outcome="empty_query",
-            )
-
-            return []
+                "vector_scores": {},
+                "candidates": [],
+            }
 
         vector_scores = (
             await self._semantic_scores(
@@ -354,14 +369,16 @@ class ContextRetrievalAdapter:
             )
         )
 
+        search_limit = max(
+            int(limit or 0),
+            20,
+        )
+
         try:
             matches = (
                 await self.bucket_mgr.search(
                     query,
-                    limit=max(
-                        max_results,
-                        20,
-                    ),
+                    limit=search_limit,
                     domain_filter=
                         domain_filter,
                     query_valence=
@@ -379,10 +396,7 @@ class ContextRetrievalAdapter:
             matches = (
                 await self.bucket_mgr.search(
                     query,
-                    limit=max(
-                        max_results,
-                        20,
-                    ),
+                    limit=search_limit,
                     domain_filter=
                         domain_filter,
                     query_valence=
@@ -394,25 +408,37 @@ class ContextRetrievalAdapter:
                 )
             )
 
-        matches = list(
-            matches or []
+        return {
+            "query": query,
+            "embedding_enabled":
+                embedding_enabled,
+            "vector_scores": vector_scores,
+            "candidates": list(
+                matches or []
+            ),
+        }
+
+    def select_legacy_results(
+        self,
+        pool: dict[str, Any],
+        *,
+        max_results: int = 8,
+    ) -> dict[str, Any]:
+        """Legacy live selection. Behaviour is unchanged.
+
+        semantic recall floor (inside _context_relevance)
+          -> calibrated context relevance threshold
+          -> max_results cap, preserving search order.
+        """
+
+        vector_scores = (
+            pool.get("vector_scores")
+            or {}
         )
 
-        raw_match_count = sum(
-            1
-            for item in matches
-            if isinstance(
-                item,
-                dict,
-            )
-        )
-
-        max_semantic_score = (
-            max(
-                vector_scores.values()
-            )
-            if vector_scores
-            else None
+        matches = (
+            pool.get("candidates")
+            or []
         )
 
         results: list[
@@ -463,7 +489,91 @@ class ContextRetrievalAdapter:
             ):
                 break
 
-        if results:
+        return {
+            "results": results,
+            "processed_candidate_count":
+                processed_candidate_count,
+            "relevance_rejected":
+                relevance_rejected,
+        }
+
+    async def retrieve(
+        self,
+        query: str,
+        *,
+        max_results: int = 8,
+        domain_filter: list[str] | None = None,
+        query_valence: float | None = None,
+        query_arousal: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """Live retrieval: acquire the pool, then select from it.
+
+        Output (count, order, ids, context_relevance) is identical
+        to the pre-split implementation. The pre-selection pool is
+        published on ``last_candidates`` /
+        ``last_pool_vector_scores`` for the shadow to observe.
+        """
+
+        pool = (
+            await self.acquire_candidate_pool(
+                query,
+                limit=max_results,
+                domain_filter=domain_filter,
+                query_valence=query_valence,
+                query_arousal=query_arousal,
+            )
+        )
+
+        selection = (
+            self.select_legacy_results(
+                pool,
+                max_results=max_results,
+            )
+        )
+
+        results = selection["results"]
+
+        vector_scores = pool[
+            "vector_scores"
+        ]
+
+        matches = pool["candidates"]
+
+        embedding_enabled = pool[
+            "embedding_enabled"
+        ]
+
+        processed_candidate_count = (
+            selection[
+                "processed_candidate_count"
+            ]
+        )
+
+        relevance_rejected = selection[
+            "relevance_rejected"
+        ]
+
+        raw_match_count = sum(
+            1
+            for item in matches
+            if isinstance(
+                item,
+                dict,
+            )
+        )
+
+        max_semantic_score = (
+            max(
+                vector_scores.values()
+            )
+            if vector_scores
+            else None
+        )
+
+        if not pool["query"]:
+            outcome = "empty_query"
+
+        elif results:
             outcome = "included"
 
         elif raw_match_count == 0:
@@ -490,6 +600,16 @@ class ContextRetrievalAdapter:
             outcome = (
                 "no_included_results"
             )
+
+        # Observation-only publication for the Retrieval v2
+        # shadow. The live result above never reads these.
+        self.last_candidates = list(
+            matches
+        )
+
+        self.last_pool_vector_scores = (
+            dict(vector_scores)
+        )
 
         self._store_telemetry(
             embedding_enabled=

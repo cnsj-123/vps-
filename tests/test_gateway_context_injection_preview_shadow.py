@@ -35,6 +35,12 @@ _SPEC.loader.exec_module(
     gateway
 )
 
+# Context pipeline orchestration now lives in the context
+# coordinator; the gateway only calls into it.
+from ombrebrain.context import (
+    context_pipeline_coordinator as coordinator,
+)
+
 
 CID = "ctx_0123456789abcdef"
 
@@ -88,16 +94,16 @@ class GatewayInjectionPreviewTests(
             clear=False,
         ):
             with patch.object(
-                gateway,
+                coordinator,
                 "update_unified_context_candidate_from_runtime",
                 unified,
             ), patch.object(
-                gateway,
+                coordinator,
                 "update_context_injection_preview",
                 preview,
             ):
                 await (
-                    gateway._observe_unified_context_shadow(
+                    coordinator.observe_unified_preview_gate(
                         CID
                     )
                 )
@@ -139,16 +145,16 @@ class GatewayInjectionPreviewTests(
             clear=False,
         ):
             with patch.object(
-                gateway,
+                coordinator,
                 "update_unified_context_candidate_from_runtime",
                 unified,
             ), patch.object(
-                gateway,
+                coordinator,
                 "update_context_injection_preview",
                 preview,
             ):
                 await (
-                    gateway._observe_unified_context_shadow(
+                    coordinator.observe_unified_preview_gate(
                         CID
                     )
                 )
@@ -188,17 +194,17 @@ class GatewayInjectionPreviewTests(
             clear=False,
         ):
             with patch.object(
-                gateway,
+                coordinator,
                 "update_unified_context_candidate_from_runtime",
                 unified,
             ), patch.object(
-                gateway,
+                coordinator,
                 "update_context_injection_preview",
                 preview,
             ):
                 # Must not propagate.
                 await (
-                    gateway._observe_unified_context_shadow(
+                    coordinator.observe_unified_preview_gate(
                         CID
                     )
                 )

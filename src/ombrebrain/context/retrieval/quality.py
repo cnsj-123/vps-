@@ -3,29 +3,36 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from ombrebrain.context.retrieval.candidate import (
-    RetrievalCandidate,
+    ShadowCandidate,
     normalize_candidate,
 )
 from ombrebrain.context.retrieval.reranker import (
-    RetrievalReranker,
-    rerank_candidates,
+    rank_candidates,
 )
 from ombrebrain.context.retrieval.scorer import (
-    RetrievalScorer,
-    RetrievalScoringContext,
+    ShadowScorer,
+    ShadowScoringContext,
 )
 
 # Retrieval v2 quality shadow.
 #
-# Statistics only. This module never participates in
-# selection: it observes the old retrieval result, runs the
-# shadow score + rerank next to it and reports what WOULD
-# change. The real result is returned untouched.
+# Observability only. It never participates in selection: the
+# legacy live result is the source of truth and is never modified.
+#
+# Metric semantics (problem E) — names must not describe behaviour
+# that does not exist:
+#   candidate_count        candidates the V2 shadow observed
+#                          (the pre-selection pool, not the live result)
+#   ranked_count           candidates V2 successfully scored/ranked
+#   legacy_selected_count  what the legacy live path finally returned
+#   order_changed          whether V2 ranking of the legacy-selected
+#                          set differs from the legacy ordering
+#   ranking_delta          ordering-only delta (no add/drop claim)
 
-_VERSION = "retrieval-quality-shadow.v1"
+_VERSION = "retrieval-quality-shadow.v2"
 _MODE = "shadow_only"
 
 LOG_TAG = "[gateway.retrieval_quality_v2]"
@@ -52,18 +59,17 @@ _SCORE_BUCKET_LABELS = tuple(
 # duplicating the list.
 PRIVACY_SAFE_FIELDS = (
     "candidate_count",
-    "selected_count",
+    "ranked_count",
+    "legacy_selected_count",
     "top_score",
     "average_score",
     "score_distribution",
-    "would_change",
+    "order_changed",
     "shadow_only",
 )
 
 
-def _empty_distribution() -> (
-    dict[str, int]
-):
+def _empty_distribution() -> dict[str, int]:
     return {
         label: 0
         for label in _SCORE_BUCKET_LABELS
@@ -106,93 +112,135 @@ def _round4(value: float) -> float:
     return round(float(value), 4)
 
 
+def _candidate_id(value: Any) -> str:
+    if isinstance(value, Mapping):
+        return str(value.get("id") or "")
+
+    if isinstance(
+        value,
+        ShadowCandidate,
+    ):
+        return value.id
+
+    return ""
+
+
 class RetrievalQualityShadow:
     """Shadow statistics observer for the new retrieval path.
 
-    Privacy contract — neither the report nor the log line
-    ever contains: query, memory content, conversation_id or
-    bucket_id. Only counts, score statistics and the shadow
-    decision leave this module.
+    Privacy contract — neither the event nor the log line ever
+    contains: query, memory content, conversation_id or bucket_id.
+    Only counts, score statistics and the shadow decision leave
+    this module.
     """
 
     def __init__(
         self,
         scorer: Any = None,
-        reranker: RetrievalReranker
-        | None = None,
     ):
         self.scorer = (
-            scorer or RetrievalScorer()
-        )
-        self.reranker = (
-            reranker
-            or RetrievalReranker(
-                scorer=self.scorer
-            )
+            scorer or ShadowScorer()
         )
 
     def observe(
         self,
-        old_candidates: Iterable[Any],
+        candidates: Iterable[Any],
         *,
+        vector_scores: Mapping[str, Any]
+        | None = None,
+        legacy_selected: Iterable[Any] = (),
         now: datetime | None = None,
     ) -> dict[str, Any]:
-        """Compare the old retrieval output with the shadow rerank.
+        """Compare the pre-selection pool with the legacy live result.
 
-        ``old_candidates`` are the raw result dicts produced by
-        the existing retrieval path. They are never modified.
+        ``candidates`` is the pre-selection candidate pool (problem B):
+        the shadow observes the same candidates the legacy path saw
+        *before* its own selection, not the legacy-selected subset.
+
+        ``vector_scores`` maps bucket id -> raw embedding similarity
+        for those candidates. It is the raw signal; the legacy
+        calibrated context relevance is deliberately not used here.
+
+        ``legacy_selected`` is the legacy live result, used only to
+        measure whether V2 ordering would differ. Neither input is
+        modified.
         """
 
-        old_normalized = [
-            normalize_candidate(item)
-            for item in old_candidates or []
+        scores_map = (
+            dict(vector_scores)
+            if isinstance(
+                vector_scores,
+                Mapping,
+            )
+            else {}
+        )
+
+        views = [
+            normalize_candidate(
+                candidate,
+                semantic_similarity=(
+                    scores_map.get(
+                        _candidate_id(
+                            candidate
+                        )
+                    )
+                ),
+            )
+            for candidate in candidates or []
         ]
 
-        context = RetrievalScoringContext(
+        context = ShadowScoringContext(
             now=(
                 now
                 or datetime.now(
                     timezone.utc
                 )
             ),
-            max_semantic_score=max(
+            max_semantic_similarity=max(
                 (
-                    candidate.semantic_score
-                    for candidate in old_normalized
+                    view.semantic_similarity
+                    for view in views
                 ),
                 default=0.0,
             ),
         )
 
-        scored = self.reranker.rank(
-            old_normalized,
-            context,
+        ranked = rank_candidates(
+            views,
+            context=context,
+            scorer=self.scorer,
         )
 
         scores = [
             score
-            for _candidate, score in scored
+            for _candidate, score in ranked
         ]
 
-        # Identity is used only to compute the delta counts
-        # below; ids never leave this method.
-        old_order = [
+        ranked_ids = [
             candidate.id
-            for candidate in old_normalized
+            for candidate, _score in ranked
         ]
 
-        new_order = [
-            candidate.id
-            for candidate, _score in scored
+        legacy_ids = [
+            _candidate_id(item)
+            for item in legacy_selected or []
         ]
 
-        event = {
+        order_changed, ranking_delta = (
+            _ordering_delta(
+                legacy_ids,
+                ranked_ids,
+            )
+        )
+
+        return {
             "version": _VERSION,
             "mode": _MODE,
-            "candidate_count": len(
-                old_normalized
+            "candidate_count": len(views),
+            "ranked_count": len(ranked),
+            "legacy_selected_count": len(
+                legacy_ids
             ),
-            "selected_count": len(new_order),
             "top_score": (
                 _round4(max(scores))
                 if scores
@@ -208,20 +256,10 @@ class RetrievalQualityShadow:
             "score_distribution": (
                 _distribution(scores)
             ),
-            "would_change": (
-                old_order != new_order
-            ),
+            "order_changed": order_changed,
             "shadow_only": True,
+            "ranking_delta": ranking_delta,
         }
-
-        event["selection_delta"] = (
-            _selection_delta(
-                old_order,
-                new_order,
-            )
-        )
-
-        return event
 
     def emit(
         self,
@@ -239,22 +277,6 @@ class RetrievalQualityShadow:
             ),
         )
 
-    @staticmethod
-    def reranked(
-        old_candidates: Iterable[Any],
-        *,
-        top_k: int | None = None,
-    ) -> list[RetrievalCandidate]:
-        """The candidate list the shadow WOULD produce.
-
-        Never returned to the real retrieval path.
-        """
-
-        return rerank_candidates(
-            old_candidates,
-            top_k=top_k,
-        )
-
     @classmethod
     def observe_failed(
         cls,
@@ -262,69 +284,86 @@ class RetrievalQualityShadow:
     ) -> dict[str, Any]:
         """Fail-open event used when observe() raises.
 
-        Keeps the shadow contract: never breaks the real
-        retrieval path, never leaks anything.
+        Keeps the shadow contract: never breaks the real retrieval
+        path, never leaks anything.
         """
 
         return {
             "version": _VERSION,
             "mode": _MODE,
             "candidate_count": 0,
-            "selected_count": 0,
+            "ranked_count": 0,
+            "legacy_selected_count": 0,
             "top_score": None,
             "average_score": None,
             "score_distribution": (
                 _empty_distribution()
             ),
-            "would_change": False,
+            "order_changed": False,
             "shadow_only": True,
             "reason": reason,
-            "selection_delta": {
+            "ranking_delta": {
                 "overlap_count": 0,
-                "added_count": 0,
-                "dropped_count": 0,
                 "reordered_count": 0,
             },
         }
 
 
-def _selection_delta(
-    old_order: list[str],
-    new_order: list[str],
-) -> dict[str, int]:
-    old_ids = set(old_order)
-    new_ids = set(new_order)
+def _ordering_delta(
+    legacy_ids: list[str],
+    ranked_ids: list[str],
+) -> tuple[bool, dict[str, int]]:
+    """Ordering-only delta between legacy order and V2 order.
 
-    old_index = {
+    Restricted to ids present in both, so it never claims that V2
+    added or dropped a candidate.
+    """
+
+    ranked_set = set(ranked_ids)
+
+    legacy_overlap = [
+        value
+        for value in legacy_ids
+        if value in ranked_set
+    ]
+
+    legacy_set = set(legacy_ids)
+
+    v2_overlap = [
+        value
+        for value in ranked_ids
+        if value in legacy_set
+    ]
+
+    common = set(legacy_overlap) & set(
+        v2_overlap
+    )
+
+    legacy_index = {
         value: index
         for index, value in enumerate(
-            old_order
+            legacy_overlap
         )
     }
 
-    new_index = {
+    v2_index = {
         value: index
         for index, value in enumerate(
-            new_order
+            v2_overlap
         )
     }
-
-    common = old_ids & new_ids
 
     reordered = sum(
         1
         for value in common
-        if old_index.get(value)
-        != new_index.get(value)
+        if legacy_index.get(value)
+        != v2_index.get(value)
     )
 
-    return {
-        "overlap_count": len(common),
-        "added_count": len(
-            new_ids - old_ids
-        ),
-        "dropped_count": len(
-            old_ids - new_ids
-        ),
-        "reordered_count": reordered,
-    }
+    return (
+        legacy_overlap != v2_overlap,
+        {
+            "overlap_count": len(common),
+            "reordered_count": reordered,
+        },
+    )
