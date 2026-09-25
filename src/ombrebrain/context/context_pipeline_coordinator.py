@@ -4,7 +4,11 @@ import hashlib
 import json
 import logging
 import os
+from typing import Any
 
+from ombrebrain.context.context_confidence_gate import (
+    update_context_confidence_gate,
+)
 from ombrebrain.context.context_injection_gate import (
     update_context_injection_gate,
 )
@@ -33,12 +37,13 @@ from ombrebrain.context.unified_context_candidate import (
 # src/web/gateway.py:
 #
 #   Unified
-#     -> Preview
-#       -> Gate
-#         -> per-request freshness latch
-#           -> Mutation Shadow
-#             -> Real Injection selector
-#               -> selected_body
+#     -> Confidence Gate (shadow only)
+#       -> Preview
+#         -> Gate
+#           -> per-request freshness latch
+#             -> Mutation Shadow
+#               -> Real Injection selector
+#                 -> selected_body
 #
 # The gateway only forwards the bytes returned by
 # ``run_context_pipeline()``. It no longer decides when a stage
@@ -50,6 +55,8 @@ from ombrebrain.context.unified_context_candidate import (
 #   - every stage is fail-open: the live request keeps forward_body;
 #   - the Mutation Shadow and the Real Injection selector may only
 #     read Preview/Gate refreshed by THIS request;
+#   - the Confidence Gate is an observer: its decision is never a
+#     prerequisite and never changes the forwarded body;
 #   - no HTTP error is produced and the request is never blocked;
 #   - only privacy-safe telemetry (counts, revisions, hashes,
 #     booleans, reason codes) is logged — never query, memory,
@@ -63,6 +70,167 @@ logger = logging.getLogger("ombre_brain.gateway")
 
 def _truthy(value) -> bool:
     return str(value or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def observe_context_confidence(
+    conversation_id: str | None,
+    *,
+    expected_unified_revision: Any,
+) -> None:
+    """Observe only whether existing Context evidence is trustworthy.
+
+    Confidence Gate, shadow-only first version:
+
+      - it evaluates evidence already produced by the Context chain
+        (Conversation Candidate + Unified telemetry), it does not
+        re-run retrieval, re-embed or copy Context text;
+      - it is bound to THIS request: the caller passes the Unified
+        revision this request just produced, so a Unified file
+        already overwritten by a concurrent request is rejected
+        (stored=False) instead of polluting shadow telemetry;
+      - its decision is NOT a prerequisite: a deny_shadow never stops
+        the Preview / Injection Gate / Mutation Shadow / Real
+        Injection stages and never changes the forwarded body;
+      - it is fail-open: a failure here logs only the exception type
+        and the existing pipeline behaviour is unchanged;
+      - only privacy-safe telemetry (revisions, counts, booleans,
+        enums, reason codes) is logged.
+    """
+
+    if not _truthy(
+        os.environ.get(
+            "OMBRE_GATEWAY_CONTEXT_CONFIDENCE_GATE_SHADOW"
+        )
+    ):
+        return
+
+    if not isinstance(
+        conversation_id,
+        str,
+    ):
+        return
+
+    try:
+        report = update_context_confidence_gate(
+            conversation_id,
+            expected_unified_revision=
+                expected_unified_revision,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[gateway.context_confidence_gate] "
+            "build_failed=%s fail_open=true",
+            type(exc).__name__,
+        )
+        return
+
+    if not isinstance(
+        report,
+        dict,
+    ):
+        logger.warning(
+            "[gateway.context_confidence_gate] "
+            "invalid_report fail_open=true"
+        )
+        return
+
+    # Explicit privacy-safe allowlist. The report is never spread
+    # into the log line, so an unexpected extra field (text, ids)
+    # can never leak, and conversation_id is deliberately not
+    # logged here.
+    logger.info(
+        "[gateway.context_confidence_gate] %s",
+        json.dumps(
+            {
+                "mode": report.get("mode"),
+                "decision": report.get("decision"),
+                "allowed": report.get("allowed"),
+                "reason": report.get("reason"),
+                "reasons": report.get("reasons"),
+                "stored": report.get("stored"),
+                "duplicate": report.get("duplicate"),
+                "revision": report.get("revision"),
+                "source_candidate_revision":
+                    report.get(
+                        "source_candidate_revision"
+                    ),
+                "source_unified_revision":
+                    report.get(
+                        "source_unified_revision"
+                    ),
+                "expected_unified_revision":
+                    report.get(
+                        "expected_unified_revision"
+                    ),
+                "observed_unified_revision":
+                    report.get(
+                        "observed_unified_revision"
+                    ),
+                "current_user_excluded":
+                    report.get(
+                        "current_user_excluded"
+                    ),
+                "retrieval_observation_available":
+                    report.get(
+                        "retrieval_observation_available"
+                    ),
+                "retrieval_candidate_count":
+                    report.get(
+                        "retrieval_candidate_count"
+                    ),
+                "usable_context_evidence":
+                    report.get(
+                        "usable_context_evidence"
+                    ),
+                "has_current_task":
+                    report.get(
+                        "has_current_task"
+                    ),
+                "state_included":
+                    report.get(
+                        "state_included"
+                    ),
+                "trusted_fact_count":
+                    report.get(
+                        "trusted_fact_count"
+                    ),
+                "constraint_count":
+                    report.get(
+                        "constraint_count"
+                    ),
+                "decision_count":
+                    report.get(
+                        "decision_count"
+                    ),
+                "open_item_count":
+                    report.get(
+                        "open_item_count"
+                    ),
+                "plan_count":
+                    report.get(
+                        "plan_count"
+                    ),
+                "memory_count":
+                    report.get(
+                        "memory_count"
+                    ),
+                "recent_context_count":
+                    report.get(
+                        "recent_context_count"
+                    ),
+                "estimated_tokens":
+                    report.get(
+                        "estimated_tokens"
+                    ),
+                "token_budget":
+                    report.get(
+                        "token_budget"
+                    ),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+    )
 
 
 async def observe_unified_preview_gate(
@@ -107,6 +275,12 @@ async def observe_unified_preview_gate(
         )
     )
 
+    confidence_enabled = _truthy(
+        os.environ.get(
+            "OMBRE_GATEWAY_CONTEXT_CONFIDENCE_GATE_SHADOW"
+        )
+    )
+
     # Phase 4A-3D: an enabled real injection must refresh the
     # Unified -> Preview -> Gate chain for THIS request, even when
     # every observability shadow flag is off. The selector itself
@@ -123,6 +297,7 @@ async def observe_unified_preview_gate(
         or preview_enabled
         or gate_enabled
         or mutation_enabled
+        or confidence_enabled
         or real_injection_enabled
     ):
         return False
@@ -265,6 +440,23 @@ async def observe_unified_preview_gate(
         ),
     )
 
+    # Confidence Gate shadow observer. It sits right after Unified and
+    # before Preview, but it is an observer only: its decision never
+    # gates the Preview, the Injection Gate, the Mutation Shadow or
+    # Real Injection, and it never changes the forwarded body.
+    #
+    # It is bound to the Unified revision THIS request just produced,
+    # so a concurrent request that already overwrote the persisted
+    # Unified cannot be mistaken for this request's evidence.
+    if unified.get(
+        "stored"
+    ):
+        observe_context_confidence(
+            conversation_id,
+            expected_unified_revision=(
+                unified.get("revision")
+            ),
+        )
 
     if not (
         preview_enabled
@@ -708,10 +900,14 @@ async def run_context_pipeline(
     orchestrates Unified / Preview / Gate / Mutation / Real
     Injection itself.
 
-    Ordering matters: conversation sources -> Unified -> Preview ->
-    Gate -> freshness -> Mutation Shadow -> Real Injection. The
-    Mutation Shadow must never read Preview/Gate left on disk by an
-    earlier request.
+    Ordering matters: conversation sources -> Unified -> Confidence
+    Shadow -> Preview -> Injection Gate -> freshness -> Mutation
+    Shadow -> Real Injection. The Mutation Shadow must never read
+    Preview/Gate left on disk by an earlier request.
+
+    The Confidence Shadow stage is observation-only: it is bound to
+    the Unified revision this request just produced, and neither its
+    result nor its presence is a prerequisite for any later stage.
 
     Default-OFF and fail-open: with
     OMBRE_GATEWAY_CONTEXT_REAL_INJECTION unset (or on any deny /
