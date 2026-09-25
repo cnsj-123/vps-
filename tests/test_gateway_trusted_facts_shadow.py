@@ -35,6 +35,12 @@ _SPEC.loader.exec_module(
     gateway
 )
 
+# Conversation observation stages were moved out of the gateway into
+# their own pipeline module; these tests drive that module directly.
+from ombrebrain.context import (
+    context_observation_pipeline as observation,
+)
+
 
 CID = "ctx_0123456789abcdef"
 
@@ -79,7 +85,7 @@ class GatewayTrustedFactsShadowTests(
             clear=False,
         ):
             with patch.object(
-                gateway,
+                observation,
                 "observe_conversation_shadow",
                 return_value={
                     "observed": True,
@@ -88,21 +94,21 @@ class GatewayTrustedFactsShadowTests(
                         "abc",
                 },
             ), patch.object(
-                gateway,
+                observation,
                 "update_conversation_snapshot",
                 return_value={
                     "stored": True,
                     "revision": 1,
                 },
             ) as snapshot_mock, patch.object(
-                gateway,
+                observation,
                 "update_conversation_compact",
                 return_value={
                     "stored": True,
                     "source_revision": 1,
                 },
             ) as compact_mock, patch.object(
-                gateway,
+                observation,
                 "update_conversation_trusted_facts",
                 return_value={
                     "stored": True,
@@ -120,13 +126,13 @@ class GatewayTrustedFactsShadowTests(
                     "inference_enabled": False,
                 },
             ) as facts_mock, patch.object(
-                gateway,
+                observation,
                 "update_conversation_semantic",
                 side_effect=AssertionError(
                     "semantic must not run"
                 ),
             ):
-                gateway._observe_context_shadow(
+                observation.observe_context_sources(
                     b"{}"
                 )
 
@@ -174,7 +180,7 @@ class GatewayTrustedFactsShadowTests(
             clear=False,
         ):
             with patch.object(
-                gateway,
+                observation,
                 "observe_conversation_shadow",
                 return_value={
                     "observed": True,
@@ -183,30 +189,30 @@ class GatewayTrustedFactsShadowTests(
                         "abc",
                 },
             ), patch.object(
-                gateway,
+                observation,
                 "update_conversation_snapshot",
                 return_value={
                     "stored": True,
                     "revision": 1,
                 },
             ), patch.object(
-                gateway,
+                observation,
                 "update_conversation_compact",
                 return_value={
                     "stored": True,
                     "source_revision": 1,
                 },
             ), patch.object(
-                gateway,
+                observation,
                 "update_conversation_trusted_facts",
             ) as facts_mock, patch.object(
-                gateway,
+                observation,
                 "update_conversation_semantic",
                 return_value={
                     "stored": True,
                 },
             ):
-                gateway._observe_context_shadow(
+                observation.observe_context_sources(
                     b"{}"
                 )
 

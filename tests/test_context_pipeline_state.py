@@ -15,6 +15,7 @@ from ombrebrain.context.pipeline_state import (
     from_stage_payload,
 )
 from ombrebrain.context.validators.freshness import (
+    is_valid_revision,
     validate_context_freshness,
 )
 
@@ -204,6 +205,35 @@ class FreshnessValidatorTests(
         )
 
         self.assertFalse(result["valid"])
+
+    def test_is_valid_revision_is_the_shared_rule(
+        self,
+    ):
+        # The single public revision rule lives here and is reused by
+        # the Gate, the Mutation Shadow and Real Injection.
+        self.assertTrue(
+            is_valid_revision(1)
+        )
+
+        self.assertTrue(
+            is_valid_revision(4)
+        )
+
+        for value in (
+            None,
+            True,
+            False,
+            0,
+            -1,
+            "5",
+            5.0,
+        ):
+            with self.subTest(
+                value=value
+            ):
+                self.assertFalse(
+                    is_valid_revision(value)
+                )
 
 
 class PipelineStateTests(

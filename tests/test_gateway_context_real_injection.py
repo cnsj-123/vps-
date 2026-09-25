@@ -47,7 +47,11 @@ _SPEC.loader.exec_module(
 
 # Context pipeline orchestration now lives in the context
 # coordinator; the gateway only calls into it and forwards the
-# body the coordinator returns.
+# body the coordinator returns. Conversation observation stages
+# live in their own pipeline module.
+from ombrebrain.context import (
+    context_observation_pipeline as observation,
+)
 from ombrebrain.context import (
     context_pipeline_coordinator as coordinator,
 )
@@ -1382,8 +1386,8 @@ class GatewayRealInjectionRequestTests(
             "select_context_injected_body",
             selector,
         ), patch.object(
-            gateway,
-            "_observe_context_shadow",
+            coordinator,
+            "observe_context_sources",
             Mock(return_value=CID),
         ):
             response, client = (
@@ -1485,8 +1489,8 @@ class GatewayRealInjectionRequestTests(
             "select_context_injected_body",
             selector,
         ), patch.object(
-            gateway,
-            "_observe_context_shadow",
+            coordinator,
+            "observe_context_sources",
             Mock(return_value=CID),
         ):
             _response, client = (
@@ -1519,8 +1523,8 @@ class GatewayRealInjectionRequestTests(
         )
 
         with patch.object(
-            gateway,
-            "_observe_context_shadow",
+            coordinator,
+            "observe_context_sources",
             Mock(return_value=CID),
         ):
             response, client = (
@@ -1593,43 +1597,43 @@ class GatewayRealInjectionRequestTests(
     # prerequisite freshness
     # --------------------------------------------------
 
-    # (key, module, attribute). ``gateway`` keeps the conversation
-    # observation stages; the Unified -> Preview -> Gate stages now
-    # live in the context coordinator.
+    # (key, module, attribute). The conversation observation stages
+    # live in context_observation_pipeline; the Unified -> Preview ->
+    # Gate stages live in the context coordinator.
     _CHAIN_TARGETS = (
         (
             "conversation",
-            gateway,
+            observation,
             "observe_conversation_shadow",
         ),
         (
             "snapshot",
-            gateway,
+            observation,
             "update_conversation_snapshot",
         ),
         (
             "compact",
-            gateway,
+            observation,
             "update_conversation_compact",
         ),
         (
             "trusted_facts",
-            gateway,
+            observation,
             "update_conversation_trusted_facts",
         ),
         (
             "semantic",
-            gateway,
+            observation,
             "update_conversation_semantic",
         ),
         (
             "semantic_state",
-            gateway,
+            observation,
             "update_semantic_state",
         ),
         (
             "candidate",
-            gateway,
+            observation,
             "update_conversation_context_candidate",
         ),
         (
@@ -1749,7 +1753,7 @@ class GatewayRealInjectionRequestTests(
             clear=False,
         ):
             conversation_id = (
-                gateway._observe_context_shadow(
+                observation.observe_context_sources(
                     body
                 )
             )
@@ -1816,7 +1820,7 @@ class GatewayRealInjectionRequestTests(
             clear=False,
         ):
             conversation_id = (
-                gateway._observe_context_shadow(
+                observation.observe_context_sources(
                     body
                 )
             )
@@ -2325,14 +2329,21 @@ class GatewayRealInjectionRequestTests(
     # call ordering
     # --------------------------------------------------
 
-    async def test_call_order_is_refresh_then_mutation_then_selector(
+    async def test_context_pipeline_full_stage_order(
         self,
     ):
-        # Conversation -> Unified -> Preview -> Gate -> freshness
-        # -> Mutation Shadow -> Real Injection.
+        # Conversation sources -> Unified -> Preview -> Gate
+        # -> freshness -> Mutation Shadow -> Real Injection.
         order = []
 
         mocks = self._mock_chain()
+
+        def sources_impl(
+            forward_body,
+        ):
+            order.append("sources")
+
+            return CID
 
         async def unified_impl(
             conversation_id,
@@ -2411,9 +2422,9 @@ class GatewayRealInjectionRequestTests(
             return forward_body
 
         with patch.object(
-            gateway,
-            "_observe_context_shadow",
-            Mock(return_value=CID),
+            coordinator,
+            "observe_context_sources",
+            Mock(side_effect=sources_impl),
         ), patch.object(
             coordinator,
             "observe_request_mutation",
@@ -2440,6 +2451,7 @@ class GatewayRealInjectionRequestTests(
         self.assertEqual(
             order,
             [
+                "sources",
                 "unified",
                 "preview",
                 "gate",
@@ -2785,13 +2797,73 @@ class GatewayCoordinatorDelegationTests(
                 name,
             )
 
-    def test_gateway_uses_the_coordinator_entry_point(
+    def test_gateway_does_not_define_context_observation_pipeline(
         self,
     ):
-        # The gateway forwards through exactly one entry point.
+        # The conversation observation pipeline lives in its own
+        # module, never inside the gateway.
+        self.assertFalse(
+            hasattr(
+                gateway,
+                "_observe_context_shadow",
+            )
+        )
+
+        self.assertTrue(
+            hasattr(
+                observation,
+                "observe_context_sources",
+            )
+        )
+
+    def test_gateway_does_not_import_context_stage_modules(
+        self,
+    ):
+        source = _GATEWAY_PATH.read_text(
+            encoding="utf-8"
+        )
+
+        for module in (
+            "conversation_shadow",
+            "conversation_snapshot",
+            "conversation_compact",
+            "conversation_trusted_facts",
+            "conversation_semantic",
+            "conversation_semantic_state",
+            "conversation_context_candidate",
+        ):
+            with self.subTest(
+                module=module
+            ):
+                self.assertNotIn(
+                    module,
+                    source,
+                )
+
+    def test_gateway_calls_single_context_pipeline_entry(
+        self,
+    ):
+        # The gateway forwards through exactly one entry point and
+        # no longer computes a conversation_id itself.
         self.assertIs(
             gateway.run_context_pipeline,
             coordinator.run_context_pipeline,
+        )
+
+        source = _GATEWAY_PATH.read_text(
+            encoding="utf-8"
+        )
+
+        self.assertEqual(
+            source.count(
+                "run_context_pipeline("
+            ),
+            1,
+        )
+
+        self.assertNotIn(
+            "context_conversation_id",
+            source,
         )
 
     async def test_pipeline_is_a_noop_when_real_injection_is_off(
@@ -2813,8 +2885,36 @@ class GatewayCoordinatorDelegationTests(
 
             selected = (
                 await coordinator.run_context_pipeline(
-                    CID,
-                    body,
+                    body
+                )
+            )
+
+        self.assertIs(
+            selected,
+            body,
+        )
+
+    async def test_context_pipeline_source_failure_is_fail_open(
+        self,
+    ):
+        # A failure in the conversation observation pipeline must
+        # not propagate and must not change the forwarded body.
+        body = body_from(
+            base_payload()
+        )
+
+        with patch.object(
+            coordinator,
+            "observe_context_sources",
+            Mock(
+                side_effect=RuntimeError(
+                    "secret"
+                )
+            ),
+        ):
+            selected = (
+                await coordinator.run_context_pipeline(
+                    body
                 )
             )
 
@@ -2844,8 +2944,7 @@ class GatewayCoordinatorDelegationTests(
         ):
             selected = (
                 await coordinator.run_context_pipeline(
-                    CID,
-                    body,
+                    body
                 )
             )
 

@@ -35,6 +35,12 @@ _SPEC.loader.exec_module(
     gateway
 )
 
+# Conversation observation stages were moved out of the gateway into
+# their own pipeline module; these tests drive that module directly.
+from ombrebrain.context import (
+    context_observation_pipeline as observation,
+)
+
 
 CID = "ctx_0123456789abcdef"
 
@@ -94,7 +100,7 @@ class GatewayContextCandidateTests(
             clear=False,
         ):
             with patch.object(
-                gateway,
+                observation,
                 "observe_conversation_shadow",
                 side_effect=mark(
                     "shadow",
@@ -107,7 +113,7 @@ class GatewayContextCandidateTests(
                     },
                 ),
             ), patch.object(
-                gateway,
+                observation,
                 "update_conversation_snapshot",
                 side_effect=mark(
                     "snapshot",
@@ -117,7 +123,7 @@ class GatewayContextCandidateTests(
                     },
                 ),
             ), patch.object(
-                gateway,
+                observation,
                 "update_conversation_compact",
                 side_effect=mark(
                     "compact",
@@ -127,7 +133,7 @@ class GatewayContextCandidateTests(
                     },
                 ),
             ), patch.object(
-                gateway,
+                observation,
                 "update_conversation_trusted_facts",
                 side_effect=mark(
                     "trusted_facts",
@@ -137,7 +143,7 @@ class GatewayContextCandidateTests(
                     },
                 ),
             ), patch.object(
-                gateway,
+                observation,
                 "update_conversation_semantic",
                 side_effect=mark(
                     "semantic",
@@ -147,7 +153,7 @@ class GatewayContextCandidateTests(
                     },
                 ),
             ), patch.object(
-                gateway,
+                observation,
                 "update_semantic_state",
                 side_effect=mark(
                     "semantic_state",
@@ -157,7 +163,7 @@ class GatewayContextCandidateTests(
                     },
                 ),
             ), patch.object(
-                gateway,
+                observation,
                 "update_conversation_context_candidate",
                 side_effect=mark(
                     "candidate",
@@ -182,7 +188,7 @@ class GatewayContextCandidateTests(
                     },
                 ),
             ):
-                gateway._observe_context_shadow(
+                observation.observe_context_sources(
                     b"{}"
                 )
 
@@ -216,7 +222,7 @@ class GatewayContextCandidateTests(
             clear=False,
         ):
             with patch.object(
-                gateway,
+                observation,
                 "observe_conversation_shadow",
                 return_value={
                     "observed": True,
@@ -226,34 +232,34 @@ class GatewayContextCandidateTests(
                         "abc",
                 },
             ), patch.object(
-                gateway,
+                observation,
                 "update_conversation_snapshot",
                 return_value={
                     "stored": True,
                 },
             ), patch.object(
-                gateway,
+                observation,
                 "update_conversation_compact",
                 return_value={
                     "stored": True,
                 },
             ), patch.object(
-                gateway,
+                observation,
                 "update_conversation_semantic",
                 return_value={
                     "stored": True,
                 },
             ), patch.object(
-                gateway,
+                observation,
                 "update_semantic_state",
                 return_value={
                     "stored": True,
                 },
             ), patch.object(
-                gateway,
+                observation,
                 "update_conversation_context_candidate",
             ) as candidate_mock:
-                gateway._observe_context_shadow(
+                observation.observe_context_sources(
                     b"{}"
                 )
 
@@ -268,7 +274,7 @@ class GatewayContextCandidateTests(
             clear=False,
         ):
             with patch.object(
-                gateway,
+                observation,
                 "observe_conversation_shadow",
                 return_value={
                     "observed": True,
@@ -278,44 +284,44 @@ class GatewayContextCandidateTests(
                         "abc",
                 },
             ), patch.object(
-                gateway,
+                observation,
                 "update_conversation_snapshot",
                 return_value={
                     "stored": True,
                 },
             ), patch.object(
-                gateway,
+                observation,
                 "update_conversation_compact",
                 return_value={
                     "stored": True,
                 },
             ), patch.object(
-                gateway,
+                observation,
                 "update_conversation_trusted_facts",
                 return_value={
                     "stored": True,
                 },
             ), patch.object(
-                gateway,
+                observation,
                 "update_conversation_semantic",
                 return_value={
                     "stored": True,
                 },
             ), patch.object(
-                gateway,
+                observation,
                 "update_semantic_state",
                 return_value={
                     "stored": True,
                 },
             ), patch.object(
-                gateway,
+                observation,
                 "update_conversation_context_candidate",
                 side_effect=RuntimeError(
                     "synthetic failure"
                 ),
             ):
                 # Must not propagate.
-                gateway._observe_context_shadow(
+                observation.observe_context_sources(
                     b"{}"
                 )
 

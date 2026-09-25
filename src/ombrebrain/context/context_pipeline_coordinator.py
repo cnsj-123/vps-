@@ -11,6 +11,9 @@ from ombrebrain.context.context_injection_gate import (
 from ombrebrain.context.context_injection_preview import (
     update_context_injection_preview,
 )
+from ombrebrain.context.context_observation_pipeline import (
+    observe_context_sources,
+)
 from ombrebrain.context.context_real_injection import (
     select_context_injected_body,
 )
@@ -695,19 +698,20 @@ def select_real_injection(
 
 
 async def run_context_pipeline(
-    conversation_id: str | None,
     forward_body: bytes,
 ) -> bytes:
     """Run the whole Context chain for one request and return the body.
 
     This is the single entry point the gateway uses. It owns the
-    fixed ordering, the per-request freshness latch and the real
-    injection eligibility rule, so the gateway no longer orchestrates
-    Unified / Preview / Gate / Mutation / Real Injection itself.
+    whole Context chain, including the conversation observation
+    stages, so the gateway no longer computes a conversation_id or
+    orchestrates Unified / Preview / Gate / Mutation / Real
+    Injection itself.
 
-    Ordering matters: Unified -> Preview -> Gate -> freshness ->
-    Mutation Shadow -> Real Injection. The Mutation Shadow must never
-    read Preview/Gate left on disk by an earlier request.
+    Ordering matters: conversation sources -> Unified -> Preview ->
+    Gate -> freshness -> Mutation Shadow -> Real Injection. The
+    Mutation Shadow must never read Preview/Gate left on disk by an
+    earlier request.
 
     Default-OFF and fail-open: with
     OMBRE_GATEWAY_CONTEXT_REAL_INJECTION unset (or on any deny /
@@ -720,6 +724,12 @@ async def run_context_pipeline(
     """
 
     try:
+        conversation_id = (
+            observe_context_sources(
+                forward_body
+            )
+        )
+
         context_chain_fresh = (
             await observe_unified_preview_gate(
                 conversation_id

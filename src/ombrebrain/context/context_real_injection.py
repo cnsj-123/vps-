@@ -11,6 +11,7 @@ from ombrebrain.context.context_request_mutation_shadow import (
     build_context_request_mutation_shadow_from_runtime,
 )
 from ombrebrain.context.validators.freshness import (
+    is_valid_revision,
     validate_context_freshness,
 )
 
@@ -143,24 +144,6 @@ def _valid_nonnegative_int(
             bool,
         )
         and value >= 0
-    )
-
-
-def _valid_revision(
-    value: Any,
-) -> bool:
-    """Revisions are 1-based."""
-
-    return (
-        isinstance(
-            value,
-            int,
-        )
-        and not isinstance(
-            value,
-            bool,
-        )
-        and value >= 1
     )
 
 
@@ -496,7 +479,7 @@ def _select_enabled(
         "revision"
     )
 
-    if not _valid_revision(
+    if not is_valid_revision(
         preview_revision
     ):
         return (
@@ -512,7 +495,7 @@ def _select_enabled(
         "source_revision"
     )
 
-    if not _valid_revision(
+    if not is_valid_revision(
         preview_source_revision
     ):
         return (

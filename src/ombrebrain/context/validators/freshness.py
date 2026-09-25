@@ -9,7 +9,7 @@ DEFAULT_INVALID_REASON = "invalid_revision"
 DEFAULT_MISMATCH_REASON = "revision_mismatch"
 
 
-def _is_valid_revision(
+def is_valid_revision(
     value: Any,
 ) -> bool:
     """Revisions are 1-based."""
@@ -54,9 +54,9 @@ def validate_context_freshness(
             expected_revision,
     }
 
-    if not _is_valid_revision(
+    if not is_valid_revision(
         checked_revision
-    ) or not _is_valid_revision(
+    ) or not is_valid_revision(
         expected_revision
     ):
         return result
