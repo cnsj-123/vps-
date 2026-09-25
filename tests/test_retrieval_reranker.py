@@ -8,12 +8,10 @@ from datetime import (
     timezone,
 )
 
-from ombrebrain.context.retrieval import (
-    ShadowCandidate,
-    ShadowRanker,
-    ShadowScorer,
-    ShadowScoringWeights,
-    ShadowScoringContext,
+from ombrebrain.context.retrieval.candidate import (
+    project_candidate,
+)
+from ombrebrain.context.retrieval.reranker import (
     rank_candidates,
 )
 
@@ -34,33 +32,32 @@ def candidate(
     *,
     semantic=0.5,
     hours_old=None,
-    importance=0.5,
+    importance=5,
 ):
-    return ShadowCandidate(
-        id=id,
-        semantic_similarity=semantic,
-        timestamp=(
+    metadata = {
+        "importance": importance,
+    }
+
+    if hours_old is not None:
+        metadata["last_active"] = (
             NOW - timedelta(hours=hours_old)
-            if hours_old is not None
-            else None
-        ),
-        importance=importance,
-    )
+        ).isoformat()
 
-
-def ctx(max_semantic=None):
-    return ShadowScoringContext(
-        now=NOW,
-        max_semantic_similarity=(
-            max_semantic
-            if max_semantic is not None
-            else 0.0
-        ),
+    return project_candidate(
+        {
+            "id": id,
+            "content": "secret-content",
+            "metadata": metadata,
+        },
+        semantic_similarity=semantic,
     )
 
 
 def ids(ranked):
-    return [c.id for c, _score in ranked]
+    return [
+        item.bucket.get("id")
+        for item, _score in ranked
+    ]
 
 
 class OrderingTests(
@@ -69,10 +66,7 @@ class OrderingTests(
 
     def test_sorted_by_score_descending(self):
         # semantic: 0.9 > 0.7 > 0.5, all else neutral.
-        ranker = ShadowRanker()
-        context = ctx(max_semantic=0.9)
-
-        result = ranker.rank(
+        result = rank_candidates(
             [
                 candidate(
                     "low",
@@ -87,7 +81,8 @@ class OrderingTests(
                     semantic=0.7,
                 ),
             ],
-            context,
+            now=NOW,
+            max_semantic_similarity=0.9,
         )
 
         self.assertEqual(
@@ -98,12 +93,9 @@ class OrderingTests(
     def test_recency_can_reorder_semantic_order(
         self,
     ):
-        # Same semantic tier, but one memory is fresh and
-        # the other ancient: recency must lift the fresh one.
-        ranker = ShadowRanker()
-        context = ctx(max_semantic=0.8)
-
-        result = ranker.rank(
+        # Same semantic tier, but one memory is fresh and the other
+        # ancient: recency must lift the fresh one.
+        result = rank_candidates(
             [
                 candidate(
                     "ancient",
@@ -116,7 +108,8 @@ class OrderingTests(
                     hours_old=1,
                 ),
             ],
-            context,
+            now=NOW,
+            max_semantic_similarity=0.8,
         )
 
         self.assertEqual(
@@ -126,25 +119,14 @@ class OrderingTests(
 
     def test_equal_scores_keep_input_order(self):
         # Stable sort: identical inputs keep relative order.
-        ranker = ShadowRanker()
-        context = ctx(max_semantic=0.6)
-
-        result = ranker.rank(
+        result = rank_candidates(
             [
-                candidate(
-                    "a",
-                    semantic=0.6,
-                ),
-                candidate(
-                    "b",
-                    semantic=0.6,
-                ),
-                candidate(
-                    "c",
-                    semantic=0.6,
-                ),
+                candidate("a", semantic=0.6),
+                candidate("b", semantic=0.6),
+                candidate("c", semantic=0.6),
             ],
-            context,
+            now=NOW,
+            max_semantic_similarity=0.6,
         )
 
         self.assertEqual(
@@ -152,99 +134,58 @@ class OrderingTests(
             ["a", "b", "c"],
         )
 
-    def test_input_list_is_not_mutated(self):
+    def test_input_is_not_mutated(self):
         original = [
-            candidate(
-                "low",
-                semantic=0.2,
-            ),
-            candidate(
-                "high",
-                semantic=0.9,
-            ),
+            candidate("low", semantic=0.2),
+            candidate("high", semantic=0.9),
         ]
 
         snapshot = list(original)
 
-        ShadowRanker().rank(
+        rank_candidates(
             original,
-            ctx(max_semantic=0.9),
+            now=NOW,
+            max_semantic_similarity=0.9,
         )
 
-        self.assertEqual(
-            original,
-            snapshot,
-        )
+        self.assertEqual(original, snapshot)
 
     def test_empty_input_returns_empty(self):
-        result = ShadowRanker().rank(
+        result = rank_candidates(
             [],
-            ctx(),
+            now=NOW,
+            max_semantic_similarity=0.0,
         )
 
         self.assertEqual(result, [])
 
-    def test_raw_buckets_are_normalized(self):
-        ranker = ShadowRanker()
+    def test_rank_returns_canonical_candidates_and_scores(
+        self,
+    ):
+        from ombrebrain.retrieval import (
+            RetrievalCandidate,
+        )
 
-        result = ranker.rank(
+        scored = rank_candidates(
             [
-                {
-                    "id": "raw-low",
-                    "context_relevance": 0.2,
-                    "importance": 1,
-                    "metadata": {},
-                },
-                {
-                    "id": "raw-high",
-                    "context_relevance": 0.9,
-                    "importance": 10,
-                    "metadata": {},
-                },
+                candidate("a", semantic=0.9),
+                candidate("b", semantic=0.1),
             ],
-            ctx(max_semantic=0.9),
+            now=NOW,
+            max_semantic_similarity=0.9,
         )
 
-        # Legacy calibrated context_relevance is not the raw
-        # semantic signal, so importance alone orders these.
-        self.assertEqual(
-            ids(result),
-            ["raw-high", "raw-low"],
-        )
+        scores = [value for _item, value in scored]
 
-    def test_rank_returns_scores(self):
-        ranker = ShadowRanker()
-
-        scored = ranker.rank(
-            [
-                candidate(
-                    "a",
-                    semantic=0.9,
-                ),
-                candidate(
-                    "b",
-                    semantic=0.1,
-                ),
-            ],
-            ctx(max_semantic=0.9),
-        )
-
-        scores = [
-            s for _c, s in scored
-        ]
-
-        self.assertEqual(
-            ids(scored),
-            ["a", "b"],
-        )
+        self.assertEqual(ids(scored), ["a", "b"])
         self.assertEqual(
             scores,
-            sorted(
-                scores,
-                reverse=True,
-            ),
+            sorted(scores, reverse=True),
         )
-
+        self.assertIsInstance(
+            scored[0][0],
+            RetrievalCandidate,
+        )
         self.assertIsInstance(
             scored[0][1],
             float,
@@ -257,25 +198,20 @@ class NoSelectionTests(
     """The ranker only ranks. Selection is not its job."""
 
     def test_rank_keeps_every_candidate(self):
-        # A zero-scoring candidate must NOT be dropped: there is
-        # no threshold and no admission decision here.
+        # A zero-scoring candidate must NOT be dropped: there is no
+        # threshold and no admission decision here.
         result = rank_candidates(
             [
-                candidate(
-                    "high",
-                    semantic=0.9,
-                ),
+                candidate("high", semantic=0.9),
                 candidate(
                     "zero",
                     semantic=0.0,
-                    importance=0.0,
+                    importance=1,
                 ),
-                candidate(
-                    "mid",
-                    semantic=0.5,
-                ),
+                candidate("mid", semantic=0.5),
             ],
-            context=ctx(max_semantic=0.9),
+            now=NOW,
+            max_semantic_similarity=0.9,
         )
 
         self.assertEqual(
@@ -286,25 +222,23 @@ class NoSelectionTests(
 
     def test_rank_never_truncates(self):
         payload = [
-            candidate(
-                f"c{index}",
-                semantic=0.5,
-            )
+            candidate(f"c{index}", semantic=0.5)
             for index in range(12)
         ]
 
         result = rank_candidates(
             payload,
-            context=ctx(max_semantic=0.5),
+            now=NOW,
+            max_semantic_similarity=0.5,
         )
 
         self.assertEqual(len(result), 12)
         self.assertEqual(
-            {c.id for c, _s in result},
-            {c.id for c in payload},
+            {item.bucket.get("id") for item, _s in result},
+            {item.bucket.get("id") for item in payload},
         )
 
-    def test_ranker_exposes_no_selection_parameters(
+    def test_rank_exposes_no_selection_parameters(
         self,
     ):
         forbidden = (
@@ -314,67 +248,23 @@ class NoSelectionTests(
             "limit",
         )
 
-        for callable_ in (
-            ShadowRanker.rank,
-            rank_candidates,
-        ):
-            parameters = inspect.signature(
-                callable_
-            ).parameters
-
-            for name in forbidden:
-                self.assertNotIn(
-                    name,
-                    parameters,
-                    f"{callable_.__name__}"
-                    f" must not select via {name}",
-                )
-
-    def test_ranker_constructor_exposes_no_selector(
-        self,
-    ):
         parameters = inspect.signature(
-            ShadowRanker.__init__
+            rank_candidates
         ).parameters
 
-        self.assertNotIn(
-            "top_k",
-            parameters,
-        )
-        self.assertNotIn(
-            "score_threshold",
-            parameters,
-        )
-
-    def test_custom_scorer_is_used(self):
-        scorer = ShadowScorer(
-            ShadowScoringWeights(
-                semantic=1.0,
-                recency=0.0,
-                importance=0.0,
-                relative_semantic=0.0,
+        for name in forbidden:
+            self.assertNotIn(
+                name,
+                parameters,
+                f"rank_candidates must not"
+                f" select via {name}",
             )
-        )
 
-        result = ShadowRanker(
-            scorer
-        ).rank(
-            [
-                candidate(
-                    "a",
-                    semantic=0.3,
-                ),
-                candidate(
-                    "b",
-                    semantic=0.8,
-                ),
-            ],
-            ctx(max_semantic=0.8),
-        )
+    def test_shadow_ranker_class_is_gone(self):
+        import ombrebrain.context.retrieval.reranker as module
 
-        self.assertEqual(
-            ids(result),
-            ["b", "a"],
+        self.assertFalse(
+            hasattr(module, "ShadowRanker")
         )
 
 

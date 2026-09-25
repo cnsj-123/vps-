@@ -26,13 +26,16 @@ class ContextService:
     def _observe_retrieval_shadow_v2(
         self,
         legacy_selected: list[Any],
+        observation: dict[str, Any],
     ) -> dict[str, Any]:
         """Run the Retrieval v2 shadow next to the live result.
 
-        The shadow observes the *pre-selection* candidate pool the
-        legacy adapter published (problem B), not the legacy-selected
-        subset. ``legacy_selected`` is passed only so the shadow can
-        measure whether V2 ordering would differ.
+        The shadow observes the *pre-selection* candidate pool of THIS
+        request, taken from the observation returned by
+        ``retrieve_with_observation()`` — never from a shared instance
+        field, so concurrent requests cannot mix pools.
+        ``legacy_selected`` is passed only so the shadow can measure
+        whether V2 ordering would differ.
 
         Fail-open: any error degrades to a neutral event and never
         affects the real retrieval result.
@@ -42,11 +45,14 @@ class ContextService:
             event = (
                 self.retrieval_shadow_v2
                 .observe(
-                    self.retrieval
-                    .last_candidates,
+                    observation.get(
+                        "candidates"
+                    )
+                    or [],
                     vector_scores=(
-                        self.retrieval
-                        .last_pool_vector_scores
+                        observation.get(
+                            "vector_scores"
+                        )
                     ),
                     legacy_selected=(
                         legacy_selected
@@ -158,21 +164,29 @@ class ContextService:
                     self.bucket_mgr.embedding_engine
                 )
 
-            memories = await self.retrieval.retrieve(
-                query,
-                max_results=self.builder.max_memories,
+            memories, retrieval_observation = (
+                await self.retrieval
+                .retrieve_with_observation(
+                    query,
+                    max_results=(
+                        self.builder.max_memories
+                    ),
+                )
             )
 
             # Retrieval v2 shadow. Runs next to the old result
             # above; the returned memories are never modified.
             retrieval_quality_v2 = (
                 self._observe_retrieval_shadow_v2(
-                    memories
+                    memories,
+                    retrieval_observation,
                 )
             )
 
             telemetry = (
-                self.retrieval.last_telemetry
+                retrieval_observation.get(
+                    "telemetry"
+                )
                 or {}
             )
 
@@ -337,8 +351,8 @@ class ContextService:
         anti_echo = {}
         dedup = {}
         if query.strip() and not memories:
-            memories = await self.retrieval.retrieve(query, max_results=self.builder.max_memories)
-            telemetry = self.retrieval.last_telemetry or {}
+            memories, retrieval_observation = await self.retrieval.retrieve_with_observation(query, max_results=self.builder.max_memories)
+            telemetry = retrieval_observation.get("telemetry") or {}
             retrieval_candidate_count = int(telemetry.get("candidate_count", 0))
             relevance_rejected = int(telemetry.get("relevance_rejected", 0))
             anti_echo = {k: int(v) for k, v in telemetry.items() if k.startswith("anti_echo_")}

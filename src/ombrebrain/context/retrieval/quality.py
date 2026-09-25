@@ -5,25 +5,25 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping
 
+from ombrebrain.retrieval import RetrievalCandidate
+
 from ombrebrain.context.retrieval.candidate import (
-    ShadowCandidate,
-    normalize_candidate,
+    project_candidate,
 )
 from ombrebrain.context.retrieval.reranker import (
     rank_candidates,
 )
-from ombrebrain.context.retrieval.scorer import (
-    ShadowScorer,
-    ShadowScoringContext,
-)
 
-# Retrieval v2 quality shadow.
+# Retrieval v2 quality shadow — observability only.
 #
-# Observability only. It never participates in selection: the
+# This is NOT part of the retrieval domain: it is a privacy-safe
+# telemetry observer that reuses the canonical candidate model
+# (``ombrebrain.retrieval.RetrievalCandidate``) plus the shadow
+# project / rank helpers. It never participates in selection: the
 # legacy live result is the source of truth and is never modified.
 #
-# Metric semantics (problem E) — names must not describe behaviour
-# that does not exist:
+# Metric semantics — names must not describe behaviour that does not
+# exist:
 #   candidate_count        candidates the V2 shadow observed
 #                          (the pre-selection pool, not the live result)
 #   ranked_count           candidates V2 successfully scored/ranked
@@ -113,16 +113,28 @@ def _round4(value: float) -> float:
 
 
 def _candidate_id(value: Any) -> str:
+    if isinstance(
+        value,
+        RetrievalCandidate,
+    ):
+        return str(
+            value.bucket.get("id") or ""
+        )
+
     if isinstance(value, Mapping):
         return str(value.get("id") or "")
 
-    if isinstance(
-        value,
-        ShadowCandidate,
-    ):
-        return value.id
-
     return ""
+
+
+def _semantic_from(views: list[Any]) -> float:
+    return max(
+        (
+            view.features.semantic_similarity
+            for view in views
+        ),
+        default=0.0,
+    )
 
 
 class RetrievalQualityShadow:
@@ -133,14 +145,6 @@ class RetrievalQualityShadow:
     Only counts, score statistics and the shadow decision leave
     this module.
     """
-
-    def __init__(
-        self,
-        scorer: Any = None,
-    ):
-        self.scorer = (
-            scorer or ShadowScorer()
-        )
 
     def observe(
         self,
@@ -153,9 +157,9 @@ class RetrievalQualityShadow:
     ) -> dict[str, Any]:
         """Compare the pre-selection pool with the legacy live result.
 
-        ``candidates`` is the pre-selection candidate pool (problem B):
-        the shadow observes the same candidates the legacy path saw
-        *before* its own selection, not the legacy-selected subset.
+        ``candidates`` is the pre-selection candidate pool: the shadow
+        observes the same candidates the legacy path saw *before* its
+        own selection, not the legacy-selected subset.
 
         ``vector_scores`` maps bucket id -> raw embedding similarity
         for those candidates. It is the raw signal; the legacy
@@ -176,7 +180,7 @@ class RetrievalQualityShadow:
         )
 
         views = [
-            normalize_candidate(
+            project_candidate(
                 candidate,
                 semantic_similarity=(
                     scores_map.get(
@@ -189,26 +193,17 @@ class RetrievalQualityShadow:
             for candidate in candidates or []
         ]
 
-        context = ShadowScoringContext(
+        ranked = rank_candidates(
+            views,
             now=(
                 now
                 or datetime.now(
                     timezone.utc
                 )
             ),
-            max_semantic_similarity=max(
-                (
-                    view.semantic_similarity
-                    for view in views
-                ),
-                default=0.0,
+            max_semantic_similarity=(
+                _semantic_from(views)
             ),
-        )
-
-        ranked = rank_candidates(
-            views,
-            context=context,
-            scorer=self.scorer,
         )
 
         scores = [
@@ -217,7 +212,7 @@ class RetrievalQualityShadow:
         ]
 
         ranked_ids = [
-            candidate.id
+            _candidate_id(candidate)
             for candidate, _score in ranked
         ]
 

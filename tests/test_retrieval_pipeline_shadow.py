@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import unittest
 from datetime import (
@@ -7,20 +8,29 @@ from datetime import (
     timedelta,
     timezone,
 )
-from unittest.mock import AsyncMock
 
+from ombrebrain.retrieval import (
+    RetrievalCandidate,
+)
+
+from ombrebrain.context import (
+    retrieval as retrieval_package,
+)
 from ombrebrain.context.retrieval import (
     ContextRetrievalAdapter,
     RetrievalQualityShadow,
-    ShadowScorer,
-    ShadowScoringWeights,
-    ShadowScoringContext,
-    normalize_candidate,
-    rank_candidates,
-    score_candidate,
+)
+from ombrebrain.context.retrieval.candidate import (
+    project_candidate,
 )
 from ombrebrain.context.retrieval.quality import (
     PRIVACY_SAFE_FIELDS,
+)
+from ombrebrain.context.retrieval.reranker import (
+    rank_candidates,
+)
+from ombrebrain.context.retrieval.scorer import (
+    score_candidate,
 )
 from ombrebrain.context.service import (
     ContextService,
@@ -37,6 +47,14 @@ NOW = datetime(
     tzinfo=timezone.utc,
 )
 
+REMOVED_DOMAIN_TYPES = (
+    "ShadowCandidate",
+    "ShadowScorer",
+    "ShadowScoringWeights",
+    "ShadowScoringContext",
+    "ShadowRanker",
+)
+
 
 def bucket(
     id,
@@ -45,7 +63,11 @@ def bucket(
     importance=5,
     hours_old=None,
 ):
-    metadata = {}
+    """Real Ombre-Brain memory bucket shape."""
+
+    metadata = {
+        "importance": importance,
+    }
 
     if hours_old is not None:
         metadata["last_active"] = (
@@ -56,7 +78,6 @@ def bucket(
         "id": id,
         "content": f"secret-{id}",
         "context_relevance": relevance,
-        "importance": importance,
         "metadata": metadata,
     }
 
@@ -86,10 +107,9 @@ class FakeStateService:
 
 
 def build_old_adapter(matches, pairs):
-    bucket_mgr = AsyncMock()
-    bucket_mgr.list_all.return_value = []
-    bucket_mgr.search.return_value = list(
-        matches
+    bucket_mgr = FakeBucketManager(
+        {"one": matches},
+        pairs,
     )
 
     return ContextRetrievalAdapter(
@@ -98,14 +118,28 @@ def build_old_adapter(matches, pairs):
     )
 
 
+class FakeBucketManager:
+    """Async bucket manager that returns a fixed pool."""
+
+    def __init__(self, pools, pairs=None):
+        self.pools = pools
+        self.embedding_engine = FakeEngine(
+            pairs or {}
+        )
+
+    async def list_all(self, **kwargs):
+        return []
+
+    async def search(self, query, **kwargs):
+        return list(
+            self.pools.get(query, [])
+        )
+
+
 def build_service(matches, pairs):
-    bucket_mgr = AsyncMock()
-    bucket_mgr.list_all.return_value = []
-    bucket_mgr.search.return_value = list(
-        matches
-    )
-    bucket_mgr.embedding_engine = (
-        FakeEngine(pairs)
+    bucket_mgr = FakeBucketManager(
+        {"secret-query": matches},
+        pairs,
     )
 
     return ContextService(
@@ -119,13 +153,11 @@ def build_service(matches, pairs):
 MATCHES = [
     bucket(
         "stale",
-        relevance=0.66,
         importance=1,
         hours_old=2000,
     ),
     bucket(
         "fresh",
-        relevance=0.90,
         importance=10,
         hours_old=0,
     ),
@@ -139,24 +171,10 @@ PAIRS = [
 VECTOR_SCORES = dict(PAIRS)
 
 
-def views():
-    return [
-        normalize_candidate(
-            item,
-            semantic_similarity=(
-                VECTOR_SCORES.get(
-                    item["id"]
-                )
-            ),
-        )
-        for item in MATCHES
-    ]
-
-
 class CandidatePoolSplitTests(
     unittest.IsolatedAsyncioTestCase
 ):
-    """B. the pool feeds both legacy selection and the shadow."""
+    """The pool feeds both legacy selection and the shadow."""
 
     async def test_pool_is_pre_selection(self):
         adapter = build_old_adapter(
@@ -165,12 +183,10 @@ class CandidatePoolSplitTests(
 
         pool = (
             await adapter.acquire_candidate_pool(
-                "secret-query"
+                "one"
             )
         )
 
-        # The pool is the raw search result, before any
-        # threshold or cap.
         self.assertEqual(
             [c["id"] for c in pool["candidates"]],
             ["stale", "fresh"],
@@ -189,11 +205,10 @@ class CandidatePoolSplitTests(
 
         pool = (
             await adapter.acquire_candidate_pool(
-                "secret-query"
+                "one"
             )
         )
 
-        # Legacy live selection consumes the pool...
         selection = (
             adapter.select_legacy_results(pool)
         )
@@ -207,7 +222,6 @@ class CandidatePoolSplitTests(
             ["stale", "fresh"],
         )
 
-        # ...and the shadow observes the very same pool.
         event = (
             RetrievalQualityShadow()
             .observe(
@@ -230,32 +244,79 @@ class CandidatePoolSplitTests(
             event["legacy_selected_count"],
             2,
         )
-
-        # Selection never mutated the pool.
         self.assertEqual(
             [c["id"] for c in pool["candidates"]],
             ["stale", "fresh"],
         )
 
-    async def test_retrieve_publishes_the_pool(self):
+    async def test_observation_is_returned_locally(
+        self,
+    ):
         adapter = build_old_adapter(
             MATCHES, PAIRS
         )
 
-        await adapter.retrieve(
-            "secret-query"
+        results, observation = (
+            await adapter.retrieve_with_observation(
+                "one"
+            )
         )
 
         self.assertEqual(
+            [item["id"] for item in results],
+            ["stale", "fresh"],
+        )
+        self.assertEqual(
             [
-                item["id"]
-                for item in adapter.last_candidates
+                c["id"]
+                for c in observation[
+                    "candidates"
+                ]
             ],
             ["stale", "fresh"],
         )
         self.assertEqual(
-            adapter.last_pool_vector_scores,
+            observation["vector_scores"],
             VECTOR_SCORES,
+        )
+        self.assertEqual(
+            observation["telemetry"][
+                "included_count"
+            ],
+            2,
+        )
+
+    async def test_no_shared_pool_state_exists(
+        self,
+    ):
+        # The cross-request channel is gone: there is no shared
+        # candidate pool field left to race on.
+        adapter = build_old_adapter(
+            MATCHES, PAIRS
+        )
+
+        self.assertFalse(
+            hasattr(adapter, "last_candidates")
+        )
+        self.assertFalse(
+            hasattr(
+                adapter,
+                "last_pool_vector_scores",
+            )
+        )
+
+    async def test_retrieve_compat_api_returns_live_only(
+        self,
+    ):
+        adapter = build_old_adapter(
+            MATCHES, PAIRS
+        )
+
+        results = await adapter.retrieve("one")
+
+        self.assertEqual(
+            [item["id"] for item in results],
+            ["stale", "fresh"],
         )
 
     async def test_shadow_failure_does_not_change_live_result(
@@ -265,7 +326,7 @@ class CandidatePoolSplitTests(
             MATCHES, PAIRS
         )
 
-        def explode(candidates, **kwargs):
+        def explode(items, **kwargs):
             raise RuntimeError(
                 "synthetic shadow failure"
             )
@@ -290,7 +351,7 @@ class CandidatePoolSplitTests(
 class LegacyOutputRegressionTests(
     unittest.IsolatedAsyncioTestCase
 ):
-    """B. legacy output is unchanged by the pool split."""
+    """Legacy live output is frozen."""
 
     async def test_context_relevance_is_unchanged(
         self,
@@ -299,11 +360,8 @@ class LegacyOutputRegressionTests(
             MATCHES, PAIRS
         )
 
-        result = await adapter.retrieve(
-            "secret-query"
-        )
+        result = await adapter.retrieve("one")
 
-        # Exact legacy calibration, frozen on purpose.
         self.assertEqual(
             [
                 (
@@ -332,9 +390,7 @@ class LegacyOutputRegressionTests(
             ],
         )
 
-        result = await adapter.retrieve(
-            "secret-query"
-        )
+        result = await adapter.retrieve("one")
 
         self.assertEqual(
             [item["id"] for item in result],
@@ -356,7 +412,7 @@ class LegacyOutputRegressionTests(
         )
 
         result = await adapter.retrieve(
-            "secret-query",
+            "one",
             max_results=3,
         )
 
@@ -369,7 +425,7 @@ class LegacyOutputRegressionTests(
 class OldRetrievalUnchangedTests(
     unittest.IsolatedAsyncioTestCase
 ):
-    """1. old retrieval is unchanged."""
+    """Old retrieval carries no shadow hook."""
 
     async def test_old_adapter_has_no_shadow_hook(
         self,
@@ -378,9 +434,6 @@ class OldRetrievalUnchangedTests(
             MATCHES, PAIRS
         )
 
-        # The Retrieval v2 shadow no longer lives inside the
-        # old adapter: it is a separate pipeline observed at
-        # the service layer.
         self.assertFalse(
             hasattr(
                 adapter,
@@ -388,9 +441,7 @@ class OldRetrievalUnchangedTests(
             )
         )
 
-        await adapter.retrieve(
-            "secret-query"
-        )
+        await adapter.retrieve("one")
 
         self.assertNotIn(
             "retrieval_quality_v2",
@@ -404,9 +455,7 @@ class OldRetrievalUnchangedTests(
             MATCHES, PAIRS
         )
 
-        old_result = await adapter.retrieve(
-            "secret-query"
-        )
+        old_result = await adapter.retrieve("one")
 
         service = build_service(
             MATCHES, PAIRS
@@ -416,8 +465,6 @@ class OldRetrievalUnchangedTests(
             "secret-query"
         )
 
-        # The service returns exactly the old retrieval
-        # result, in the old order.
         self.assertEqual(
             [
                 item["id"]
@@ -438,15 +485,232 @@ class OldRetrievalUnchangedTests(
         )
 
 
+class ConcurrencyTests(
+    unittest.IsolatedAsyncioTestCase
+):
+    """P0-2: concurrent requests must never mix pools.
+
+    Two queries are run truly concurrently on one shared adapter.
+    Both are parked inside ``bucket_mgr.search`` at the same time
+    (controlled by per-query events), then released out of order, so
+    the two retrieval pipelines interleave across await points.
+
+    Each shadow observation must be built from exactly its own
+    request's pool / vector map / live result.
+    """
+
+    async def test_concurrent_queries_do_not_mix_pools(
+        self,
+    ):
+        pool_a = [
+            bucket("a1", importance=1),
+            bucket("a2", importance=10),
+        ]
+        pool_b = [
+            bucket("b1", importance=2),
+            bucket("b2", importance=9),
+            bucket("b3", importance=4),
+        ]
+
+        pairs_a = {
+            "a1": 0.61,
+            "a2": 0.92,
+        }
+        pairs_b = {
+            "b1": 0.58,
+            "b2": 0.88,
+            "b3": 0.71,
+        }
+
+        entered = {
+            "query-A": asyncio.Event(),
+            "query-B": asyncio.Event(),
+        }
+        release = {
+            "query-A": asyncio.Event(),
+            "query-B": asyncio.Event(),
+        }
+
+        class GatedEngine:
+            enabled = True
+
+            async def search_similar_strict(
+                self,
+                query,
+                top_k,
+            ):
+                pairs = (
+                    pairs_a
+                    if query == "query-A"
+                    else pairs_b
+                )
+                return list(pairs.items())
+
+        class GatedBucketManager:
+            embedding_engine = GatedEngine()
+
+            async def list_all(self, **kwargs):
+                return []
+
+            async def search(self, query, **kwargs):
+                entered[query].set()
+
+                await release[query].wait()
+
+                return list(
+                    pool_a
+                    if query == "query-A"
+                    else pool_b
+                )
+
+        service = ContextService(
+            state_service=FakeStateService(),
+            bucket_mgr=GatedBucketManager(),
+        )
+
+        observed: list[dict] = []
+
+        inner_observe = (
+            service.retrieval_shadow_v2
+            .observe
+        )
+
+        def recording_observe(
+            candidates,
+            **kwargs,
+        ):
+            candidate_ids = sorted(
+                item.get("id")
+                for item in candidates
+            )
+            score_ids = sorted(
+                kwargs.get("vector_scores")
+                or {}
+            )
+            selected_ids = sorted(
+                item.get("id")
+                for item in
+                kwargs.get("legacy_selected")
+                or ()
+            )
+
+            # Every observation must be internally consistent:
+            # the pool and the vector map describe the same set.
+            self.assertEqual(
+                candidate_ids,
+                score_ids,
+            )
+
+            observed.append(
+                {
+                    "candidates":
+                        candidate_ids,
+                    "scores": score_ids,
+                    "legacy": selected_ids,
+                }
+            )
+
+            return inner_observe(
+                candidates,
+                **kwargs,
+            )
+
+        service.retrieval_shadow_v2.observe = (
+            recording_observe
+        )
+
+        task_a = asyncio.create_task(
+            service.get_candidates("query-A")
+        )
+        await entered["query-A"].wait()
+
+        task_b = asyncio.create_task(
+            service.get_candidates("query-B")
+        )
+        await entered["query-B"].wait()
+
+        # Both retrievals are now in flight simultaneously.
+        # Release B first and let it finish while A is still parked.
+        release["query-B"].set()
+        result_b = await task_b
+
+        release["query-A"].set()
+        result_a = await task_a
+
+        self.assertEqual(
+            [
+                item["id"]
+                for item in result_a["memories"]
+            ],
+            ["a1", "a2"],
+        )
+        self.assertEqual(
+            [
+                item["id"]
+                for item in result_b["memories"]
+            ],
+            ["b1", "b2", "b3"],
+        )
+
+        # Exactly two observations, each from one request, with no
+        # A/B mixing at all.
+        self.assertEqual(len(observed), 2)
+
+        self.assertEqual(
+            sorted(
+                (
+                    tuple(item["candidates"]),
+                    tuple(item["scores"]),
+                    tuple(item["legacy"]),
+                )
+                for item in observed
+            ),
+            sorted(
+                [
+                    (
+                        ("a1", "a2"),
+                        ("a1", "a2"),
+                        ("a1", "a2"),
+                    ),
+                    (
+                        ("b1", "b2", "b3"),
+                        ("b1", "b2", "b3"),
+                        ("b1", "b2", "b3"),
+                    ),
+                ]
+            ),
+        )
+
+        # And each request's own telemetry reflects its own pool.
+        self.assertEqual(
+            result_a["telemetry"][
+                "retrieval_quality"
+            ]["retrieval_quality_v2"][
+                "candidate_count"
+            ],
+            2,
+        )
+        self.assertEqual(
+            result_b["telemetry"][
+                "retrieval_quality"
+            ]["retrieval_quality_v2"][
+                "candidate_count"
+            ],
+            3,
+        )
+
+
 class ShadowIsolationTests(
     unittest.TestCase
 ):
-    """2. shadow retrieval does not modify output."""
+    """The shadow never modifies the live inputs."""
 
-    def test_shadow_reorders_but_output_stays(
+    def test_observe_reports_reorder_but_keeps_inputs(
         self,
     ):
         shadow = RetrievalQualityShadow()
+
+        original = list(MATCHES)
 
         event = shadow.observe(
             MATCHES,
@@ -455,55 +719,11 @@ class ShadowIsolationTests(
             now=NOW,
         )
 
-        # The shadow does reorder...
         self.assertTrue(
             event["order_changed"]
         )
 
-        reranked = rank_candidates(
-            views(),
-            context=ShadowScoringContext(
-                now=NOW,
-                max_semantic_similarity=0.9,
-            ),
-        )
-
-        self.assertEqual(
-            [c.id for c, _s in reranked],
-            ["fresh", "stale"],
-        )
-
-        # ...but the input list itself is untouched.
-        self.assertEqual(
-            [item["id"] for item in MATCHES],
-            ["stale", "fresh"],
-        )
-
-    def test_rank_does_not_mutate_inputs(self):
-        snapshot = json.loads(
-            json.dumps(MATCHES)
-        )
-
-        original = list(MATCHES)
-
-        rank_candidates(
-            MATCHES,
-            context=ShadowScoringContext(
-                now=NOW,
-                max_semantic_similarity=0.9,
-            ),
-        )
-
-        self.assertEqual(
-            MATCHES,
-            original,
-        )
-        self.assertEqual(
-            json.loads(
-                json.dumps(MATCHES)
-            ),
-            snapshot,
-        )
+        self.assertEqual(MATCHES, original)
 
     def test_observe_does_not_mutate_inputs(self):
         original = list(MATCHES)
@@ -516,27 +736,36 @@ class ShadowIsolationTests(
 
         self.assertEqual(MATCHES, original)
 
-    def test_normalize_is_pure(self):
-        candidate = normalize_candidate(
-            MATCHES[0]
+    def test_rank_does_not_mutate_inputs(self):
+        snapshot = json.loads(
+            json.dumps(MATCHES)
         )
 
-        # The source dict is unchanged.
-        self.assertIn(
-            "content",
-            MATCHES[0],
+        original = list(MATCHES)
+
+        rank_candidates(
+            [
+                project_candidate(
+                    item,
+                    semantic_similarity=(
+                        VECTOR_SCORES.get(
+                            item["id"]
+                        )
+                    ),
+                )
+                for item in MATCHES
+            ],
+            now=NOW,
+            max_semantic_similarity=0.90,
         )
 
-        # The candidate exposes no storage fields.
-        self.assertFalse(
-            hasattr(candidate, "content")
+        self.assertEqual(MATCHES, original)
+        self.assertEqual(
+            json.loads(
+                json.dumps(MATCHES)
+            ),
+            snapshot,
         )
-
-
-class QualityPrivacyTests(
-    unittest.TestCase
-):
-    """3. quality event privacy."""
 
     def test_event_exposes_privacy_safe_fields(
         self,
@@ -584,277 +813,140 @@ class QualityPrivacyTests(
                 forbidden,
             )
 
-    def test_event_is_json_serializable(self):
-        event = RetrievalQualityShadow().observe(
-            MATCHES,
-            vector_scores=VECTOR_SCORES,
-            now=NOW,
-        )
-
-        payload = json.loads(
-            json.dumps(event)
-        )
-
-        self.assertIs(
-            payload["shadow_only"],
-            True,
-        )
-
-
-class ScoreDeterminismTests(
-    unittest.TestCase
-):
-    """5. score deterministic."""
-
-    def test_score_is_repeatable(self):
-        context = ShadowScoringContext(
-            now=NOW,
-            max_semantic_similarity=0.9,
-        )
-
-        candidate = views()[1]
-
-        first = score_candidate(
-            candidate,
-            context,
-        )
-
-        for _ in range(5):
-            self.assertEqual(
-                score_candidate(
-                    candidate,
-                    context,
-                ),
-                first,
-            )
-
-        # A fresh scorer instance produces the same value.
-        self.assertEqual(
-            ShadowScorer().score(
-                candidate,
-                context,
-            ),
-            first,
-        )
-
-    def test_malformed_candidate_never_crashes(
+    def test_score_is_deterministic_and_bounded(
         self,
     ):
-        context = ShadowScoringContext(
-            now=NOW,
-            max_semantic_similarity=0.9,
-        )
-
-        for bad in (
-            None,
-            5,
-            "x",
-            [],
-            {"id": 1},
-        ):
-            value = score_candidate(
-                bad,
-                context,
-            )
-
-            self.assertGreaterEqual(
-                value,
-                0.0,
-                bad,
-            )
-            self.assertLessEqual(
-                value,
-                1.0,
-                bad,
-            )
-
-    def test_relative_semantic_is_not_an_independent_signal(
-        self,
-    ):
-        from ombrebrain.context.retrieval.scorer import (
-            relative_semantic_score,
-        )
-
-        context = ShadowScoringContext(
-            now=NOW,
-            max_semantic_similarity=0.9,
-        )
-
-        # relative_semantic is purely derived from the raw
-        # semantic similarity, so two candidates with the same
-        # similarity get the same relative score.
-        first = relative_semantic_score(
-            normalize_candidate(
-                MATCHES[0],
-                semantic_similarity=0.45,
-            ),
-            context,
-        )
-        second = relative_semantic_score(
-            normalize_candidate(
-                MATCHES[1],
-                semantic_similarity=0.45,
-            ),
-            context,
-        )
-
-        self.assertEqual(first, second)
-        self.assertAlmostEqual(
-            first,
-            0.5,
-            places=9,
-        )
-
-    def test_score_does_not_mutate_candidate(
-        self,
-    ):
-        candidate = views()[1]
-
-        before = candidate.to_dict()
-
-        score_candidate(
-            candidate,
-            ShadowScoringContext(
-                now=NOW,
-                max_semantic_similarity=0.9,
-            ),
-        )
-
-        self.assertEqual(
-            candidate.to_dict(),
-            before,
-        )
-
-    def test_score_is_bounded(self):
-        for item in MATCHES:
-            value = score_candidate(
-                normalize_candidate(item),
-                ShadowScoringContext(
-                    now=NOW,
-                    max_semantic_similarity=0.9,
-                ),
-            )
-
-            self.assertGreaterEqual(value, 0.0)
-            self.assertLessEqual(value, 1.0)
-
-    def test_weights_default_formula(self):
-        self.assertEqual(
-            ShadowScoringWeights().to_dict(),
-            {
-                "semantic": 0.5,
-                "recency": 0.2,
-                "importance": 0.2,
-                "relative_semantic": 0.1,
-            },
-        )
-
-
-class RankDeterminismTests(
-    unittest.TestCase
-):
-    """4. rank deterministic and selection-free."""
-
-    def test_rank_is_repeatable(self):
-        context = ShadowScoringContext(
-            now=NOW,
-            max_semantic_similarity=0.9,
-        )
-
-        first = rank_candidates(
-            views(),
-            context=context,
-        )
-
-        for _ in range(5):
-            self.assertEqual(
-                [
-                    c.id
-                    for c, _s
-                    in rank_candidates(
-                        views(),
-                        context=context,
+        views = [
+            project_candidate(
+                item,
+                semantic_similarity=(
+                    VECTOR_SCORES.get(
+                        item["id"]
                     )
-                ],
-                [c.id for c, _s in first],
+                ),
+            )
+            for item in MATCHES
+        ]
+
+        for item in views:
+            first = score_candidate(
+                item,
+                now=NOW,
+                max_semantic_similarity=0.90,
             )
 
-    def test_rank_is_order_independent_for_scores(
+            self.assertEqual(
+                first,
+                score_candidate(
+                    item,
+                    now=NOW,
+                    max_semantic_similarity=0.90,
+                ),
+            )
+            self.assertGreaterEqual(first, 0.0)
+            self.assertLessEqual(first, 1.0)
+
+    def test_rank_never_truncates_or_filters(
         self,
     ):
-        # The shadow score depends only on candidate
-        # content, not on input position.
-        context = ShadowScoringContext(
-            now=NOW,
-            max_semantic_similarity=0.9,
-        )
-
-        forward = rank_candidates(
-            views(),
-            context=context,
-        )
-
-        backward = rank_candidates(
-            list(reversed(views())),
-            context=context,
-        )
-
-        self.assertEqual(
-            [c.id for c, _s in forward],
-            [c.id for c, _s in backward],
-        )
-
-    def test_equal_scores_are_stable(self):
-        tied = [
-            bucket(
-                "a",
-                relevance=0.7,
-                importance=5,
-                hours_old=10,
-            ),
-            bucket(
-                "b",
-                relevance=0.7,
-                importance=5,
-                hours_old=10,
-            ),
-            bucket(
-                "c",
-                relevance=0.7,
-                importance=5,
-                hours_old=10,
-            ),
+        views = [
+            project_candidate(
+                item,
+                semantic_similarity=(
+                    VECTOR_SCORES.get(
+                        item["id"]
+                    )
+                ),
+            )
+            for item in MATCHES
         ]
 
         result = rank_candidates(
-            tied,
-            context=ShadowScoringContext(
-                now=NOW,
-                max_semantic_similarity=0.7,
-            ),
-        )
-
-        self.assertEqual(
-            [c.id for c, _s in result],
-            ["a", "b", "c"],
-        )
-
-    def test_rank_never_truncates(self):
-        # There is no top_k here any more: every candidate
-        # is ranked and returned.
-        result = rank_candidates(
-            MATCHES,
-            context=ShadowScoringContext(
-                now=NOW,
-                max_semantic_similarity=0.9,
-            ),
+            views,
+            now=NOW,
+            max_semantic_similarity=0.90,
         )
 
         self.assertEqual(len(result), 2)
         self.assertEqual(
-            sorted(c.id for c, _s in result),
+            sorted(
+                item.bucket.get("id")
+                for item, _score in result
+            ),
             ["fresh", "stale"],
         )
+
+
+class ArchitectureTests(
+    unittest.TestCase
+):
+    """P0-3: no second retrieval domain is exposed."""
+
+    def test_context_retrieval_does_not_export_shadow_domain_types(
+        self,
+    ):
+        for name in REMOVED_DOMAIN_TYPES:
+            self.assertFalse(
+                hasattr(
+                    retrieval_package,
+                    name,
+                ),
+                name,
+            )
+
+    def test_shadow_domain_types_are_gone_from_submodules(
+        self,
+    ):
+        import ombrebrain.context.retrieval.candidate as candidate_module
+        import ombrebrain.context.retrieval.reranker as reranker_module
+        import ombrebrain.context.retrieval.scorer as scorer_module
+
+        for module in (
+            candidate_module,
+            scorer_module,
+            reranker_module,
+        ):
+            for name in REMOVED_DOMAIN_TYPES:
+                self.assertFalse(
+                    hasattr(module, name),
+                    f"{module.__name__}.{name}",
+                )
+
+    def test_package_public_api_is_minimal(
+        self,
+    ):
+        self.assertEqual(
+            sorted(retrieval_package.__all__),
+            [
+                "ContextRetrievalAdapter",
+                "RetrievalQualityShadow",
+            ],
+        )
+
+    def test_project_candidate_returns_canonical_candidate(
+        self,
+    ):
+        candidate = project_candidate(
+            bucket("m"),
+            semantic_similarity=0.5,
+        )
+
+        self.assertIsInstance(
+            candidate,
+            RetrievalCandidate,
+        )
+        self.assertIs(
+            type(candidate),
+            retrieval_package_module_type(),
+        )
+
+
+def retrieval_package_module_type():
+    from ombrebrain.retrieval import (
+        RetrievalCandidate as Canonical,
+    )
+
+    return Canonical
 
 
 if __name__ == "__main__":

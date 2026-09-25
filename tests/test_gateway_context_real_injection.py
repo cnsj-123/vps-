@@ -2823,6 +2823,37 @@ class GatewayCoordinatorDelegationTests(
             body,
         )
 
+    async def test_pipeline_unexpected_exception_fails_open(
+        self,
+    ):
+        # Top-level guard: an unexpected error anywhere in the
+        # Context chain must degrade to forwarding the original
+        # body, never to an exception on the live path.
+        body = body_from(
+            base_payload()
+        )
+
+        with patch.object(
+            coordinator,
+            "observe_unified_preview_gate",
+            new=AsyncMock(
+                side_effect=RuntimeError(
+                    "secret"
+                )
+            ),
+        ):
+            selected = (
+                await coordinator.run_context_pipeline(
+                    CID,
+                    body,
+                )
+            )
+
+        self.assertIs(
+            selected,
+            body,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

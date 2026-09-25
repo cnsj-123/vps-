@@ -713,23 +713,40 @@ async def run_context_pipeline(
     OMBRE_GATEWAY_CONTEXT_REAL_INJECTION unset (or on any deny /
     exception / invalid report inside the selector) this returns the
     exact ``forward_body``.
+
+    There is also a top-level guard: a Context pipeline failure must
+    never break live forwarding, so any unexpected error here returns
+    ``forward_body`` unchanged and logs only the exception *type*.
     """
 
-    context_chain_fresh = (
-        await observe_unified_preview_gate(
-            conversation_id
+    try:
+        context_chain_fresh = (
+            await observe_unified_preview_gate(
+                conversation_id
+            )
         )
-    )
 
-    if context_chain_fresh is True:
-        observe_request_mutation(
+        if context_chain_fresh is True:
+            observe_request_mutation(
+                conversation_id,
+                forward_body,
+            )
+
+        return select_real_injection(
             conversation_id,
             forward_body,
+            context_chain_fresh=
+                context_chain_fresh,
         )
 
-    return select_real_injection(
-        conversation_id,
-        forward_body,
-        context_chain_fresh=
-            context_chain_fresh,
-    )
+    except Exception as exc:
+        # Fail-open: never break live forwarding. Only the exception
+        # type is logged — never the message, query, memory, prompt
+        # or rendered Context.
+        logger.warning(
+            "[gateway.context_pipeline] "
+            "pipeline_failed=%s fail_open=true",
+            type(exc).__name__,
+        )
+
+        return forward_body

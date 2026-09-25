@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from ombrebrain.context.anti_echo import (
@@ -33,15 +33,6 @@ class ContextRetrievalAdapter:
     decision_shadow_observer: (
         RetrievalDecisionShadowObserver
     ) = RetrievalDecisionShadowObserver()
-
-    # Published pre-selection pool for the Retrieval v2 shadow.
-    # Observation-only: the live selection below never reads it.
-    last_candidates: list[dict[str, Any]] = field(
-        default_factory=list
-    )
-    last_pool_vector_scores: dict[str, float] = (
-        field(default_factory=dict)
-    )
 
     async def _semantic_scores(
         self,
@@ -158,7 +149,7 @@ class ContextRetrievalAdapter:
         included: list[dict[str, Any]],
         max_semantic_score: float | None,
         outcome: str,
-    ) -> None:
+    ) -> dict[str, Any]:
 
         anti_echo = (
             self.anti_echo_observer.observe(
@@ -215,7 +206,7 @@ class ContextRetrievalAdapter:
             else None
         )
 
-        self.last_telemetry = {
+        telemetry: dict[str, Any] = {
             # Retrieval pipeline.
             "embedding_enabled":
                 embedding_enabled,
@@ -316,6 +307,13 @@ class ContextRetrievalAdapter:
             "decision_shadow":
                 decision_shadow.to_dict(),
         }
+
+        # Kept for backwards compatibility with existing callers.
+        # New callers must use the per-call observation returned by
+        # retrieve_with_observation() instead of this shared field.
+        self.last_telemetry = telemetry
+
+        return telemetry
 
     async def acquire_candidate_pool(
         self,
@@ -497,7 +495,7 @@ class ContextRetrievalAdapter:
                 relevance_rejected,
         }
 
-    async def retrieve(
+    async def retrieve_with_observation(
         self,
         query: str,
         *,
@@ -505,13 +503,24 @@ class ContextRetrievalAdapter:
         domain_filter: list[str] | None = None,
         query_valence: float | None = None,
         query_arousal: float | None = None,
-    ) -> list[dict[str, Any]]:
-        """Live retrieval: acquire the pool, then select from it.
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Live retrieval + this call's observation data.
 
-        Output (count, order, ids, context_relevance) is identical
-        to the pre-split implementation. The pre-selection pool is
-        published on ``last_candidates`` /
-        ``last_pool_vector_scores`` for the shadow to observe.
+        Output (count, order, ids, context_relevance) is identical to
+        the previous implementation. The observation is created and
+        returned by *this* call::
+
+            (
+                live_results,
+                {
+                    "candidates": [...],
+                    "vector_scores": {...},
+                    "telemetry": {...},
+                },
+            )
+
+        Nothing is published on a shared instance field, so concurrent
+        queries can never observe each other's candidate pool.
         """
 
         pool = (
@@ -601,17 +610,7 @@ class ContextRetrievalAdapter:
                 "no_included_results"
             )
 
-        # Observation-only publication for the Retrieval v2
-        # shadow. The live result above never reads these.
-        self.last_candidates = list(
-            matches
-        )
-
-        self.last_pool_vector_scores = (
-            dict(vector_scores)
-        )
-
-        self._store_telemetry(
+        telemetry = self._store_telemetry(
             embedding_enabled=
                 embedding_enabled,
             semantic_score_count=
@@ -628,6 +627,41 @@ class ContextRetrievalAdapter:
                 max_semantic_score,
             outcome=
                 outcome,
+        )
+
+        observation = {
+            "candidates": list(matches),
+            "vector_scores": dict(
+                vector_scores
+            ),
+            "telemetry": telemetry,
+        }
+
+        return results, observation
+
+    async def retrieve(
+        self,
+        query: str,
+        *,
+        max_results: int = 8,
+        domain_filter: list[str] | None = None,
+        query_valence: float | None = None,
+        query_arousal: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """Backwards-compatible live retrieval.
+
+        Behaviour is unchanged: the observation data is discarded here
+        and only the live result is returned.
+        """
+
+        results, _observation = (
+            await self.retrieve_with_observation(
+                query,
+                max_results=max_results,
+                domain_filter=domain_filter,
+                query_valence=query_valence,
+                query_arousal=query_arousal,
+            )
         )
 
         return results

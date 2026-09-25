@@ -1,94 +1,94 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from ombrebrain.retrieval import RetrievalCandidate
+
 from ombrebrain.context.retrieval.candidate import (
-    normalize_candidate,
+    read_active_timestamp,
+    read_importance,
 )
 
-# Shadow-only scoring for the Retrieval v2 observation pipeline.
+# Retrieval v2 shadow scoring — **pure functions only**.
 #
-# Canonical scoring domain lives in ``ombrebrain.retrieval``
-# (RetrievalFeatures.candidate_score / PolicyGatedRetrievalScorer).
-# This module is a small, fixed shadow formula; it is NOT a second
-# scoring framework and is named to make that explicit.
+# This is a shadow *experiment*, not a second scoring framework:
+# there is no scorer class, no weights class and no context class.
+# The canonical data model is reused (``RetrievalCandidate`` /
+# ``RetrievalFeatures``); the canonical ``PolicyGatedRetrievalScorer``
+# is deliberately NOT called here.
 #
-# Formula (unchanged weights):
+# Fixed formula (weights must not change in this round):
+#
 #   score =
-#     0.5 * semantic_similarity
-#   + 0.2 * recency_score
-#   + 0.2 * importance_score
-#   + 0.1 * relative_semantic
+#       0.5 * semantic_similarity
+#     + 0.2 * recency_score
+#     + 0.2 * importance_score
+#     + 0.1 * relative_semantic_score
 #
-# ``relative_semantic`` is the candidate's raw semantic similarity
-# relative to the best candidate in the same set. It was previously
-# misnamed ``context_match``, which implied an independent context
-# signal. It is not one, so it is named for what it actually is
-# (problem F). Weights are unchanged and still sum to 1.0.
+# ``relative_semantic_score`` is the candidate's raw semantic
+# similarity relative to the best candidate in the same set. It is
+# derived purely from ``semantic_similarity`` and is NOT an
+# independent context signal (it used to be misnamed ``context_match``).
+#
+# Every function here is pure and total: the same inputs always
+# produce the same float, and malformed input degrades to a neutral
+# value instead of raising.
+
+_SEMANTIC_WEIGHT = 0.5
+_RECENCY_WEIGHT = 0.2
+_IMPORTANCE_WEIGHT = 0.2
+_RELATIVE_SEMANTIC_WEIGHT = 0.1
 
 _DEFAULT_RECENCY_HALF_LIFE_HOURS = 72.0
 
-# A missing timestamp is neutral: memories without
-# last_active are neither promoted nor punished.
+# A missing timestamp is neutral: memories without last_active are
+# neither promoted nor punished.
 _MISSING_TIMESTAMP_RECENCY = 0.5
 
-
-@dataclass(frozen=True)
-class ShadowScoringWeights:
-    """Fixed shadow weights. Defaults sum to 1.0."""
-
-    semantic: float = 0.5
-    recency: float = 0.2
-    importance: float = 0.2
-    relative_semantic: float = 0.1
-
-    def to_dict(self) -> dict[str, float]:
-        return {
-            "semantic": float(self.semantic),
-            "recency": float(self.recency),
-            "importance": float(self.importance),
-            "relative_semantic": float(
-                self.relative_semantic
-            ),
-        }
+# Real OB importance lives in metadata["importance"] as 1..10 and is
+# normalized to 0..1 via (n - 1) / 9.
+_DEFAULT_IMPORTANCE = 5
+_MIN_IMPORTANCE = 1
+_MAX_IMPORTANCE = 10
 
 
-@dataclass(frozen=True)
-class ShadowScoringContext:
-    """Per-request scoring context.
+def semantic_similarity(
+    candidate: Any,
+) -> float:
+    """Raw semantic similarity from the canonical candidate."""
 
-    Carries only what scoring needs. It never contains the
-    query, conversation id or any raw text.
-    """
-
-    now: datetime = field(
-        default_factory=lambda: (
-            datetime.now(timezone.utc)
+    if isinstance(
+        candidate,
+        RetrievalCandidate,
+    ):
+        return _clamp01(
+            candidate.features.semantic_similarity
         )
-    )
 
-    # Best raw semantic similarity in the observed set.
-    max_semantic_similarity: float = 0.0
+    return 0.0
 
 
 def recency_score(
     candidate: Any,
-    context: ShadowScoringContext,
     *,
+    now: datetime,
     recency_half_life_hours: float = (
         _DEFAULT_RECENCY_HALF_LIFE_HOURS
     ),
 ) -> float:
-    """Exponential decay with a configurable half-life."""
+    """Exponential decay with a configurable half-life.
 
-    candidate = normalize_candidate(
+    The timestamp is read from the real OB bucket metadata:
+    ``last_active`` first, then ``created``.
+    """
+
+    timestamp = read_active_timestamp(
         candidate
     )
 
-    if candidate.timestamp is None:
+    if timestamp is None:
         return _MISSING_TIMESTAMP_RECENCY
 
     half_life = max(
@@ -101,7 +101,8 @@ def recency_score(
         ),
     )
 
-    now = context.now
+    if now is None:
+        now = datetime.now(timezone.utc)
 
     if now.tzinfo is None:
         now = now.replace(
@@ -110,9 +111,7 @@ def recency_score(
 
     age_hours = max(
         0.0,
-        (
-            now - candidate.timestamp
-        ).total_seconds()
+        (now - timestamp).total_seconds()
         / 3600.0,
     )
 
@@ -122,153 +121,92 @@ def recency_score(
 def importance_score(
     candidate: Any,
 ) -> float:
-    """Normalized importance. Already 0..1 on the view."""
+    """Normalized real OB importance (metadata.importance, 1..10).
 
-    candidate = normalize_candidate(
-        candidate
+    Missing or unparsable importance uses the default 5. A top-level
+    bucket ``importance`` never overrides ``metadata.importance``.
+    """
+
+    try:
+        raw = int(read_importance(candidate))
+    except (
+        TypeError,
+        ValueError,
+        OverflowError,
+    ):
+        raw = _DEFAULT_IMPORTANCE
+
+    raw = max(
+        _MIN_IMPORTANCE,
+        min(_MAX_IMPORTANCE, raw),
     )
 
-    return _clamp01(candidate.importance)
+    return (raw - _MIN_IMPORTANCE) / (
+        _MAX_IMPORTANCE - _MIN_IMPORTANCE
+    )
 
 
 def relative_semantic_score(
     candidate: Any,
-    context: ShadowScoringContext,
+    *,
+    max_semantic_similarity: Any,
 ) -> float:
     """Candidate similarity relative to the best in the set.
 
-    This is NOT an independent context signal: it is derived
-    purely from ``semantic_similarity``. Formerly named
-    ``context_match_score``.
+    This is NOT an independent context signal: it is derived purely
+    from ``semantic_similarity``. Formerly named ``context_match``.
     """
 
-    candidate = normalize_candidate(
-        candidate
-    )
-
     best = _clamp01(
-        context.max_semantic_similarity
+        max_semantic_similarity
     )
 
     if best <= 0.0:
         return 0.0
 
     return _clamp01(
-        candidate.semantic_similarity / best
+        semantic_similarity(candidate) / best
     )
 
 
 def score_candidate(
     candidate: Any,
-    context: ShadowScoringContext,
     *,
-    weights: ShadowScoringWeights
-    | None = None,
+    now: datetime,
+    max_semantic_similarity: Any,
     recency_half_life_hours: float = (
         _DEFAULT_RECENCY_HALF_LIFE_HOURS
     ),
 ) -> float:
-    """Unified shadow scoring entry point. Returns a 0..1 float.
+    """Fixed shadow score for one canonical candidate. 0..1.
 
-    Pure function of (candidate, context, weights): the same
-    inputs always produce the same float. It never modifies the
-    candidate and never raises for malformed input.
+    Pure: never modifies the candidate, never raises for malformed
+    input.
     """
 
-    candidate = normalize_candidate(
-        candidate
-    )
-
-    active = weights or ShadowScoringWeights()
-
     combined = (
-        _clamp01(active.semantic)
-        * _clamp01(candidate.semantic_similarity)
-        + _clamp01(active.recency)
+        _SEMANTIC_WEIGHT
+        * semantic_similarity(candidate)
+        + _RECENCY_WEIGHT
         * recency_score(
             candidate,
-            context,
+            now=now,
             recency_half_life_hours=(
                 recency_half_life_hours
             ),
         )
-        + _clamp01(active.importance)
+        + _IMPORTANCE_WEIGHT
         * importance_score(candidate)
-        + _clamp01(active.relative_semantic)
+        + _RELATIVE_SEMANTIC_WEIGHT
         * relative_semantic_score(
             candidate,
-            context,
+            max_semantic_similarity=(
+                max_semantic_similarity
+            ),
         )
     )
 
     return _clamp01(combined)
-
-
-class ShadowScorer:
-    """Configured shadow scorer.
-
-    Holds weights / half-life and delegates every computation to
-    the module-level pure functions.
-    """
-
-    def __init__(
-        self,
-        weights: ShadowScoringWeights
-        | None = None,
-        *,
-        recency_half_life_hours: float = (
-            _DEFAULT_RECENCY_HALF_LIFE_HOURS
-        ),
-    ):
-        self.weights = (
-            weights or ShadowScoringWeights()
-        )
-        self.recency_half_life_hours = (
-            recency_half_life_hours
-        )
-
-    def recency_score(
-        self,
-        candidate: Any,
-        context: ShadowScoringContext,
-    ) -> float:
-        return recency_score(
-            candidate,
-            context,
-            recency_half_life_hours=(
-                self.recency_half_life_hours
-            ),
-        )
-
-    def importance_score(
-        self,
-        candidate: Any,
-    ) -> float:
-        return importance_score(candidate)
-
-    def relative_semantic_score(
-        self,
-        candidate: Any,
-        context: ShadowScoringContext,
-    ) -> float:
-        return relative_semantic_score(
-            candidate,
-            context,
-        )
-
-    def score(
-        self,
-        candidate: Any,
-        context: ShadowScoringContext,
-    ) -> float:
-        return score_candidate(
-            candidate,
-            context,
-            weights=self.weights,
-            recency_half_life_hours=(
-                self.recency_half_life_hours
-            ),
-        )
 
 
 def _float(

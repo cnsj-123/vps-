@@ -40,25 +40,26 @@ def bucket(
     importance=5,
     hours_old=None,
 ):
-    last_active = (
-        (
+    """Real Ombre-Brain memory bucket shape.
+
+    ``importance`` / ``last_active`` live inside ``metadata``.
+    ``context_relevance`` is the legacy live-path field, not a raw OB
+    bucket field.
+    """
+
+    metadata = {
+        "importance": importance,
+    }
+
+    if hours_old is not None:
+        metadata["last_active"] = (
             NOW - timedelta(hours=hours_old)
         ).isoformat()
-        if hours_old is not None
-        else None
-    )
-
-    metadata = (
-        {"last_active": last_active}
-        if last_active
-        else {}
-    )
 
     return {
         "id": id,
         "content": f"secret-{id}",
         "context_relevance": relevance,
-        "importance": importance,
         "metadata": metadata,
     }
 
@@ -126,56 +127,37 @@ class ReportShapeTests(
         )
 
     def test_distribution_counts(self):
-        # semantic-only scorer for exact bucket control
-        from ombrebrain.context.retrieval import (
-            ShadowScorer,
-            ShadowScoringWeights,
-        )
-
-        # semantic_similarity comes from the raw vector score
-        # map, not from the legacy calibrated relevance.
-        shadow = RetrievalQualityShadow(
-            scorer=ShadowScorer(
-                ShadowScoringWeights(
-                    semantic=1.0,
-                    recency=0.0,
-                    importance=0.0,
-                    relative_semantic=0.0,
-                )
-            ),
-        )
-
-        report = shadow.observe(
-            [
-                bucket(
-                    "a",
-                    relevance=0.10,
-                ),
-                bucket(
-                    "b",
-                    relevance=0.35,
-                ),
-                bucket(
-                    "c",
-                    relevance=0.55,
-                ),
-                bucket(
-                    "d",
-                    relevance=0.75,
-                ),
-                bucket(
-                    "e",
-                    relevance=0.95,
-                ),
-            ],
-            vector_scores={
-                "a": 0.10,
-                "b": 0.35,
-                "c": 0.55,
-                "d": 0.75,
-                "e": 0.95,
-            },
-            now=NOW,
+        # semantic comes from the raw vector score map; the fixed
+        # shadow weights then place each candidate in a bucket.
+        report = (
+            RetrievalQualityShadow()
+            .observe(
+                [
+                    # 0.2 * 0.5 -> 0.10
+                    bucket(
+                        "a",
+                        importance=1,
+                    ),
+                    # 1.00
+                    bucket(
+                        "b",
+                        importance=10,
+                        hours_old=0,
+                    ),
+                    # 0.608...
+                    bucket(
+                        "c",
+                        importance=5,
+                        hours_old=72,
+                    ),
+                ],
+                vector_scores={
+                    "a": 0.0,
+                    "b": 1.0,
+                    "c": 0.7,
+                },
+                now=NOW,
+            )
         )
 
         self.assertEqual(
@@ -184,8 +166,8 @@ class ReportShapeTests(
             ],
             {
                 "0.0-0.2": 1,
-                "0.2-0.4": 1,
-                "0.4-0.6": 1,
+                "0.2-0.4": 0,
+                "0.4-0.6": 0,
                 "0.6-0.8": 1,
                 "0.8-1.0": 1,
             },
@@ -223,21 +205,19 @@ class ReportShapeTests(
     def test_order_changed_detects_reorder(
         self,
     ):
-        # Fresh, important memory ranked below a stale one
-        # by the legacy order -> the shadow ranking differs.
+        # Fresh, important memory ranked below a stale one by the
+        # legacy order -> the shadow ranking differs.
         report = (
             RetrievalQualityShadow()
             .observe(
                 [
                     bucket(
                         "stale",
-                        relevance=0.66,
                         importance=1,
                         hours_old=2000,
                     ),
                     bucket(
                         "fresh",
-                        relevance=0.68,
                         importance=10,
                         hours_old=0,
                     ),
@@ -293,12 +273,10 @@ class ReportShapeTests(
                 [
                     bucket(
                         "stale",
-                        relevance=0.66,
                         hours_old=2000,
                     ),
                     bucket(
                         "fresh",
-                        relevance=0.90,
                         hours_old=0,
                     ),
                 ],
@@ -327,13 +305,11 @@ class ReportShapeTests(
                 [
                     bucket(
                         "best",
-                        relevance=0.9,
                         importance=10,
                         hours_old=0,
                     ),
                     bucket(
                         "second",
-                        relevance=0.7,
                         importance=1,
                         hours_old=2000,
                     ),
@@ -585,8 +561,8 @@ class ServiceHookTests(
     """The shadow runs at the service layer, next to old retrieval.
 
     The integration point is ContextService.get_candidates():
-    old retrieval runs first, the shadow observes its result and
-    the returned result is never modified.
+    old retrieval runs first, the shadow observes the candidate pool
+    of the same call and the returned result is never modified.
     """
 
     async def test_service_reports_quality_v2(
@@ -596,12 +572,10 @@ class ServiceHookTests(
             matches=[
                 bucket(
                     "stale",
-                    relevance=0.66,
                     hours_old=2000,
                 ),
                 bucket(
                     "fresh",
-                    relevance=0.90,
                     hours_old=0,
                 ),
             ],
@@ -647,7 +621,6 @@ class ServiceHookTests(
             matches=[
                 bucket(
                     "fresh",
-                    relevance=0.90,
                     hours_old=0,
                 )
             ],
@@ -706,7 +679,6 @@ class ServiceHookTests(
             matches=[
                 bucket(
                     "ok",
-                    relevance=0.9,
                     hours_old=0,
                 )
             ],

@@ -1,41 +1,171 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
-# Context-layer shadow projection of a legacy retrieval candidate.
-#
-# Canonical retrieval domain lives in ``ombrebrain.retrieval``
-# (RetrievalCandidate / RetrievalFeatures / PolicyGatedRetrievalScorer).
-# This module intentionally does NOT define a second candidate
-# domain: it is a read-only *adapter view* used only by the
-# Retrieval v2 shadow pipeline, and it is named accordingly.
-#
-# Signal naming (problem G):
-#   semantic_similarity
-#       raw embedding similarity, i.e. the engine's vector score.
-#       Named to match the upstream RetrievalFeatures contract.
-#   legacy_context_relevance
-#       the legacy adapter's *calibrated* value (its
-#       _context_relevance() mapping of the raw score). This is a
-#       different concept and is NOT read here, so the shadow can
-#       never mistake one for the other.
-#
-# The candidate id is used internally for identity comparison.
-# It must never be logged or persisted in telemetry.
-
-_METADATA_WHITELIST = (
-    "type",
-    "domain",
-    "name",
+from ombrebrain.retrieval import (
+    RetrievalCandidate,
+    RetrievalFeatures,
 )
 
-_DEFAULT_IMPORTANCE = 5
+# Context-layer adapter onto the **canonical** retrieval domain.
+#
+# Canonical candidate / features / scoring / policy live in
+# ``ombrebrain.retrieval``. This module deliberately defines no
+# second candidate domain: it only *projects* one legacy
+# Ombre-Brain memory bucket into a canonical ``RetrievalCandidate``
+# for the Retrieval v2 shadow.
+#
+# Real Ombre-Brain memory bucket shape — this is the only shape read
+# here:
+#
+#   {
+#       "id": "...",
+#       "content": "...",
+#       "metadata": {
+#           "importance": 1..10,
+#           "last_active": "<iso>",
+#           "created": "<iso>",
+#           ...
+#       },
+#   }
+#
+# importance / last_active / created live inside ``metadata``. A
+# top-level ``importance`` or ``created_at`` is NOT the real OB
+# bucket contract and is never used as a normal path.
+#
+# timestamp / importance are deliberately NOT candidate fields: when
+# scoring needs them it reads them through the readers below, which
+# are the single place that knows the real OB bucket shape.
 
-# importance is stored 1..10; normalized to 0..1.
-_MIN_IMPORTANCE = 1
-_MAX_IMPORTANCE = 10
+_SOURCE = "context_retrieval_v2_shadow"
+
+
+def bucket_metadata(value: Any) -> Mapping[str, Any]:
+    """Return the real OB ``metadata`` mapping of a bucket/candidate.
+
+    Accepts either a raw bucket mapping or a canonical
+    ``RetrievalCandidate``. Pure and total: anything unexpected
+    degrades to an empty mapping.
+    """
+
+    bucket: Any = value
+
+    if isinstance(value, RetrievalCandidate):
+        bucket = value.bucket
+
+    if not isinstance(bucket, Mapping):
+        return {}
+
+    metadata = bucket.get("metadata")
+
+    if not isinstance(metadata, Mapping):
+        return {}
+
+    return metadata
+
+
+def read_importance(value: Any) -> Any:
+    """Real OB importance, read from ``metadata.importance`` only.
+
+    A top-level ``importance`` is not the OB contract and must not
+    override the metadata value.
+    """
+
+    return bucket_metadata(value).get("importance")
+
+
+def read_active_timestamp(
+    value: Any,
+) -> datetime | None:
+    """Last activity as a UTC datetime.
+
+    ``metadata.last_active`` first; if it is missing, empty or
+    unparsable, fall back to ``metadata.created``. Top-level
+    ``created_at`` is never used.
+    """
+
+    metadata = bucket_metadata(value)
+
+    last_active = parse_timestamp(
+        metadata.get("last_active")
+    )
+
+    if last_active is not None:
+        return last_active
+
+    return parse_timestamp(
+        metadata.get("created")
+    )
+
+
+def parse_timestamp(
+    value: Any,
+) -> datetime | None:
+    """Parse one ISO timestamp into an aware UTC datetime.
+
+    Pure and total: anything unparsable returns ``None``.
+    """
+
+    if not value:
+        return None
+
+    try:
+        text = str(value).strip().replace(
+            "Z",
+            "+00:00",
+        )
+        parsed = datetime.fromisoformat(
+            text
+        )
+
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(
+                tzinfo=timezone.utc
+            )
+
+        return parsed.astimezone(
+            timezone.utc
+        )
+    except Exception:
+        return None
+
+
+def project_candidate(
+    bucket: Any,
+    *,
+    semantic_similarity: Any = None,
+) -> RetrievalCandidate:
+    """Project one legacy OB memory bucket into the canonical domain.
+
+    ``semantic_similarity`` must be the raw embedding similarity for
+    this bucket (the adapter's vector score map), never the legacy
+    calibrated context relevance.
+
+    The bucket mapping is held by reference — it is not copied and no
+    content is extracted here. Privacy is enforced at the
+    telemetry/output boundary, not at this internal boundary.
+
+    Pure and total: never raises, never ranks, never filters, never
+    selects.
+    """
+
+    if isinstance(bucket, RetrievalCandidate):
+        safe_bucket: Mapping[str, Any] = bucket.bucket
+    elif isinstance(bucket, Mapping):
+        safe_bucket = bucket
+    else:
+        safe_bucket = {}
+
+    return RetrievalCandidate(
+        bucket=safe_bucket,
+        features=RetrievalFeatures(
+            semantic_similarity=_clamp01(
+                semantic_similarity
+            ),
+        ),
+        source=_SOURCE,
+    )
 
 
 def _clamp01(value: Any) -> float:
@@ -48,201 +178,3 @@ def _clamp01(value: Any) -> float:
         return 0.0
 
     return max(0.0, min(1.0, numeric))
-
-
-def _parse_timestamp(value: Any) -> datetime | None:
-    if not value:
-        return None
-
-    try:
-        text = str(value).strip().replace("Z", "+00:00")
-        parsed = datetime.fromisoformat(text)
-
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-
-        return parsed.astimezone(timezone.utc)
-    except Exception:
-        return None
-
-
-def _normalized_importance(value: Any) -> float:
-    try:
-        raw = int(value)
-    except (TypeError, ValueError, OverflowError):
-        raw = _DEFAULT_IMPORTANCE
-
-    raw = max(_MIN_IMPORTANCE, min(_MAX_IMPORTANCE, raw))
-
-    return (raw - _MIN_IMPORTANCE) / (
-        _MAX_IMPORTANCE - _MIN_IMPORTANCE
-    )
-
-
-def _safe_metadata(value: Any) -> dict[str, str]:
-    if not isinstance(value, Mapping):
-        return {}
-
-    safe: dict[str, str] = {}
-
-    for key in _METADATA_WHITELIST:
-        item = value.get(key)
-
-        if (
-            isinstance(item, str)
-            and item.strip()
-        ):
-            safe[key] = item.strip()
-
-    return safe
-
-
-@dataclass(frozen=True)
-class ShadowCandidate:
-    """Shadow-only, storage-independent view of a candidate.
-
-    Not a retrieval domain type: the canonical one is
-    ``ombrebrain.retrieval.RetrievalCandidate``. This view never
-    exposes raw bucket content, created_at strings, storage
-    internals or the legacy calibrated relevance.
-    """
-
-    id: str
-    semantic_similarity: float = 0.0
-    timestamp: datetime | None = None
-    importance: float = 0.5
-    metadata: dict[str, str] = field(default_factory=dict)
-
-    @classmethod
-    def from_bucket(
-        cls,
-        bucket: Any,
-        *,
-        semantic_similarity: float | None = None,
-    ) -> "ShadowCandidate":
-        """Project one legacy retrieval candidate.
-
-        ``semantic_similarity`` must be the raw vector score for
-        this bucket (from the adapter's vector score map), not the
-        legacy calibrated context relevance.
-
-        Never raises: malformed input degrades to a neutral view.
-        """
-
-        if not isinstance(bucket, Mapping):
-            return cls(id="")
-
-        metadata = bucket.get("metadata")
-        raw_metadata = (
-            metadata
-            if isinstance(metadata, Mapping)
-            else {}
-        )
-
-        timestamp = _parse_timestamp(
-            raw_metadata.get("last_active")
-        )
-
-        if timestamp is None:
-            timestamp = _parse_timestamp(
-                bucket.get("created_at")
-            )
-
-        return cls(
-            id=str(
-                bucket.get("id") or ""
-            ),
-            semantic_similarity=_clamp01(
-                semantic_similarity
-            ),
-            timestamp=timestamp,
-            importance=(
-                _normalized_importance(
-                    bucket.get(
-                        "importance",
-                        _DEFAULT_IMPORTANCE,
-                    )
-                )
-            ),
-            metadata=_safe_metadata(
-                raw_metadata
-            ),
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        """Serialize for tests and local shadow state."""
-
-        return {
-            "id": self.id,
-            "semantic_similarity": round(
-                self.semantic_similarity,
-                6,
-            ),
-            "timestamp": (
-                self.timestamp.isoformat()
-                if self.timestamp
-                is not None
-                else None
-            ),
-            "importance": round(
-                self.importance,
-                6,
-            ),
-            "metadata": dict(
-                self.metadata
-            ),
-        }
-
-    @classmethod
-    def from_dict(
-        cls,
-        payload: Any,
-    ) -> "ShadowCandidate":
-        if not isinstance(payload, Mapping):
-            return cls(id="")
-
-        return cls(
-            id=str(
-                payload.get("id") or ""
-            ),
-            semantic_similarity=_clamp01(
-                payload.get(
-                    "semantic_similarity"
-                )
-            ),
-            timestamp=_parse_timestamp(
-                payload.get("timestamp")
-            ),
-            importance=_clamp01(
-                payload.get("importance")
-            ),
-            metadata=_safe_metadata(
-                payload.get("metadata")
-            ),
-        )
-
-
-def normalize_candidate(
-    value: Any,
-    *,
-    semantic_similarity: float | None = None,
-) -> ShadowCandidate:
-    """Project one legacy candidate into a shadow view.
-
-    Pure and total: never raises, never ranks, never filters,
-    never selects. An already-projected view is returned
-    unchanged (its similarity is preserved).
-    """
-
-    if isinstance(
-        value,
-        ShadowCandidate,
-    ):
-        return value
-
-    return ShadowCandidate.from_bucket(
-        value,
-        semantic_similarity=(
-            semantic_similarity
-        ),
-    )

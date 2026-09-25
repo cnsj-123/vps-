@@ -8,10 +8,17 @@ from datetime import (
 )
 
 from ombrebrain.context.retrieval import (
-    ShadowCandidate,
-    ShadowScorer,
-    ShadowScoringWeights,
-    ShadowScoringContext,
+    scorer as scorer_module,
+)
+from ombrebrain.context.retrieval.candidate import (
+    project_candidate,
+)
+from ombrebrain.context.retrieval.scorer import (
+    importance_score,
+    recency_score,
+    relative_semantic_score,
+    score_candidate,
+    semantic_similarity,
 )
 
 
@@ -26,34 +33,42 @@ NOW = datetime(
 )
 
 
+def bucket(
+    *,
+    id="c",
+    importance=5,
+    hours_old=None,
+):
+    """Real Ombre-Brain bucket shape (importance in metadata)."""
+
+    metadata = {
+        "importance": importance,
+    }
+
+    if hours_old is not None:
+        metadata["last_active"] = (
+            NOW - timedelta(hours=hours_old)
+        ).isoformat()
+
+    return {
+        "id": id,
+        "content": "secret-content",
+        "metadata": metadata,
+    }
+
+
 def candidate(
     *,
     semantic=0.8,
+    importance=5,
     hours_old=None,
-    importance=0.5,
 ):
-    timestamp = (
-        NOW - timedelta(hours=hours_old)
-        if hours_old is not None
-        else None
-    )
-
-    return ShadowCandidate(
-        id="c",
+    return project_candidate(
+        bucket(
+            importance=importance,
+            hours_old=hours_old,
+        ),
         semantic_similarity=semantic,
-        timestamp=timestamp,
-        importance=importance,
-    )
-
-
-def context(
-    *,
-    max_semantic=0.8,
-    now=NOW,
-):
-    return ShadowScoringContext(
-        now=now,
-        max_semantic_similarity=max_semantic,
     )
 
 
@@ -62,48 +77,43 @@ class DeterministicScoreTests(
 ):
 
     def test_same_inputs_same_score(self):
-        scorer = ShadowScorer()
-        c = candidate(
-            semantic=0.9,
-            hours_old=10,
-            importance=0.8,
-        )
-        ctx = context(
-            max_semantic=0.9
+        first = score_candidate(
+            candidate(
+                semantic=0.9,
+                hours_old=10,
+                importance=8,
+            ),
+            now=NOW,
+            max_semantic_similarity=0.9,
         )
 
-        first = scorer.score(c, ctx)
-        second = scorer.score(c, ctx)
+        second = score_candidate(
+            candidate(
+                semantic=0.9,
+                hours_old=10,
+                importance=8,
+            ),
+            now=NOW,
+            max_semantic_similarity=0.9,
+        )
 
         self.assertEqual(first, second)
 
-        # Repeat with fresh instances.
-        self.assertEqual(
-            first,
-            ShadowScorer().score(
-                candidate(
-                    semantic=0.9,
-                    hours_old=10,
-                    importance=0.8,
-                ),
-                context(
-                    max_semantic=0.9
-                ),
-            ),
-        )
-
     def test_default_formula_weights(self):
-        scorer = ShadowScorer()
-
         # Fully neutral except semantic.
-        c = candidate(
-            semantic=1.0,
-            hours_old=None,
-            importance=0.0,
+        value = score_candidate(
+            candidate(
+                semantic=1.0,
+                importance=1,
+            ),
+            now=NOW,
+            max_semantic_similarity=1.0,
         )
 
-        # relative_semantic = 1.0 / 1.0 = 1.0
-        # recency (missing timestamp) = 0.5
+        # 0.5 * 1.0
+        # + 0.2 * 0.5 (missing timestamp is neutral)
+        # + 0.2 * 0.0 (importance 1 -> 0.0)
+        # + 0.1 * 1.0 (relative semantic 1.0/1.0)
         expected = (
             0.5 * 1.0
             + 0.2 * 0.5
@@ -112,101 +122,115 @@ class DeterministicScoreTests(
         )
 
         self.assertAlmostEqual(
-            scorer.score(
-                c,
-                context(max_semantic=1.0),
-            ),
+            value,
             expected,
             places=9,
         )
 
-    def test_score_is_bounded_0_1(self):
-        scorer = ShadowScorer()
-        ctx = context(max_semantic=1.0)
-
-        self.assertEqual(
-            scorer.score(
-                candidate(
-                    semantic=0.0,
-                    importance=0.0,
-                    hours_old=None,
-                ),
-                ctx,
-            ),
-            0.2 * 0.5,
-        )
-
-        top = scorer.score(
-            candidate(
-                semantic=1.0,
-                hours_old=0,
-                importance=1.0,
-            ),
-            ctx,
-        )
-
-        self.assertLessEqual(top, 1.0)
-        self.assertGreaterEqual(top, 0.0)
-
-    def test_custom_weights_are_respected(
+    def test_fixed_weights_are_unchanged(
         self,
     ):
-        scorer = ShadowScorer(
-            ShadowScoringWeights(
-                semantic=1.0,
-                recency=0.0,
-                importance=0.0,
-                relative_semantic=0.0,
-            )
+        # The shadow formula weights are frozen this round.
+        self.assertEqual(
+            scorer_module._SEMANTIC_WEIGHT,
+            0.5,
+        )
+        self.assertEqual(
+            scorer_module._RECENCY_WEIGHT,
+            0.2,
+        )
+        self.assertEqual(
+            scorer_module._IMPORTANCE_WEIGHT,
+            0.2,
+        )
+        self.assertEqual(
+            scorer_module
+            ._RELATIVE_SEMANTIC_WEIGHT,
+            0.1,
         )
 
-        self.assertAlmostEqual(
-            scorer.score(
-                candidate(semantic=0.42),
-                context(max_semantic=0.9),
+    def test_score_is_bounded_0_1(self):
+        lowest = score_candidate(
+            candidate(
+                semantic=0.0,
+                importance=1,
             ),
-            0.42,
-            places=9,
-        )
-
-    def test_weights_to_dict(self):
-        weights = (
-            ShadowScoringWeights()
+            now=NOW,
+            max_semantic_similarity=1.0,
         )
 
         self.assertEqual(
-            weights.to_dict(),
-            {
-                "semantic": 0.5,
-                "recency": 0.2,
-                "importance": 0.2,
-                "relative_semantic": 0.1,
-            },
-        )
-
-    def test_score_accepts_raw_bucket(self):
-        scorer = ShadowScorer()
-
-        # score() normalizes raw dicts on the fly. A raw bucket
-        # carries no raw embedding similarity, so only neutral
-        # components contribute; the legacy calibrated
-        # context_relevance above is deliberately never read.
-        score = scorer.score(
-            {
-                "id": "raw",
-                "context_relevance": 1.0,
-                "importance": 1,
-                "metadata": {},
-            },
-            context(max_semantic=1.0),
-        )
-
-        # Missing timestamp -> neutral recency 0.5, and nothing
-        # else contributes for this raw bucket.
-        self.assertAlmostEqual(
-            score,
+            lowest,
             0.2 * 0.5,
-            places=9,
+        )
+
+        highest = score_candidate(
+            candidate(
+                semantic=1.0,
+                importance=10,
+                hours_old=0,
+            ),
+            now=NOW,
+            max_semantic_similarity=1.0,
+        )
+
+        self.assertLessEqual(highest, 1.0)
+        self.assertGreaterEqual(highest, 0.0)
+
+    def test_score_does_not_mutate_candidate(
+        self,
+    ):
+        item = candidate(hours_old=3)
+
+        before = item
+
+        score_candidate(
+            item,
+            now=NOW,
+            max_semantic_similarity=0.8,
+        )
+
+        self.assertIs(item, before)
+        self.assertEqual(
+            item.features.semantic_similarity,
+            0.8,
+        )
+
+    def test_malformed_candidate_never_crashes(
+        self,
+    ):
+        for bad in (
+            None,
+            5,
+            "x",
+            [],
+            {"id": 1},
+        ):
+            value = score_candidate(
+                bad,
+                now=NOW,
+                max_semantic_similarity=0.9,
+            )
+
+            self.assertGreaterEqual(
+                value, 0.0, bad
+            )
+            self.assertLessEqual(
+                value, 1.0, bad
+            )
+
+    def test_semantic_similarity_reads_features(
+        self,
+    ):
+        item = candidate(semantic=0.42)
+
+        self.assertEqual(
+            semantic_similarity(item),
+            0.42,
+        )
+        self.assertEqual(
+            semantic_similarity("not-a-candidate"),
+            0.0,
         )
 
 
@@ -215,23 +239,20 @@ class BoundaryValueTests(
 ):
 
     def test_recency_boundaries(self):
-        scorer = ShadowScorer()
-        ctx = context()
-
         # age 0 -> 1.0
         self.assertEqual(
-            scorer.recency_score(
+            recency_score(
                 candidate(hours_old=0),
-                ctx,
+                now=NOW,
             ),
             1.0,
         )
 
         # half-life (default 72h) -> 0.5
         self.assertAlmostEqual(
-            scorer.recency_score(
+            recency_score(
                 candidate(hours_old=72),
-                ctx,
+                now=NOW,
             ),
             0.5,
             places=9,
@@ -239,144 +260,134 @@ class BoundaryValueTests(
 
         # missing timestamp -> neutral 0.5
         self.assertEqual(
-            scorer.recency_score(
+            recency_score(
                 candidate(hours_old=None),
-                ctx,
+                now=NOW,
             ),
             0.5,
         )
 
-        # far future age -> decays toward 0
+        # far past -> decays toward 0
         self.assertLess(
-            scorer.recency_score(
+            recency_score(
                 candidate(hours_old=720),
-                ctx,
+                now=NOW,
             ),
             0.01,
         )
 
         # future timestamp clamps to age 0
-        future = ShadowCandidate(
-            id="f",
-            timestamp=NOW
-            + timedelta(hours=5),
+        future = project_candidate(
+            {
+                "id": "f",
+                "metadata": {
+                    "last_active": (
+                        NOW
+                        + timedelta(hours=5)
+                    ).isoformat(),
+                },
+            }
         )
 
         self.assertEqual(
-            scorer.recency_score(
+            recency_score(
                 future,
-                ctx,
+                now=NOW,
             ),
             1.0,
         )
 
     def test_custom_half_life(self):
-        scorer = ShadowScorer(
-            recency_half_life_hours=24.0,
-        )
-
         self.assertAlmostEqual(
-            scorer.recency_score(
+            recency_score(
                 candidate(hours_old=24),
-                context(),
+                now=NOW,
+                recency_half_life_hours=24.0,
             ),
             0.5,
             places=9,
         )
 
     def test_importance_boundaries(self):
-        scorer = ShadowScorer()
-
         self.assertEqual(
-            scorer.importance_score(
-                candidate(importance=0.0)
+            importance_score(
+                candidate(importance=1)
             ),
             0.0,
         )
         self.assertEqual(
-            scorer.importance_score(
-                candidate(importance=1.0)
+            importance_score(
+                candidate(importance=10)
             ),
             1.0,
         )
 
     def test_relative_semantic_boundaries(self):
-        scorer = ShadowScorer()
-
         # No best score -> 0.0
         self.assertEqual(
-            scorer.relative_semantic_score(
+            relative_semantic_score(
                 candidate(semantic=0.9),
-                context(max_semantic=0.0),
+                max_semantic_similarity=0.0,
             ),
             0.0,
         )
 
         # Best candidate -> 1.0
         self.assertEqual(
-            scorer.relative_semantic_score(
+            relative_semantic_score(
                 candidate(semantic=0.9),
-                context(max_semantic=0.9),
+                max_semantic_similarity=0.9,
             ),
             1.0,
         )
 
         # Half of best -> 0.5
         self.assertAlmostEqual(
-            scorer.relative_semantic_score(
+            relative_semantic_score(
                 candidate(semantic=0.45),
-                context(max_semantic=0.9),
+                max_semantic_similarity=0.9,
             ),
             0.5,
             places=9,
         )
 
-    def test_semantic_boundary_scores(self):
-        scorer = ShadowScorer(
-            ShadowScoringWeights(
-                semantic=1.0,
-                recency=0.0,
-                importance=0.0,
-                relative_semantic=0.0,
-            )
-        )
-
-        ctx = context(max_semantic=0.0)
-
-        self.assertEqual(
-            scorer.score(
-                candidate(semantic=0.0),
-                ctx,
+    def test_relative_semantic_is_derived_from_semantic_only(
+        self,
+    ):
+        # Two candidates with the same raw similarity get the same
+        # relative score: it is not an independent signal.
+        first = relative_semantic_score(
+            candidate(
+                semantic=0.45,
+                importance=1,
             ),
-            0.0,
+            max_semantic_similarity=0.9,
         )
-        self.assertEqual(
-            scorer.score(
-                candidate(semantic=1.0),
-                ctx,
+        second = relative_semantic_score(
+            candidate(
+                semantic=0.45,
+                importance=10,
             ),
-            1.0,
+            max_semantic_similarity=0.9,
         )
 
-    def test_naive_context_now_default(self):
-        # A naive datetime is treated as UTC and never raises.
-        scorer = ShadowScorer()
-
-        naive_ctx = (
-            ShadowScoringContext(
-                now=NOW.replace(
-                    tzinfo=None
-                ),
-                max_semantic_similarity=1.0,
-            )
+        self.assertEqual(first, second)
+        self.assertAlmostEqual(
+            first,
+            0.5,
+            places=9,
         )
 
-        score = scorer.score(
+    def test_naive_now_is_treated_as_utc(
+        self,
+    ):
+        value = score_candidate(
             candidate(hours_old=1),
-            naive_ctx,
+            now=NOW.replace(tzinfo=None),
+            max_semantic_similarity=0.8,
         )
 
-        self.assertGreater(score, 0.0)
+        self.assertGreater(value, 0.0)
 
 
 if __name__ == "__main__":
