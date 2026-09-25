@@ -148,9 +148,11 @@ class CiWorkflowTests(
                 )
 
         # ...and the packages the suite actually imports are there.
+        # pyyaml is required by this test module itself (yaml).
         for package in (
             "starlette",
             "httpx",
+            "pyyaml",
         ):
             with self.subTest(
                 package=package

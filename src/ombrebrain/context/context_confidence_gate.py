@@ -8,6 +8,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from ombrebrain.context.validators.freshness import (
+    is_valid_revision,
+    validate_context_freshness,
+)
+
 
 # Context Confidence Gate — shadow only.
 #
@@ -19,6 +24,15 @@ from typing import Any
 # freshness of the rendered chain, render SHA, mutation safety, body
 # invariants, the token envelope or HTTP safety: those stay owned by
 # the Injection Gate and the Real Injection selector.
+#
+# What it does own is the legality of the evidence it observes:
+#   - every revision it reads (candidate revision / candidate
+#     source_revision / unified revision) must be a valid 1-based
+#     revision, checked with the shared is_valid_revision();
+#   - the Candidate -> Unified source chain must match, checked with
+#     the shared validate_context_freshness().
+# It never validates Preview, the Injection Gate or the mutation
+# chain.
 #
 # This first version is deliberately rule / reason based:
 #   - deterministic, read-only, no model call, no LLM judge,
@@ -74,6 +88,25 @@ _FRESHNESS_FLAGS = (
     "semantic_source_ahead",
     "trusted_facts_source_stale",
     "trusted_facts_source_ahead",
+)
+
+# The real legacy retrieval outcome contract
+# (ombrebrain.context.service.get_candidates). The Confidence Gate
+# only validates that the retrieval observation telemetry carries
+# one of these values; it never interprets the outcome itself as a
+# confidence deny. In particular embedding_disabled /
+# no_semantic_scores / below_relevance_threshold / no_search_matches
+# are valid observations, not evidence that the Context is invalid.
+_KNOWN_RETRIEVAL_OUTCOMES = frozenset(
+    (
+        "empty_query",
+        "included",
+        "no_search_matches",
+        "embedding_disabled",
+        "no_semantic_scores",
+        "below_relevance_threshold",
+        "no_included_results",
+    )
 )
 
 
@@ -313,7 +346,164 @@ def evaluate_context_confidence(
             )
 
     # --------------------------------------------------
-    # 2. Telemetry shape — malformed telemetry
+    # 2. Revision legality — shared freshness validator
+    #
+    # Missing / None / bool / 0 / negative / wrongly-typed
+    # revisions are all invalid, so a malformed evidence chain can
+    # never reach allow_shadow. The single shared validator is
+    # reused; this module never re-implements a revision rule.
+    # --------------------------------------------------
+
+    candidate_revision = (
+        conversation_candidate.get(
+            "revision"
+        )
+        if isinstance(
+            conversation_candidate,
+            dict,
+        )
+        else None
+    )
+
+    candidate_source_revision = (
+        conversation_candidate.get(
+            "source_revision"
+        )
+        if isinstance(
+            conversation_candidate,
+            dict,
+        )
+        else None
+    )
+
+    unified_revision = (
+        unified.get(
+            "revision"
+        )
+        if isinstance(
+            unified,
+            dict,
+        )
+        else None
+    )
+
+    raw_source_revisions = (
+        unified.get(
+            "source_revisions"
+        )
+        if isinstance(
+            unified,
+            dict,
+        )
+        else None
+    )
+
+    if not is_valid_revision(
+        candidate_revision
+    ):
+        reasons.append(
+            "invalid_candidate_revision"
+        )
+
+    if not is_valid_revision(
+        candidate_source_revision
+    ):
+        reasons.append(
+            "invalid_candidate_source_revision"
+        )
+
+    if not is_valid_revision(
+        unified_revision
+    ):
+        reasons.append(
+            "invalid_unified_revision"
+        )
+
+    source_revisions = (
+        raw_source_revisions
+        if isinstance(
+            raw_source_revisions,
+            dict,
+        )
+        else {}
+    )
+
+    if not isinstance(
+        raw_source_revisions,
+        dict,
+    ):
+        reasons.append(
+            "invalid_unified_source_revisions"
+        )
+
+    # --------------------------------------------------
+    # 3. Candidate -> Unified source chain
+    #
+    # The Unified candidate must have been built from the
+    # Conversation Candidate this gate is observing. Only this
+    # evidence chain is verified: Preview / Injection Gate /
+    # Mutation / Real Injection freshness stays owned by their own
+    # stages and is never touched here.
+    # --------------------------------------------------
+
+    candidate_chain_freshness = (
+        validate_context_freshness(
+            checked_revision=(
+                source_revisions.get(
+                    "conversation_candidate"
+                )
+            ),
+            expected_revision=(
+                candidate_revision
+            ),
+            invalid_reason=(
+                "invalid_unified_source_revisions"
+            ),
+            mismatch_reason=(
+                "unified_source_candidate_revision_mismatch"
+            ),
+        )
+    )
+
+    if not candidate_chain_freshness[
+        "valid"
+    ]:
+        reasons.append(
+            candidate_chain_freshness[
+                "reason"
+            ]
+        )
+
+    conversation_source_freshness = (
+        validate_context_freshness(
+            checked_revision=(
+                source_revisions.get(
+                    "conversation_source"
+                )
+            ),
+            expected_revision=(
+                candidate_source_revision
+            ),
+            invalid_reason=(
+                "invalid_unified_source_revisions"
+            ),
+            mismatch_reason=(
+                "unified_source_conversation_revision_mismatch"
+            ),
+        )
+    )
+
+    if not conversation_source_freshness[
+        "valid"
+    ]:
+        reasons.append(
+            conversation_source_freshness[
+                "reason"
+            ]
+        )
+
+    # --------------------------------------------------
+    # 4. Telemetry shape — malformed telemetry
     # --------------------------------------------------
 
     raw_candidate_telemetry = (
@@ -363,7 +553,7 @@ def evaluate_context_confidence(
         )
 
     # --------------------------------------------------
-    # 3. Current user must be excluded from carried Context
+    # 5. Current user must be excluded from carried Context
     # --------------------------------------------------
 
     if (
@@ -387,7 +577,7 @@ def evaluate_context_confidence(
         )
 
     # --------------------------------------------------
-    # 4. Carried-forward source freshness
+    # 6. Carried-forward source freshness
     # --------------------------------------------------
 
     for flag in _FRESHNESS_FLAGS:
@@ -404,12 +594,16 @@ def evaluate_context_confidence(
             )
 
     # --------------------------------------------------
-    # 5. Retrieval observation availability
+    # 7. Retrieval observation availability
     #
-    # "Unavailable" means the retrieval observation telemetry was
-    # not attached at all. It does NOT mean "no memories matched":
-    # an empty result is a valid observation, so this gate never
-    # turns memory_count == 0 into a deny on its own.
+    # Only the STRUCTURE of the retrieval observation telemetry is
+    # validated here: the outcome must be one of the known legacy
+    # retrieval outcomes. Missing / non-string / empty / unknown is
+    # an unavailable or malformed observation, never a judgement
+    # about the memories themselves. "Unavailable" does NOT mean
+    # "no memories matched": an empty result (empty_query /
+    # no_search_matches / ...) is a valid observation, and
+    # memory_count == 0 is never a deny on its own.
     # --------------------------------------------------
 
     retrieval_quality = (
@@ -418,26 +612,60 @@ def evaluate_context_confidence(
         )
     )
 
-    retrieval_observation_available = (
-        isinstance(
-            retrieval_quality,
-            dict,
-        )
-        and isinstance(
-            retrieval_quality.get(
-                "outcome"
-            ),
-            str,
-        )
-    )
+    retrieval_outcome = None
 
-    if not retrieval_observation_available:
+    if not isinstance(
+        retrieval_quality,
+        dict,
+    ):
+        retrieval_observation_available = (
+            False
+        )
+
         reasons.append(
             "retrieval_observation_unavailable"
         )
 
+    else:
+        retrieval_outcome = (
+            retrieval_quality.get(
+                "outcome"
+            )
+        )
+
+        if retrieval_outcome is None:
+            retrieval_observation_available = (
+                False
+            )
+
+            reasons.append(
+                "retrieval_observation_unavailable"
+            )
+
+        elif (
+            not isinstance(
+                retrieval_outcome,
+                str,
+            )
+            or not retrieval_outcome.strip()
+            or retrieval_outcome
+            not in _KNOWN_RETRIEVAL_OUTCOMES
+        ):
+            retrieval_observation_available = (
+                False
+            )
+
+            reasons.append(
+                "malformed_telemetry"
+            )
+
+        else:
+            retrieval_observation_available = (
+                True
+            )
+
     # --------------------------------------------------
-    # 6. Section evidence
+    # 8. Section evidence
     # --------------------------------------------------
 
     section_counts: dict[str, int] = {}
@@ -460,13 +688,31 @@ def evaluate_context_confidence(
                     "malformed_telemetry"
                 )
 
-    section_presence = {
-        field: (
-            unified_telemetry.get(field)
-            is True
-        )
-        for field in _EVIDENCE_BOOL_FIELDS
-    }
+    # Boolean presence flags are strict: when present they must be a
+    # real bool. "true" / "yes" / 1 / 0 / [] / {} are malformed and
+    # must never be silently coerced to False.
+    section_presence: dict[str, bool] = {}
+
+    for field in _EVIDENCE_BOOL_FIELDS:
+        if field not in unified_telemetry:
+            section_presence[field] = False
+
+            continue
+
+        value = unified_telemetry[field]
+
+        if not isinstance(
+            value,
+            bool,
+        ):
+            section_presence[field] = False
+
+            reasons.append(
+                "malformed_telemetry"
+            )
+
+        else:
+            section_presence[field] = value
 
     usable_context_evidence = (
         any(
@@ -528,27 +774,9 @@ def evaluate_context_confidence(
         "reasons":
             reasons,
         "source_candidate_revision":
-            (
-                conversation_candidate.get(
-                    "revision"
-                )
-                if isinstance(
-                    conversation_candidate,
-                    dict,
-                )
-                else None
-            ),
+            candidate_revision,
         "source_unified_revision":
-            (
-                unified.get(
-                    "revision"
-                )
-                if isinstance(
-                    unified,
-                    dict,
-                )
-                else None
-            ),
+            unified_revision,
         "current_user_excluded":
             (
                 candidate_telemetry.get(

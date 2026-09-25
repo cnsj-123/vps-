@@ -13,6 +13,18 @@ from ombrebrain.context.context_confidence_gate import (
 
 CID = "ctx_0123456789abcdef"
 
+# The real legacy retrieval outcome contract. Every one of these is
+# a valid observation and must never be denied for its name alone.
+_KNOWN_OUTCOMES = (
+    "empty_query",
+    "included",
+    "no_search_matches",
+    "embedding_disabled",
+    "no_semantic_scores",
+    "below_relevance_threshold",
+    "no_included_results",
+)
+
 # Canonical privacy-safe field names the report may expose. Anything
 # else (text, ids, query) would break the privacy contract.
 _ALLOWED_REPORT_FIELDS = {
@@ -116,7 +128,7 @@ def unified(
             0,
         "retrieval_quality": {
             "outcome":
-                "ok",
+                "included",
             "embedding_enabled":
                 False,
         },
@@ -296,6 +308,317 @@ class ConfidenceGateDecisionTests(
             report["reasons"],
         )
 
+    # --------------------------------------------------
+    # revision legality (shared freshness validator)
+    # --------------------------------------------------
+
+    def test_matching_revision_chain_allows_shadow(
+        self,
+    ):
+        report = _evaluate()
+
+        self.assertEqual(
+            report["decision"],
+            "allow_shadow",
+        )
+
+        self.assertEqual(
+            report["reasons"],
+            [],
+        )
+
+        self.assertEqual(
+            report["source_candidate_revision"],
+            6,
+        )
+
+        self.assertEqual(
+            report["source_unified_revision"],
+            3,
+        )
+
+    def test_candidate_revision_missing_is_deny(
+        self,
+    ):
+        broken = candidate()
+
+        del broken["revision"]
+
+        report = _evaluate(
+            conversation_candidate=broken
+        )
+
+        self.assertEqual(
+            report["decision"],
+            "deny_shadow",
+        )
+
+        self.assertIn(
+            "invalid_candidate_revision",
+            report["reasons"],
+        )
+
+    def test_candidate_revision_malformed_is_deny(
+        self,
+    ):
+        for value in (
+            None,
+            True,
+            False,
+            0,
+            -1,
+            "6",
+            6.0,
+            [],
+            {},
+        ):
+            with self.subTest(
+                revision=value
+            ):
+                broken = candidate()
+
+                broken["revision"] = value
+
+                report = _evaluate(
+                    conversation_candidate=
+                        broken
+                )
+
+                self.assertEqual(
+                    report["decision"],
+                    "deny_shadow",
+                )
+
+                self.assertIn(
+                    "invalid_candidate_revision",
+                    report["reasons"],
+                )
+
+    def test_candidate_source_revision_malformed_is_deny(
+        self,
+    ):
+        for value in (
+            None,
+            True,
+            0,
+            -2,
+            "5",
+        ):
+            with self.subTest(
+                source_revision=value
+            ):
+                broken = candidate()
+
+                broken[
+                    "source_revision"
+                ] = value
+
+                report = _evaluate(
+                    conversation_candidate=
+                        broken
+                )
+
+                self.assertEqual(
+                    report["decision"],
+                    "deny_shadow",
+                )
+
+                self.assertIn(
+                    "invalid_candidate_source_revision",
+                    report["reasons"],
+                )
+
+    def test_unified_revision_missing_is_deny(
+        self,
+    ):
+        broken = unified()
+
+        del broken["revision"]
+
+        report = _evaluate(
+            unified_candidate=broken
+        )
+
+        self.assertEqual(
+            report["decision"],
+            "deny_shadow",
+        )
+
+        self.assertIn(
+            "invalid_unified_revision",
+            report["reasons"],
+        )
+
+    def test_unified_revision_malformed_is_deny(
+        self,
+    ):
+        for value in (
+            None,
+            True,
+            0,
+            -1,
+            "3",
+        ):
+            with self.subTest(
+                revision=value
+            ):
+                broken = unified()
+
+                broken["revision"] = value
+
+                report = _evaluate(
+                    unified_candidate=broken
+                )
+
+                self.assertEqual(
+                    report["decision"],
+                    "deny_shadow",
+                )
+
+                self.assertIn(
+                    "invalid_unified_revision",
+                    report["reasons"],
+                )
+
+    # --------------------------------------------------
+    # Candidate -> Unified source chain
+    # --------------------------------------------------
+
+    def test_unified_source_revisions_missing_is_deny(
+        self,
+    ):
+        broken = unified()
+
+        del broken["source_revisions"]
+
+        report = _evaluate(
+            unified_candidate=broken
+        )
+
+        self.assertEqual(
+            report["decision"],
+            "deny_shadow",
+        )
+
+        self.assertIn(
+            "invalid_unified_source_revisions",
+            report["reasons"],
+        )
+
+    def test_unified_source_revisions_non_dict_is_deny(
+        self,
+    ):
+        for value in (
+            None,
+            ["6", "5"],
+            "6",
+            8,
+        ):
+            with self.subTest(
+                source_revisions=value
+            ):
+                broken = unified()
+
+                broken[
+                    "source_revisions"
+                ] = value
+
+                report = _evaluate(
+                    unified_candidate=broken
+                )
+
+                self.assertEqual(
+                    report["decision"],
+                    "deny_shadow",
+                )
+
+                self.assertIn(
+                    "invalid_unified_source_revisions",
+                    report["reasons"],
+                )
+
+    def test_unified_source_candidate_entry_malformed_is_deny(
+        self,
+    ):
+        for value in (
+            None,
+            True,
+            0,
+            "6",
+        ):
+            with self.subTest(
+                value=value
+            ):
+                broken = unified()
+
+                broken["source_revisions"] = {
+                    "conversation_candidate":
+                        value,
+                    "conversation_source":
+                        5,
+                }
+
+                report = _evaluate(
+                    unified_candidate=broken
+                )
+
+                self.assertIn(
+                    "invalid_unified_source_revisions",
+                    report["reasons"],
+                )
+
+    def test_unified_source_candidate_revision_mismatch_is_deny(
+        self,
+    ):
+        broken = unified()
+
+        broken["source_revisions"] = {
+            "conversation_candidate":
+                7,
+            "conversation_source":
+                5,
+        }
+
+        report = _evaluate(
+            unified_candidate=broken
+        )
+
+        self.assertEqual(
+            report["decision"],
+            "deny_shadow",
+        )
+
+        self.assertIn(
+            "unified_source_candidate_revision_mismatch",
+            report["reasons"],
+        )
+
+    def test_unified_source_conversation_revision_mismatch_is_deny(
+        self,
+    ):
+        broken = unified()
+
+        broken["source_revisions"] = {
+            "conversation_candidate":
+                6,
+            "conversation_source":
+                9,
+        }
+
+        report = _evaluate(
+            unified_candidate=broken
+        )
+
+        self.assertEqual(
+            report["decision"],
+            "deny_shadow",
+        )
+
+        self.assertIn(
+            "unified_source_conversation_revision_mismatch",
+            report["reasons"],
+        )
+
     def test_stale_semantic_source_is_deny(
         self,
     ):
@@ -465,6 +788,242 @@ class ConfidenceGateDecisionTests(
             "malformed_candidate_telemetry",
             report["reasons"],
         )
+
+    # --------------------------------------------------
+    # strict boolean telemetry
+    # --------------------------------------------------
+
+    def test_boolean_telemetry_must_be_real_bool(
+        self,
+    ):
+        cases = (
+            ("has_current_task", "yes"),
+            ("has_current_task", "true"),
+            ("has_current_task", 1),
+            ("has_current_task", 0),
+            ("has_current_task", []),
+            ("has_current_task", {}),
+            ("has_current_task", None),
+            ("state_included", "true"),
+            ("state_included", "yes"),
+            ("state_included", 1),
+            ("state_included", 0),
+            ("state_included", []),
+            ("state_included", {}),
+            ("state_included", None),
+        )
+
+        for field, value in cases:
+            with self.subTest(
+                field=field,
+                value=value,
+            ):
+                report = _evaluate(
+                    unified_candidate=unified(
+                        **{field: value}
+                    )
+                )
+
+                self.assertEqual(
+                    report["decision"],
+                    "deny_shadow",
+                )
+
+                self.assertIn(
+                    "malformed_telemetry",
+                    report["reasons"],
+                )
+
+    def test_malformed_boolean_not_masked_by_other_evidence(
+        self,
+    ):
+        # trusted_fact_count=1 must not hide malformed telemetry.
+        report = _evaluate(
+            unified_candidate=unified(
+                has_current_task="yes",
+                trusted_fact_count=1,
+            )
+        )
+
+        self.assertEqual(
+            report["decision"],
+            "deny_shadow",
+        )
+
+        self.assertIn(
+            "malformed_telemetry",
+            report["reasons"],
+        )
+
+        self.assertIs(
+            report["usable_context_evidence"],
+            True,
+        )
+
+    # --------------------------------------------------
+    # retrieval outcome contract
+    # --------------------------------------------------
+
+    def test_every_known_retrieval_outcome_allows(
+        self,
+    ):
+        for outcome in _KNOWN_OUTCOMES:
+            with self.subTest(
+                outcome=outcome
+            ):
+                report = _evaluate(
+                    unified_candidate=unified(
+                        retrieval_quality={
+                            "outcome":
+                                outcome,
+                        }
+                    )
+                )
+
+                self.assertEqual(
+                    report["decision"],
+                    "allow_shadow",
+                )
+
+                self.assertEqual(
+                    report["reasons"],
+                    [],
+                )
+
+                self.assertIs(
+                    report[
+                        "retrieval_observation_available"
+                    ],
+                    True,
+                )
+
+    def test_unknown_retrieval_outcome_is_deny(
+        self,
+    ):
+        for outcome in (
+            "ok",
+            "whatever",
+            "INCLUDED",
+        ):
+            with self.subTest(
+                outcome=outcome
+            ):
+                report = _evaluate(
+                    unified_candidate=unified(
+                        retrieval_quality={
+                            "outcome":
+                                outcome,
+                        }
+                    )
+                )
+
+                self.assertEqual(
+                    report["decision"],
+                    "deny_shadow",
+                )
+
+                self.assertIn(
+                    "malformed_telemetry",
+                    report["reasons"],
+                )
+
+                self.assertIs(
+                    report[
+                        "retrieval_observation_available"
+                    ],
+                    False,
+                )
+
+    def test_empty_retrieval_outcome_is_deny(
+        self,
+    ):
+        for outcome in ("", "   "):
+            with self.subTest(
+                outcome=repr(outcome)
+            ):
+                report = _evaluate(
+                    unified_candidate=unified(
+                        retrieval_quality={
+                            "outcome":
+                                outcome,
+                        }
+                    )
+                )
+
+                self.assertEqual(
+                    report["decision"],
+                    "deny_shadow",
+                )
+
+                self.assertIn(
+                    "malformed_telemetry",
+                    report["reasons"],
+                )
+
+    def test_non_string_retrieval_outcome_is_deny(
+        self,
+    ):
+        for outcome in (1, 0, [], {}):
+            with self.subTest(
+                outcome=outcome
+            ):
+                report = _evaluate(
+                    unified_candidate=unified(
+                        retrieval_quality={
+                            "outcome":
+                                outcome,
+                        }
+                    )
+                )
+
+                self.assertEqual(
+                    report["decision"],
+                    "deny_shadow",
+                )
+
+                self.assertIn(
+                    "malformed_telemetry",
+                    report["reasons"],
+                )
+
+                self.assertIs(
+                    report[
+                        "retrieval_observation_available"
+                    ],
+                    False,
+                )
+
+    def test_missing_retrieval_outcome_is_unavailable(
+        self,
+    ):
+        for quality in (
+            {
+                "embedding_enabled":
+                    False,
+            },
+            {
+                "outcome":
+                    None,
+            },
+        ):
+            with self.subTest(
+                quality=quality
+            ):
+                report = _evaluate(
+                    unified_candidate=unified(
+                        retrieval_quality=quality
+                    )
+                )
+
+                self.assertEqual(
+                    report["decision"],
+                    "deny_shadow",
+                )
+
+                self.assertIn(
+                    "retrieval_observation_unavailable",
+                    report["reasons"],
+                )
 
     def test_no_usable_context_evidence_is_deny(
         self,

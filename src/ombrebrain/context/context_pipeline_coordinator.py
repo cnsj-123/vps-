@@ -115,13 +115,100 @@ def observe_context_confidence(
         )
         return
 
+    if not isinstance(
+        report,
+        dict,
+    ):
+        logger.warning(
+            "[gateway.context_confidence_gate] "
+            "invalid_report fail_open=true"
+        )
+        return
+
+    # Explicit privacy-safe allowlist. The report is never spread
+    # into the log line, so an unexpected extra field (text, ids)
+    # can never leak, and conversation_id is deliberately not
+    # logged here.
     logger.info(
         "[gateway.context_confidence_gate] %s",
         json.dumps(
             {
-                "conversation_id":
-                    conversation_id,
-                **report,
+                "mode": report.get("mode"),
+                "decision": report.get("decision"),
+                "allowed": report.get("allowed"),
+                "reason": report.get("reason"),
+                "reasons": report.get("reasons"),
+                "stored": report.get("stored"),
+                "duplicate": report.get("duplicate"),
+                "revision": report.get("revision"),
+                "source_candidate_revision":
+                    report.get(
+                        "source_candidate_revision"
+                    ),
+                "source_unified_revision":
+                    report.get(
+                        "source_unified_revision"
+                    ),
+                "current_user_excluded":
+                    report.get(
+                        "current_user_excluded"
+                    ),
+                "retrieval_observation_available":
+                    report.get(
+                        "retrieval_observation_available"
+                    ),
+                "retrieval_candidate_count":
+                    report.get(
+                        "retrieval_candidate_count"
+                    ),
+                "usable_context_evidence":
+                    report.get(
+                        "usable_context_evidence"
+                    ),
+                "has_current_task":
+                    report.get(
+                        "has_current_task"
+                    ),
+                "state_included":
+                    report.get(
+                        "state_included"
+                    ),
+                "trusted_fact_count":
+                    report.get(
+                        "trusted_fact_count"
+                    ),
+                "constraint_count":
+                    report.get(
+                        "constraint_count"
+                    ),
+                "decision_count":
+                    report.get(
+                        "decision_count"
+                    ),
+                "open_item_count":
+                    report.get(
+                        "open_item_count"
+                    ),
+                "plan_count":
+                    report.get(
+                        "plan_count"
+                    ),
+                "memory_count":
+                    report.get(
+                        "memory_count"
+                    ),
+                "recent_context_count":
+                    report.get(
+                        "recent_context_count"
+                    ),
+                "estimated_tokens":
+                    report.get(
+                        "estimated_tokens"
+                    ),
+                "token_budget":
+                    report.get(
+                        "token_budget"
+                    ),
             },
             ensure_ascii=False,
             separators=(",", ":"),

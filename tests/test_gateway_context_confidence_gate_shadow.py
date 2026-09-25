@@ -570,6 +570,12 @@ class ConfidenceGatePipelineTests(
                             CID,
                         "revision":
                             3,
+                        "source_revisions": {
+                            "conversation_candidate":
+                                2,
+                            "conversation_source":
+                                1,
+                        },
                         "sections": {
                             "secret":
                                 "context-secret",
@@ -579,13 +585,15 @@ class ConfidenceGatePipelineTests(
                                 True,
                             "has_current_task":
                                 True,
+                            "state_included":
+                                False,
                             "estimated_tokens":
                                 80,
                             "token_budget":
                                 1200,
                             "retrieval_quality": {
                                 "outcome":
-                                    "ok",
+                                    "included",
                             },
                         },
                     },
@@ -647,6 +655,206 @@ class ConfidenceGatePipelineTests(
                 " ",
                 "",
             ),
+        )
+
+    async def test_confidence_log_uses_explicit_allowlist(
+        self,
+    ):
+        # A report carrying unexpected extra fields must never leak
+        # them: the observer logs an explicit allowlist, never
+        # **report, and never conversation_id.
+        report = {
+            "version":
+                "context-confidence-gate.v1",
+            "mode":
+                "shadow_only",
+            "decision":
+                "deny_shadow",
+            "allowed":
+                False,
+            "reason":
+                "semantic_source_stale",
+            "reasons": [
+                "semantic_source_stale",
+            ],
+            "stored":
+                True,
+            "duplicate":
+                False,
+            "revision":
+                1,
+            "source_candidate_revision":
+                6,
+            "source_unified_revision":
+                3,
+            "current_user_excluded":
+                True,
+            "retrieval_observation_available":
+                True,
+            "retrieval_candidate_count":
+                3,
+            "usable_context_evidence":
+                True,
+            "has_current_task":
+                True,
+            "state_included":
+                False,
+            "trusted_fact_count":
+                1,
+            "constraint_count":
+                0,
+            "decision_count":
+                0,
+            "open_item_count":
+                0,
+            "plan_count":
+                0,
+            "memory_count":
+                0,
+            "recent_context_count":
+                0,
+            "estimated_tokens":
+                80,
+            "token_budget":
+                1200,
+            # These must never reach the log.
+            "conversation_id":
+                CID,
+            "dangerous_text":
+                "SECRET",
+            "query":
+                "secret-query",
+            "memory_text":
+                "secret-memory",
+            "current_user_text":
+                "secret-user",
+        }
+
+        with patch.dict(
+            os.environ,
+            {
+                **_ISOLATED_ENV,
+                _CONFIDENCE_ENV:
+                    "1",
+            },
+            clear=False,
+        ):
+            with patch.object(
+                coordinator,
+                "update_context_confidence_gate",
+                Mock(
+                    return_value=report
+                ),
+            ):
+                with self.assertLogs(
+                    "ombre_brain.gateway",
+                    level="INFO",
+                ) as captured:
+                    coordinator.observe_context_confidence(
+                        CID
+                    )
+
+        logged = "\n".join(
+            record.getMessage()
+            for record in captured.records
+        )
+
+        for secret in (
+            CID,
+            "SECRET",
+            "secret-query",
+            "secret-memory",
+            "secret-user",
+            "dangerous_text",
+        ):
+            with self.subTest(
+                secret=secret
+            ):
+                self.assertNotIn(
+                    secret,
+                    logged,
+                )
+
+        self.assertIn(
+            "[gateway.context_confidence_gate]",
+            logged,
+        )
+
+        self.assertIn(
+            '"decision":"deny_shadow"',
+            logged.replace(
+                " ",
+                "",
+            ),
+        )
+
+    async def test_confidence_deny_is_shadow_decision_only(
+        self,
+    ):
+        # The deny decision must never reach the live pipeline: the
+        # coordinator never passes a confidence result into the real
+        # injection selector and never uses it as a freshness
+        # condition.
+        body = b'{"messages":[]}'
+
+        deny = Mock(
+            return_value=_deny_report()
+        )
+
+        selector = Mock(
+            side_effect=AssertionError(
+                "confidence must not reach the selector"
+            )
+        )
+
+        with patch.dict(
+            os.environ,
+            {
+                **_ISOLATED_ENV,
+                _CONFIDENCE_ENV:
+                    "1",
+            },
+            clear=False,
+        ):
+            with patch.object(
+                coordinator,
+                "observe_context_sources",
+                Mock(return_value=CID),
+            ), patch.object(
+                coordinator,
+                "update_unified_context_candidate_from_runtime",
+                AsyncMock(
+                    return_value={
+                        "stored": True,
+                        "revision": 1,
+                    }
+                ),
+            ), patch.object(
+                coordinator,
+                "update_context_confidence_gate",
+                deny,
+            ), patch.object(
+                coordinator,
+                "select_context_injected_body",
+                selector,
+            ):
+                selected = await (
+                    coordinator.run_context_pipeline(
+                        body
+                    )
+                )
+
+        deny.assert_called_once_with(
+            CID
+        )
+
+        # Real injection stays OFF by default, so the selector is
+        # not called and the body is unchanged.
+        selector.assert_not_called()
+
+        self.assertIs(
+            selected,
+            body,
         )
 
 
