@@ -101,26 +101,46 @@ class ContextServiceCandidateTests(
             embedding_engine=None,
         )
 
-        service.retrieval.retrieve = (
+        # Internal contract: the live result and this request's
+        # observation travel together in the return value of
+        # retrieve_with_observation(), never via shared instance state.
+        service.retrieval.retrieve_with_observation = (
             AsyncMock(
-                return_value=[
+                return_value=(
+                    [
+                        {
+                            "id": "m1",
+                            "content":
+                                "memory",
+                            "context_relevance":
+                                0.9,
+                        }
+                    ],
                     {
-                        "id": "m1",
-                        "content":
-                            "memory",
-                        "context_relevance":
-                            0.9,
-                    }
-                ]
+                        "candidates": [
+                            {
+                                "id": "m1",
+                                "content": "memory",
+                                "metadata": {
+                                    "importance": 5,
+                                    "last_active":
+                                        "2026-01-01T00:00:00+00:00",
+                                },
+                            }
+                        ],
+                        "vector_scores": {
+                            "m1": 0.9,
+                        },
+                        "telemetry": {
+                            "candidate_count": 3,
+                            "relevance_rejected": 2,
+                            "anti_echo_candidates": 1,
+                            "dedup_candidates": 1,
+                        },
+                    },
+                )
             )
         )
-
-        service.retrieval.last_telemetry = {
-            "candidate_count": 3,
-            "relevance_rejected": 2,
-            "anti_echo_candidates": 1,
-            "dedup_candidates": 1,
-        }
 
         result = await service.get_candidates(
             query="current user query"
@@ -144,7 +164,7 @@ class ContextServiceCandidateTests(
             3,
         )
 
-        service.retrieval.retrieve.assert_awaited_once()
+        service.retrieval.retrieve_with_observation.assert_awaited_once()
 
 
 if __name__ == "__main__":

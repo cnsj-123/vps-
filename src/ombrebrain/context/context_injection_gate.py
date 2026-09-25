@@ -9,6 +9,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from ombrebrain.context.validators.freshness import (
+    validate_context_freshness,
+)
+
 
 _VERSION = "context-injection-gate.v1"
 _MODE = "shadow_only"
@@ -372,38 +376,97 @@ def evaluate_context_injection_gate(
     ):
         source_revisions = {}
 
-    if (
-        source_revisions.get(
-            "conversation_candidate"
+    # Shared freshness device: every revision edge in the chain is
+    # checked by the single validator, so a missing revision is
+    # reported as invalid (deny) rather than silently treated as
+    # "equal" when both sides are None.
+    candidate_freshness = (
+        validate_context_freshness(
+            checked_revision=(
+                source_revisions.get(
+                    "conversation_candidate"
+                )
+            ),
+            expected_revision=(
+                candidate_revision
+            ),
+            invalid_reason=(
+                "candidate_revision_invalid"
+            ),
+            mismatch_reason=(
+                "candidate_revision_mismatch"
+            ),
         )
-        != candidate_revision
-    ):
+    )
+
+    if not candidate_freshness["valid"]:
         reasons.append(
-            "candidate_revision_mismatch"
+            candidate_freshness["reason"]
         )
 
-    if (
-        source_revisions.get(
-            "conversation_source"
+    conversation_source_freshness = (
+        validate_context_freshness(
+            checked_revision=(
+                source_revisions.get(
+                    "conversation_source"
+                )
+            ),
+            expected_revision=(
+                candidate_source_revision
+            ),
+            invalid_reason=(
+                "conversation_source_revision_invalid"
+            ),
+            mismatch_reason=(
+                "conversation_source_revision_mismatch"
+            ),
         )
-        != candidate_source_revision
-    ):
+    )
+
+    if not conversation_source_freshness[
+        "valid"
+    ]:
         reasons.append(
-            "conversation_source_revision_mismatch"
+            conversation_source_freshness[
+                "reason"
+            ]
         )
 
-    if (
-        not isinstance(
+    preview_source_revision = (
+        preview.get(
+            "source_revision"
+        )
+        if isinstance(
             preview,
             dict,
         )
-        or preview.get(
-            "source_revision"
+        else None
+    )
+
+    preview_source_freshness = (
+        validate_context_freshness(
+            checked_revision=(
+                preview_source_revision
+            ),
+            expected_revision=(
+                unified_revision
+            ),
+            invalid_reason=(
+                "preview_source_revision_invalid"
+            ),
+            mismatch_reason=(
+                "preview_source_revision_mismatch"
+            ),
         )
-        != unified_revision
-    ):
+    )
+
+    if not preview_source_freshness[
+        "valid"
+    ]:
         reasons.append(
-            "preview_source_revision_mismatch"
+            preview_source_freshness[
+                "reason"
+            ]
         )
 
     # --------------------------------------------------

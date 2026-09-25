@@ -20,38 +20,13 @@ from ombrebrain.gateway import (
 
 from ombrebrain.gateway.cache_fingerprint import cache_fingerprint_summary_from_body
 from ombrebrain.gateway.response_usage import ResponseUsageObserver
-from ombrebrain.context.conversation_shadow import (
-    observe_conversation_shadow,
-)
-from ombrebrain.context.conversation_snapshot import (
-    update_conversation_snapshot,
-)
-from ombrebrain.context.conversation_compact import (
-    update_conversation_compact,
-)
-from ombrebrain.context.conversation_semantic import (
-    update_conversation_semantic,
-)
-from ombrebrain.context.conversation_semantic_state import (
-    update_semantic_state,
-)
-from ombrebrain.context.conversation_trusted_facts import (
-    update_conversation_trusted_facts,
-)
-from ombrebrain.context.conversation_context_candidate import (
-    update_conversation_context_candidate,
-)
-from ombrebrain.context.unified_context_candidate import (
-    update_unified_context_candidate_from_runtime,
-)
-from ombrebrain.context.context_injection_preview import (
-    update_context_injection_preview,
-)
-from ombrebrain.context.context_injection_gate import (
-    update_context_injection_gate,
-)
-from ombrebrain.context.context_request_mutation_shadow import (
-    build_context_request_mutation_shadow_from_runtime,
+
+# Context orchestration is owned by the coordinator, which also runs
+# the conversation observation stages (moved to
+# context_observation_pipeline). The gateway never imports or drives
+# an individual Context stage itself.
+from ombrebrain.context.context_pipeline_coordinator import (
+    run_context_pipeline,
 )
 from ombrebrain.context.context_real_injection import (
     select_context_injected_body,
@@ -403,6 +378,7 @@ def _observe_request(body: bytes, content_type: str) -> None:
 
 
 
+<<<<<<< HEAD
 def _observe_context_shadow(body: bytes) -> None:
     """
     Phase 4A shadow context pipeline.
@@ -1792,6 +1768,8 @@ def _select_context_real_injection(
 
 
 
+=======
+>>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
 def register(mcp) -> None:
 
     @mcp.custom_route(
@@ -1833,6 +1811,7 @@ def register(mcp) -> None:
 
         forward_body = _rewrite_upstream_body(body)
 
+<<<<<<< HEAD
         # Phase 4A-1: observation-only conversation continuity.
         # Important: observe the cache-stabilized body so the stable
         # boundary used for continuity matches what is actually sent upstream.
@@ -1873,6 +1852,19 @@ def register(mcp) -> None:
                 context_chain_fresh=
                     context_chain_fresh,
             )
+=======
+        # Context pipeline (default-OFF real injection).
+        # The coordinator owns the WHOLE chain -- conversation
+        # observation sources -> Unified -> Preview -> Gate ->
+        # freshness -> Mutation Shadow -> Real Injection -- and
+        # returns the body to forward. When the master flag is OFF,
+        # or on any deny / exception, it returns forward_body
+        # unchanged. The gateway forwards one body in and one body
+        # out; it never decides stage ordering, freshness or
+        # injection eligibility itself.
+        selected_body = await run_context_pipeline(
+            forward_body
+>>>>>>> afeeb42fd92abf51f6d9cdaa07170b34f12ff052
         )
 
         if _truthy(

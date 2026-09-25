@@ -16,3 +16,5 @@ buckets/
 .dashboard_auth.json
 .dashboard_sessions.json
 secrets/
+.uploads/
+.trae-html-share-packages/

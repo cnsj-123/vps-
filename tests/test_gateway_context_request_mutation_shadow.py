@@ -38,6 +38,13 @@ _SPEC.loader.exec_module(
     gateway
 )
 
+# The Context pipeline orchestration now lives in the context
+# coordinator; the gateway only calls into it. The observer under
+# test is resolved from the coordinator module.
+from ombrebrain.context import (
+    context_pipeline_coordinator as coordinator,
+)
+
 
 CID = "ctx_0123456789abcdef"
 BODY = b'{"messages":[]}'
@@ -83,12 +90,12 @@ class GatewayMutationShadowTests(
             clear=False,
         ):
             with patch.object(
-                gateway,
+                coordinator,
                 "build_context_request_mutation_shadow_from_runtime",
                 builder,
             ):
                 result = (
-                    gateway._observe_context_request_mutation_shadow(
+                    coordinator.observe_request_mutation(
                         CID,
                         BODY,
                     )
@@ -119,11 +126,11 @@ class GatewayMutationShadowTests(
             clear=False,
         ):
             with patch.object(
-                gateway,
+                coordinator,
                 "build_context_request_mutation_shadow_from_runtime",
                 builder,
             ):
-                gateway._observe_context_request_mutation_shadow(
+                coordinator.observe_request_mutation(
                     CID,
                     BODY,
                 )
@@ -150,12 +157,12 @@ class GatewayMutationShadowTests(
             clear=False,
         ):
             with patch.object(
-                gateway,
+                coordinator,
                 "build_context_request_mutation_shadow_from_runtime",
                 builder,
             ):
                 # Must not propagate.
-                gateway._observe_context_request_mutation_shadow(
+                coordinator.observe_request_mutation(
                     CID,
                     BODY,
                 )
