@@ -1895,6 +1895,402 @@ class ConfidenceGatePersistenceTests(
             "semantic_source_stale",
         )
 
+    def test_expected_unified_revision_is_required(
+        self,
+    ):
+        import os
+
+        from unittest.mock import patch
+
+        self._write(
+            "context_candidate",
+            candidate(),
+        )
+
+        self._write(
+            "unified_context_candidate",
+            unified(),
+        )
+
+        with patch.dict(
+            os.environ,
+            {
+                "OMBRE_CONTEXT_STATE_DIR":
+                    str(self.root),
+            },
+            clear=False,
+        ):
+            with self.assertRaises(
+                TypeError
+            ):
+                update_context_confidence_gate(
+                    CID
+                )
+
+    # --------------------------------------------------
+    # out-of-order completion / interleaving
+    # --------------------------------------------------
+
+    def test_out_of_order_observation_is_not_persisted(
+        self,
+    ):
+        # A newer observation (Unified source revision 4) is already
+        # persisted...
+        newer = unified()
+
+        newer["revision"] = 4
+
+        self._write(
+            "context_candidate",
+            candidate(),
+        )
+
+        self._write(
+            "unified_context_candidate",
+            newer,
+        )
+
+        first = self._update(
+            expected_unified_revision=4
+        )
+
+        self.assertIs(
+            first["stored"],
+            True,
+        )
+
+        self.assertEqual(
+            first["source_unified_revision"],
+            4,
+        )
+
+        self.assertEqual(
+            first["revision"],
+            1,
+        )
+
+        before = self._state_path().read_text(
+            encoding="utf-8"
+        )
+
+        # ...then a late observer still bound to revision 3 finishes.
+        older = unified()
+
+        older["revision"] = 3
+
+        self._write(
+            "unified_context_candidate",
+            older,
+        )
+
+        late = self._update(
+            expected_unified_revision=3
+        )
+
+        self.assertIs(
+            late["stored"],
+            False,
+        )
+
+        self.assertEqual(
+            late["decision"],
+            "deny_shadow",
+        )
+
+        self.assertEqual(
+            late["reason"],
+            "confidence_observation_out_of_order",
+        )
+
+        # The newer state is byte-for-byte untouched and its revision
+        # did not move.
+        self.assertEqual(
+            self._state_path().read_text(
+                encoding="utf-8"
+            ),
+            before,
+        )
+
+        persisted = json.loads(
+            before
+        )
+
+        self.assertEqual(
+            persisted["revision"],
+            1,
+        )
+
+        self.assertEqual(
+            persisted[
+                "source_unified_revision"
+            ],
+            4,
+        )
+
+    def test_unified_overwritten_after_evaluate_is_not_persisted(
+        self,
+    ):
+        import os
+
+        from unittest.mock import (
+            Mock,
+            patch,
+        )
+
+        from ombrebrain.context import (
+            context_confidence_gate as module,
+        )
+
+        self._write(
+            "context_candidate",
+            candidate(),
+        )
+
+        self._write(
+            "unified_context_candidate",
+            unified(),
+        )
+
+        real_evaluate = (
+            module.evaluate_context_confidence
+        )
+
+        def evaluate_then_overwrite(
+            **kwargs,
+        ):
+            result = real_evaluate(
+                **kwargs
+            )
+
+            # A concurrent request overwrites the disk Unified after
+            # this observation was evaluated but before it persists.
+            newer = unified()
+
+            newer["revision"] = 4
+
+            self._write(
+                "unified_context_candidate",
+                newer,
+            )
+
+            return result
+
+        with patch.dict(
+            os.environ,
+            {
+                "OMBRE_CONTEXT_STATE_DIR":
+                    str(self.root),
+            },
+            clear=False,
+        ):
+            with patch.object(
+                module,
+                "evaluate_context_confidence",
+                Mock(
+                    side_effect=
+                        evaluate_then_overwrite
+                ),
+            ):
+                report = (
+                    module
+                    .update_context_confidence_gate(
+                        CID,
+                        expected_unified_revision=3,
+                    )
+                )
+
+        self.assertIs(
+            report["stored"],
+            False,
+        )
+
+        self.assertEqual(
+            report["decision"],
+            "deny_shadow",
+        )
+
+        self.assertEqual(
+            report["reason"],
+            "confidence_unified_request_revision_mismatch",
+        )
+
+        self.assertFalse(
+            self._state_path().is_file()
+        )
+
+    def test_candidate_interleaving_is_not_persisted(
+        self,
+    ):
+        # A valid decision is persisted first...
+        self._write(
+            "context_candidate",
+            candidate(),
+        )
+
+        self._write(
+            "unified_context_candidate",
+            unified(),
+        )
+
+        first = self._update(
+            expected_unified_revision=3
+        )
+
+        self.assertIs(
+            first["stored"],
+            True,
+        )
+
+        before = self._state_path().read_text(
+            encoding="utf-8"
+        )
+
+        # ...then another request advances the Candidate while the
+        # Unified file still references the previous Candidate
+        # revision.
+        self._write(
+            "context_candidate",
+            {
+                **candidate(),
+                "revision":
+                    7,
+            },
+        )
+
+        report = self._update(
+            expected_unified_revision=3
+        )
+
+        self.assertIs(
+            report["stored"],
+            False,
+        )
+
+        self.assertEqual(
+            report["decision"],
+            "deny_shadow",
+        )
+
+        self.assertEqual(
+            report["reason"],
+            "unified_source_candidate_revision_mismatch",
+        )
+
+        self.assertIn(
+            "unified_source_candidate_revision_mismatch",
+            report["reasons"],
+        )
+
+        # A source-chain interrupted observation never touches state.
+        self.assertEqual(
+            self._state_path().read_text(
+                encoding="utf-8"
+            ),
+            before,
+        )
+
+    def test_source_conversation_mismatch_is_not_persisted(
+        self,
+    ):
+        self._write(
+            "context_candidate",
+            candidate(),
+        )
+
+        self._write(
+            "unified_context_candidate",
+            unified(),
+        )
+
+        first = self._update(
+            expected_unified_revision=3
+        )
+
+        self.assertIs(
+            first["stored"],
+            True,
+        )
+
+        before = self._state_path().read_text(
+            encoding="utf-8"
+        )
+
+        broken = unified()
+
+        broken["source_revisions"] = {
+            "conversation_candidate":
+                6,
+            "conversation_source":
+                9,
+        }
+
+        self._write(
+            "unified_context_candidate",
+            broken,
+        )
+
+        report = self._update(
+            expected_unified_revision=3
+        )
+
+        self.assertIs(
+            report["stored"],
+            False,
+        )
+
+        self.assertEqual(
+            report["reason"],
+            "unified_source_conversation_revision_mismatch",
+        )
+
+        self.assertEqual(
+            self._state_path().read_text(
+                encoding="utf-8"
+            ),
+            before,
+        )
+
+    def test_evidence_deny_is_still_persisted(
+        self,
+    ):
+        # An evidence-quality deny is still a normal shadow decision
+        # and must keep being persisted (only structural / out-of-order
+        # observations are rejected).
+        self._write(
+            "context_candidate",
+            candidate(
+                semantic_source_stale=True
+            ),
+        )
+
+        self._write(
+            "unified_context_candidate",
+            unified(),
+        )
+
+        report = self._update(
+            expected_unified_revision=3
+        )
+
+        self.assertIs(
+            report["stored"],
+            True,
+        )
+
+        self.assertEqual(
+            report["decision"],
+            "deny_shadow",
+        )
+
+        self.assertEqual(
+            report["reason"],
+            "semantic_source_stale",
+        )
+
+        self.assertTrue(
+            self._state_path().is_file()
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

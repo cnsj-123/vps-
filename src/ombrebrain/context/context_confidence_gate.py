@@ -115,6 +115,24 @@ _KNOWN_RETRIEVAL_OUTCOMES = frozenset(
     )
 )
 
+# Reasons that mean the observation itself is structurally broken or
+# was interrupted by a concurrent request (revision / source-chain),
+# not "the evidence is consistent but not trustworthy enough".
+# These are reported as deny_shadow but are NEVER persisted: they are
+# not valid evidence decisions. Every other deny reason (staleness,
+# current_user_not_excluded, malformed telemetry, ...) is a normal
+# shadow decision and keeps being persisted.
+_NON_PERSISTABLE_REASONS = frozenset(
+    (
+        "invalid_candidate_revision",
+        "invalid_candidate_source_revision",
+        "invalid_unified_revision",
+        "invalid_unified_source_revisions",
+        "unified_source_candidate_revision_mismatch",
+        "unified_source_conversation_revision_mismatch",
+    )
+)
+
 
 def _root() -> Path:
     return Path(
@@ -893,20 +911,38 @@ def evaluate_context_confidence(
 def update_context_confidence_gate(
     conversation_id: str,
     *,
-    expected_unified_revision: Any = None,
+    expected_unified_revision: Any,
 ) -> dict[str, Any]:
     """Evaluate and persist a privacy-safe confidence shadow report.
 
-    Per-request binding: the caller must pass the Unified revision
-    THIS request just produced. The persisted Unified file is read
-    first and its revision must equal ``expected_unified_revision``;
-    otherwise a concurrent request has already overwritten it and the
-    observation belongs to someone else.
+    Per-request binding: ``expected_unified_revision`` is a required
+    keyword-only argument -- the Unified revision THIS request just
+    produced. It is intentionally required, not defaulted, so a new
+    caller that forgets to bind the request fails immediately instead
+    of silently producing an invalid report. The runtime still
+    revalidates it with is_valid_revision(): a type hint is not a
+    security boundary.
 
-    A cross-request mismatch / malformed revision is NOT a valid
-    evidence decision: it is reported with ``stored=False`` and is
-    never written to the confidence_gate state. It also never raises,
-    so the caller stays fail-open.
+    The persisted Unified file is read first and its revision must
+    equal ``expected_unified_revision``; otherwise a concurrent
+    request has already overwritten it and the observation belongs to
+    someone else.
+
+    Three concurrency guards are enforced:
+      1. pre-evaluation: observed Unified revision must equal the
+         expected revision;
+      2. pre-persistence (inside the lock): the Unified revision is
+         re-read and re-checked to shrink the evaluate -> persist
+         TOCTOU window;
+      3. monotonic source revision: an observation whose Unified
+         source revision is older than the already persisted
+         Confidence state can never overwrite the newer one.
+
+    Out-of-order / structural observations are reported with
+    ``stored=False`` and are never written to the confidence_gate
+    state. Normal evidence-quality denies (staleness, current user
+    not excluded, malformed telemetry, ...) keep being persisted.
+    Nothing here ever raises, so the caller stays fail-open.
 
     Read-only over the existing Context state. The persisted file
     follows the same directory / atomic-write / monotonic revision
@@ -1066,6 +1102,55 @@ def update_context_confidence_gate(
         )
     )
 
+    # A structural / source-chain problem means the observation was
+    # interrupted by a concurrent request (or the evidence itself is
+    # malformed). It stays a deny_shadow, but it is not a valid
+    # evidence decision, so it is never persisted.
+    structural_reason = next(
+        (
+            reason
+            for reason in (
+                result.get("reasons") or ()
+            )
+            if reason
+            in _NON_PERSISTABLE_REASONS
+        ),
+        None,
+    )
+
+    if structural_reason is not None:
+        return {
+            "stored":
+                False,
+            "mode":
+                _MODE,
+            "decision":
+                "deny_shadow",
+            "allowed":
+                False,
+            "reason":
+                structural_reason,
+            "reasons":
+                list(
+                    result.get("reasons")
+                    or ()
+                ),
+            "source_candidate_revision":
+                result.get(
+                    "source_candidate_revision"
+                ),
+            "source_unified_revision":
+                result.get(
+                    "source_unified_revision"
+                ),
+            "expected_unified_revision":
+                expected_unified_revision,
+            "observed_unified_revision":
+                observed_unified_revision,
+            "conversation_id":
+                conversation_id,
+        }
+
     gate_path = _path(
         "confidence_gate",
         conversation_id,
@@ -1075,6 +1160,131 @@ def update_context_confidence_gate(
         previous = _read_json(
             gate_path
         )
+
+        # Monotonic guard: an older observation must never overwrite a
+        # newer one, even though the Confidence revision counter would
+        # simply increment.
+        previous_source_revision = (
+            previous.get(
+                "source_unified_revision"
+            )
+            if isinstance(
+                previous,
+                dict,
+            )
+            else None
+        )
+
+        result_source_revision = (
+            result.get(
+                "source_unified_revision"
+            )
+        )
+
+        if (
+            is_valid_revision(
+                previous_source_revision
+            )
+            and is_valid_revision(
+                result_source_revision
+            )
+            and previous_source_revision
+            > result_source_revision
+        ):
+            return {
+                "stored":
+                    False,
+                "mode":
+                    _MODE,
+                "decision":
+                    "deny_shadow",
+                "allowed":
+                    False,
+                "reason":
+                    "confidence_observation_out_of_order",
+                "reasons": [
+                    "confidence_observation_out_of_order",
+                ],
+                "source_candidate_revision":
+                    result.get(
+                        "source_candidate_revision"
+                    ),
+                "source_unified_revision":
+                    result_source_revision,
+                "expected_unified_revision":
+                    expected_unified_revision,
+                "observed_unified_revision":
+                    observed_unified_revision,
+                "conversation_id":
+                    conversation_id,
+            }
+
+        # Re-read the Unified revision right before persisting. If it
+        # moved between evaluate and persist, this observation is
+        # stale. Unified and Confidence do not share a lock, so this
+        # only narrows the window -- the monotonic guard above is the
+        # second layer.
+        current_unified = _read_json(
+            _path(
+                "unified_context_candidate",
+                conversation_id,
+            )
+        )
+
+        current_unified_revision = (
+            current_unified.get(
+                "revision"
+            )
+            if isinstance(
+                current_unified,
+                dict,
+            )
+            else None
+        )
+
+        recheck_freshness = (
+            validate_context_freshness(
+                checked_revision=
+                    current_unified_revision,
+                expected_revision=
+                    expected_unified_revision,
+                invalid_reason=(
+                    "invalid_observed_unified_revision"
+                ),
+                mismatch_reason=(
+                    "confidence_unified_request_revision_mismatch"
+                ),
+            )
+        )
+
+        if not recheck_freshness["valid"]:
+            return {
+                "stored":
+                    False,
+                "mode":
+                    _MODE,
+                "decision":
+                    "deny_shadow",
+                "allowed":
+                    False,
+                "reason":
+                    recheck_freshness["reason"],
+                "reasons": [
+                    recheck_freshness["reason"],
+                ],
+                "source_candidate_revision":
+                    result.get(
+                        "source_candidate_revision"
+                    ),
+                "source_unified_revision":
+                    result_source_revision,
+                "expected_unified_revision":
+                    expected_unified_revision,
+                "observed_unified_revision":
+                    current_unified_revision,
+                "conversation_id":
+                    conversation_id,
+            }
 
         if (
             isinstance(

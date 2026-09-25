@@ -75,7 +75,7 @@ def _truthy(value) -> bool:
 def observe_context_confidence(
     conversation_id: str | None,
     *,
-    expected_unified_revision: Any = None,
+    expected_unified_revision: Any,
 ) -> None:
     """Observe only whether existing Context evidence is trustworthy.
 

@@ -1115,6 +1115,244 @@ class ConfidenceGatePipelineTests(
             selected_without,
         )
 
+    async def _run_with_real_mutation_shadow(
+        self,
+        body,
+        *,
+        confidence_on,
+    ):
+        """Run the pipeline with the REAL observe_request_mutation.
+
+        Only the bottom-most mutation shadow builder is mocked, so the
+        real mutation stage (flag, guards, ordering) still executes.
+        """
+
+        selected_body = body + b" "
+
+        applied = {
+            "version":
+                "context-real-injection.v1",
+            "enabled":
+                True,
+            "applied":
+                True,
+            "reason":
+                "injection_applied",
+            "conversation_id":
+                CID,
+            "original_sha256":
+                hashlib.sha256(
+                    body
+                ).hexdigest(),
+            "selected_sha256":
+                hashlib.sha256(
+                    selected_body
+                ).hexdigest(),
+        }
+
+        mutation_calls: list = []
+        selector_freshness: list = []
+
+        real_select = (
+            coordinator.select_real_injection
+        )
+
+        def builder_impl(
+            forward_body,
+            *,
+            conversation_id=None,
+        ):
+            mutation_calls.append(
+                conversation_id
+            )
+
+            return (
+                body,
+                {
+                    "version":
+                        "context-request-mutation-shadow.v1",
+                    "mode":
+                        "shadow_only",
+                    "built":
+                        True,
+                    "safe_to_mutate":
+                        True,
+                    "would_inject":
+                        True,
+                    "upstream_mutated":
+                        False,
+                    "reason":
+                        "shadow_mutation_safe",
+                },
+            )
+
+        def selector_impl(
+            conversation_id,
+            forward_body,
+            *,
+            context_chain_fresh,
+        ):
+            selector_freshness.append(
+                context_chain_fresh
+            )
+
+            return real_select(
+                conversation_id,
+                forward_body,
+                context_chain_fresh=
+                    context_chain_fresh,
+            )
+
+        environ = {
+            **_ISOLATED_ENV,
+            "OMBRE_GATEWAY_CONTEXT_REAL_INJECTION":
+                "1",
+            "OMBRE_GATEWAY_CONTEXT_REQUEST_MUTATION_SHADOW":
+                "1",
+            _CONFIDENCE_ENV:
+                "1" if confidence_on else "0",
+        }
+
+        with patch.dict(
+            os.environ,
+            environ,
+            clear=False,
+        ):
+            with patch.object(
+                coordinator,
+                "observe_context_sources",
+                Mock(return_value=CID),
+            ), patch.object(
+                coordinator,
+                "update_unified_context_candidate_from_runtime",
+                AsyncMock(
+                    return_value={
+                        "stored": True,
+                        "revision": 5,
+                    }
+                ),
+            ), patch.object(
+                coordinator,
+                "update_context_injection_preview",
+                Mock(
+                    return_value={
+                        "stored": True,
+                        "revision": 1,
+                        "source_revision": 5,
+                    }
+                ),
+            ), patch.object(
+                coordinator,
+                "update_context_injection_gate",
+                Mock(
+                    return_value={
+                        "stored": True,
+                        "revision": 1,
+                        "decision":
+                            "allow_shadow",
+                        "allowed": True,
+                    }
+                ),
+            ), patch.object(
+                coordinator,
+                "update_context_confidence_gate",
+                Mock(
+                    return_value=_deny_report()
+                ),
+            ), patch.object(
+                coordinator,
+                "build_context_request_mutation_shadow_from_runtime",
+                Mock(side_effect=builder_impl),
+            ), patch.object(
+                coordinator,
+                "select_real_injection",
+                Mock(side_effect=selector_impl),
+            ), patch.object(
+                coordinator,
+                "select_context_injected_body",
+                Mock(
+                    return_value=(
+                        selected_body,
+                        applied,
+                    )
+                ),
+            ):
+                selected = await (
+                    coordinator.run_context_pipeline(
+                        body
+                    )
+                )
+
+        return (
+            selected,
+            mutation_calls,
+            selector_freshness,
+        )
+
+    async def test_real_mutation_shadow_runs_under_confidence_deny(
+        self,
+    ):
+        # Stronger proof than the mocked-mutation test: the REAL
+        # observe_request_mutation runs (its flag is ON, only the
+        # bottom-most builder is mocked), so a Confidence deny cannot
+        # be skipping Mutation by any indirect path.
+        body = b'{"messages":[{"role":"user","content":"hi"}]}'
+
+        (
+            selected_with,
+            mutation_with,
+            freshness_with,
+        ) = await (
+            self._run_with_real_mutation_shadow(
+                body,
+                confidence_on=True,
+            )
+        )
+
+        (
+            selected_without,
+            mutation_without,
+            freshness_without,
+        ) = await (
+            self._run_with_real_mutation_shadow(
+                body,
+                confidence_on=False,
+            )
+        )
+
+        # The mutation shadow builder really ran in both runs...
+        self.assertEqual(
+            mutation_with,
+            [CID],
+        )
+
+        self.assertEqual(
+            mutation_without,
+            [CID],
+        )
+
+        # ...the Real Injection selector still saw a fresh chain...
+        self.assertEqual(
+            freshness_with,
+            [True],
+        )
+
+        self.assertEqual(
+            freshness_without,
+            [True],
+        )
+
+        # ...and the injected body is unchanged by Confidence.
+        self.assertNotEqual(
+            selected_with,
+            body,
+        )
+
+        self.assertEqual(
+            selected_with,
+            selected_without,
+        )
+
 
 class ConfidenceGateGatewayThinnessTests(
     unittest.TestCase,
