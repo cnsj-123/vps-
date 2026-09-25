@@ -211,3 +211,24 @@ class RetrievalCandidate:
                 payload.get("metadata")
             ),
         )
+
+
+def normalize_candidate(
+    value: Any,
+) -> RetrievalCandidate:
+    """Convert one old-retrieval result into a candidate.
+
+    Pure and total: never raises, never ranks, never
+    filters, never selects. An already-normalized
+    candidate is returned unchanged.
+    """
+
+    if isinstance(
+        value,
+        RetrievalCandidate,
+    ):
+        return value
+
+    return RetrievalCandidate.from_bucket(
+        value
+    )

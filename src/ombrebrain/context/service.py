@@ -3,6 +3,9 @@ from typing import Any
 from ombrebrain.context.pack import ContextPack, ContextPackBuilder
 from ombrebrain.state.service import StateService
 from ombrebrain.context.retrieval import ContextRetrievalAdapter
+from ombrebrain.context.retrieval.quality import (
+    RetrievalQualityShadow,
+)
 
 class ContextService:
     def __init__(
@@ -16,6 +19,39 @@ class ContextService:
         self.bucket_mgr = bucket_mgr
         self.builder = ContextPackBuilder(token_budget=token_budget)
         self.retrieval = ContextRetrievalAdapter(bucket_mgr=bucket_mgr, embedding_engine=embedding_engine)
+        # Retrieval v2 shadow pipeline. Observation-only: it
+        # never changes the retrieval result returned below.
+        self.retrieval_shadow_v2 = RetrievalQualityShadow()
+
+    def _observe_retrieval_shadow_v2(
+        self,
+        memories: list[Any],
+    ) -> dict[str, Any]:
+        """Run the Retrieval v2 shadow next to the old result.
+
+        Fail-open: any error degrades to a neutral event and
+        never affects the real retrieval result.
+        """
+
+        try:
+            event = (
+                self.retrieval_shadow_v2
+                .observe(memories)
+            )
+        except Exception:
+            return (
+                RetrievalQualityShadow
+                .observe_failed()
+            )
+
+        try:
+            self.retrieval_shadow_v2.emit(
+                event
+            )
+        except Exception:
+            pass
+
+        return event
 
     async def get_candidates(
         self,
@@ -83,6 +119,9 @@ class ContextService:
                 "would_keep_missing_last_active":
                     0,
             },
+            # Retrieval v2 shadow event. Empty when no query
+            # was run, so the telemetry shape stays stable.
+            "retrieval_quality_v2": {},
             "outcome": "empty_query",
         }
         anti_echo: dict[str, int] = {}
@@ -103,6 +142,14 @@ class ContextService:
             memories = await self.retrieval.retrieve(
                 query,
                 max_results=self.builder.max_memories,
+            )
+
+            # Retrieval v2 shadow. Runs next to the old result
+            # above; the returned memories are never modified.
+            retrieval_quality_v2 = (
+                self._observe_retrieval_shadow_v2(
+                    memories
+                )
             )
 
             telemetry = (
@@ -201,15 +248,10 @@ class ContextService:
                         )
                         or {}
                     ),
-                # Retrieval v2 shadow report (counts and
-                # score statistics only, never text or ids).
+                # Retrieval v2 shadow event (counts and score
+                # statistics only, never text, ids or query).
                 "retrieval_quality_v2":
-                    dict(
-                        telemetry.get(
-                            "retrieval_quality_v2"
-                        )
-                        or {}
-                    ),
+                    retrieval_quality_v2,
                 "outcome":
                     str(
                         telemetry.get(

@@ -10,11 +10,13 @@ from datetime import (
 from unittest.mock import AsyncMock
 
 from ombrebrain.context.retrieval import (
-    ContextRetrievalAdapter,
     RetrievalQualityShadow,
 )
 from ombrebrain.context.retrieval.quality import (
     LOG_TAG,
+)
+from ombrebrain.context.service import (
+    ContextService,
 )
 
 
@@ -469,134 +471,141 @@ class PrivacyTests(
         )
 
 
-class LegacyHookTests(
+class FakeEngine:
+    enabled = True
+
+    def __init__(self, pairs):
+        self.pairs = pairs
+
+    async def search_similar_strict(
+        self,
+        query,
+        top_k,
+    ):
+        return list(self.pairs)
+
+
+class FakeState:
+    def to_dict(self):
+        return {}
+
+
+class FakeStateService:
+    def get(self):
+        return FakeState(), 1
+
+
+def build_service(
+    matches,
+    pairs,
+):
+    """ContextService with a stubbed old-retrieval stack."""
+
+    bucket_mgr = AsyncMock()
+    bucket_mgr.list_all.return_value = []
+    bucket_mgr.search.return_value = list(
+        matches
+    )
+    bucket_mgr.embedding_engine = (
+        FakeEngine(pairs)
+    )
+
+    return ContextService(
+        state_service=FakeStateService(),
+        bucket_mgr=bucket_mgr,
+    )
+
+
+class ServiceHookTests(
     unittest.IsolatedAsyncioTestCase
 ):
-    """The shadow runs next to the old retrieval."""
+    """The shadow runs at the service layer, next to old retrieval.
 
-    class FakeEngine:
-        enabled = True
+    The integration point is ContextService.get_candidates():
+    old retrieval runs first, the shadow observes its result and
+    the returned result is never modified.
+    """
 
-        def __init__(
-            self,
-            pairs,
-        ):
-            self.pairs = pairs
-
-        async def search_similar_strict(
-            self,
-            query,
-            top_k,
-        ):
-            return list(self.pairs)
-
-    async def test_adapter_reports_quality_v2(
+    async def test_service_reports_quality_v2(
         self,
     ):
-        bucket_mgr = AsyncMock()
-
-        bucket_mgr.search.return_value = [
-            bucket(
-                "stale",
-                relevance=0.66,
-                hours_old=2000,
-            ),
-            bucket(
-                "fresh",
-                relevance=0.90,
-                hours_old=0,
-            ),
-        ]
-
-        adapter = ContextRetrievalAdapter(
-            bucket_mgr=bucket_mgr,
-            embedding_engine=(
-                self.FakeEngine(
-                    [
-                        (
-                            "stale",
-                            0.66,
-                        ),
-                        (
-                            "fresh",
-                            0.90,
-                        ),
-                    ]
-                )
-            ),
+        service = build_service(
+            matches=[
+                bucket(
+                    "stale",
+                    relevance=0.66,
+                    hours_old=2000,
+                ),
+                bucket(
+                    "fresh",
+                    relevance=0.90,
+                    hours_old=0,
+                ),
+            ],
+            pairs=[
+                ("stale", 0.66),
+                ("fresh", 0.90),
+            ],
         )
 
-        result = await adapter.retrieve(
+        result = await service.get_candidates(
             "secret-query"
         )
 
-        # Old retrieval result is untouched.
+        # Old retrieval result and its order are untouched.
         self.assertEqual(
-            len(result),
-            2,
-        )
-        self.assertEqual(
-            result[0]["id"],
-            "stale",
+            [
+                item["id"]
+                for item in result[
+                    "memories"
+                ]
+            ],
+            ["stale", "fresh"],
         )
 
-        # Shadow report is attached to telemetry.
-        report = adapter.last_telemetry[
+        event = result["telemetry"][
+            "retrieval_quality"
+        ][
             "retrieval_quality_v2"
         ]
 
         self.assertTrue(
-            report["shadow_only"]
+            event["shadow_only"]
         )
         self.assertEqual(
-            report["candidate_count"],
+            event["candidate_count"],
             2,
         )
 
-    async def test_adapter_emits_gateway_log(
+    async def test_service_emits_gateway_log(
         self,
     ):
-        bucket_mgr = AsyncMock()
-
-        bucket_mgr.search.return_value = [
-            bucket(
-                "fresh",
-                relevance=0.90,
-                hours_old=0,
-            ),
-        ]
-
-        adapter = ContextRetrievalAdapter(
-            bucket_mgr=bucket_mgr,
-            embedding_engine=(
-                self.FakeEngine(
-                    [
-                        (
-                            "fresh",
-                            0.90,
-                        )
-                    ]
+        service = build_service(
+            matches=[
+                bucket(
+                    "fresh",
+                    relevance=0.90,
+                    hours_old=0,
                 )
-            ),
+            ],
+            pairs=[("fresh", 0.90)],
         )
 
         with self.assertLogs(
             "ombre_brain.gateway",
             level="INFO",
         ) as captured:
-            await adapter.retrieve(
+            await service.get_candidates(
                 "secret-query"
             )
 
         logged = "\n".join(
             record.getMessage()
-            for record in (
-                captured.records
-            )
+            for record in captured.records
         )
 
         self.assertIn(
-            "[gateway.retrieval_quality_v2]",
+            LOG_TAG,
             logged,
         )
         self.assertNotIn(
@@ -608,26 +617,37 @@ class LegacyHookTests(
             logged,
         )
 
+    async def test_empty_query_has_no_shadow_event(
+        self,
+    ):
+        service = build_service(
+            matches=[],
+            pairs=[],
+        )
+
+        result = await service.get_candidates("")
+
+        self.assertEqual(
+            result["telemetry"][
+                "retrieval_quality"
+            ][
+                "retrieval_quality_v2"
+            ],
+            {},
+        )
+
     async def test_shadow_failure_is_fail_open(
         self,
     ):
-        bucket_mgr = AsyncMock()
-
-        bucket_mgr.search.return_value = [
-            bucket(
-                "ok",
-                relevance=0.9,
-                hours_old=0,
-            ),
-        ]
-
-        adapter = ContextRetrievalAdapter(
-            bucket_mgr=bucket_mgr,
-            embedding_engine=(
-                self.FakeEngine(
-                    [("ok", 0.9)]
+        service = build_service(
+            matches=[
+                bucket(
+                    "ok",
+                    relevance=0.9,
+                    hours_old=0,
                 )
-            ),
+            ],
+            pairs=[("ok", 0.9)],
         )
 
         def explode(items, **kwargs):
@@ -635,29 +655,31 @@ class LegacyHookTests(
                 "synthetic shadow failure"
             )
 
-        adapter.quality_v2_shadow.observe = (
+        service.retrieval_shadow_v2.observe = (
             explode
         )
 
-        # Old retrieval still succeeds.
-        result = await adapter.retrieve(
+        # Old retrieval still succeeds and returns its result.
+        result = await service.get_candidates(
             "q"
         )
 
         self.assertEqual(
-            len(result),
+            len(result["memories"]),
             1,
         )
 
-        report = adapter.last_telemetry[
+        event = result["telemetry"][
+            "retrieval_quality"
+        ][
             "retrieval_quality_v2"
         ]
 
         self.assertTrue(
-            report["shadow_only"]
+            event["shadow_only"]
         )
         self.assertEqual(
-            report["reason"],
+            event["reason"],
             "observe_failed",
         )
 

@@ -3,9 +3,9 @@ from __future__ import annotations
 # Context-layer Retrieval v2 shadow pipeline.
 #
 # Package layout:
-#   candidate.py - normalized RetrievalCandidate
-#   scorer.py    - configurable shadow scoring
-#   reranker.py  - shadow reorder (top_k / threshold)
+#   candidate.py - RetrievalCandidate + normalize_candidate()
+#   scorer.py    - score_candidate() (fixed weight formula)
+#   reranker.py  - rerank_candidates()
 #   quality.py   - privacy-safe [gateway.retrieval_quality_v2]
 #   legacy.py    - the original ContextRetrievalAdapter
 #
@@ -17,20 +17,26 @@ from __future__ import annotations
 #       ContextRetrievalAdapter,
 #   )
 # keeps working unchanged.
+#
+# Nothing in this package changes the real retrieval result:
+# it is a shadow-only pipeline observed at the service layer.
 
 from ombrebrain.context.retrieval.candidate import (
     RetrievalCandidate,
+    normalize_candidate,
 )
 from ombrebrain.context.retrieval.quality import (
     RetrievalQualityShadow,
 )
 from ombrebrain.context.retrieval.reranker import (
     RetrievalReranker,
+    rerank_candidates,
 )
 from ombrebrain.context.retrieval.scorer import (
     RetrievalScorer,
     RetrievalScorerWeights,
     RetrievalScoringContext,
+    score_candidate,
 )
 
 # Backward-compatible re-export. Import after the new modules
@@ -48,4 +54,7 @@ __all__ = [
     "RetrievalScorer",
     "RetrievalScorerWeights",
     "RetrievalScoringContext",
+    "normalize_candidate",
+    "rerank_candidates",
+    "score_candidate",
 ]

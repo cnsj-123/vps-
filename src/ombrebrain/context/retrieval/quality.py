@@ -7,14 +7,23 @@ from typing import Any, Iterable
 
 from ombrebrain.context.retrieval.candidate import (
     RetrievalCandidate,
+    normalize_candidate,
 )
 from ombrebrain.context.retrieval.reranker import (
     RetrievalReranker,
+    rerank_candidates,
 )
 from ombrebrain.context.retrieval.scorer import (
     RetrievalScorer,
     RetrievalScoringContext,
 )
+
+# Retrieval v2 quality shadow.
+#
+# Statistics only. This module never participates in
+# selection: it observes the old retrieval result, runs the
+# shadow score + rerank next to it and reports what WOULD
+# change. The real result is returned untouched.
 
 _VERSION = "retrieval-quality-shadow.v1"
 _MODE = "shadow_only"
@@ -22,8 +31,7 @@ _MODE = "shadow_only"
 LOG_TAG = "[gateway.retrieval_quality_v2]"
 
 # Same logging channel as the other gateway.* shadow tags so
-# operators collect them uniformly. The gateway module itself
-# stays untouched.
+# operators collect them uniformly.
 _logger = logging.getLogger(
     "ombre_brain.gateway"
 )
@@ -37,6 +45,19 @@ _SCORE_BUCKET_LABELS = tuple(
     f"{i * _SCORE_BUCKET_WIDTH:.1f}"
     f"-{(i + 1) * _SCORE_BUCKET_WIDTH:.1f}"
     for i in range(_SCORE_BUCKET_COUNT)
+)
+
+# Canonical fields of a privacy-safe quality event.
+# Exported so tests can assert the contract without
+# duplicating the list.
+PRIVACY_SAFE_FIELDS = (
+    "candidate_count",
+    "selected_count",
+    "top_score",
+    "average_score",
+    "score_distribution",
+    "would_change",
+    "shadow_only",
 )
 
 
@@ -86,21 +107,17 @@ def _round4(value: float) -> float:
 
 
 class RetrievalQualityShadow:
-    """Retrieval v2 shadow observer.
+    """Shadow statistics observer for the new retrieval path.
 
-    Runs the new score + rerank pipeline next to the old
-    retrieval result and reports what WOULD change.
-
-    Privacy contract — the report and the log line never
-    contain: the query, memory content, conversation_id
-    or bucket_id. Only counts, score statistics and the
-    shadow decision.
+    Privacy contract — neither the report nor the log line
+    ever contains: query, memory content, conversation_id or
+    bucket_id. Only counts, score statistics and the shadow
+    decision leave this module.
     """
 
     def __init__(
         self,
-        scorer: RetrievalScorer
-        | None = None,
+        scorer: Any = None,
         reranker: RetrievalReranker
         | None = None,
     ):
@@ -120,26 +137,15 @@ class RetrievalQualityShadow:
         *,
         now: datetime | None = None,
     ) -> dict[str, Any]:
-        """Compare old retrieval output with the shadow rerank.
+        """Compare the old retrieval output with the shadow rerank.
 
         ``old_candidates`` are the raw result dicts produced by
-        the existing retrieval path (with context_relevance).
+        the existing retrieval path. They are never modified.
         """
 
         old_normalized = [
-            candidate
-            for candidate in (
-                RetrievalCandidate.from_bucket(
-                    item
-                )
-                if not isinstance(
-                    item,
-                    RetrievalCandidate,
-                )
-                else item
-                for item in old_candidates
-                or []
-            )
+            normalize_candidate(item)
+            for item in old_candidates or []
         ]
 
         context = RetrievalScoringContext(
@@ -149,15 +155,12 @@ class RetrievalQualityShadow:
                     timezone.utc
                 )
             ),
-            max_semantic_score=(
-                max(
-                    (
-                        candidate
-                        .semantic_score
-                        for candidate in old_normalized
-                    ),
-                    default=0.0,
-                )
+            max_semantic_score=max(
+                (
+                    candidate.semantic_score
+                    for candidate in old_normalized
+                ),
+                default=0.0,
             ),
         )
 
@@ -171,8 +174,8 @@ class RetrievalQualityShadow:
             for _candidate, score in scored
         ]
 
-        # Identity comparison stays internal: ids are used
-        # only to compute the delta counts below.
+        # Identity is used only to compute the delta counts
+        # below; ids never leave this method.
         old_order = [
             candidate.id
             for candidate in old_normalized
@@ -183,20 +186,13 @@ class RetrievalQualityShadow:
             for candidate, _score in scored
         ]
 
-        would_change = (
-            old_order != new_order
-        )
-
-        return {
+        event = {
             "version": _VERSION,
             "mode": _MODE,
             "candidate_count": len(
                 old_normalized
             ),
             "selected_count": len(new_order),
-            "score_distribution": (
-                _distribution(scores)
-            ),
             "top_score": (
                 _round4(max(scores))
                 if scores
@@ -204,27 +200,34 @@ class RetrievalQualityShadow:
             ),
             "average_score": (
                 _round4(
-                    sum(scores)
-                    / len(scores)
+                    sum(scores) / len(scores)
                 )
                 if scores
                 else None
             ),
-            "would_change": would_change,
-            "shadow_only": True,
-            "selection_delta": (
-                _selection_delta(
-                    old_order,
-                    new_order,
-                )
+            "score_distribution": (
+                _distribution(scores)
             ),
+            "would_change": (
+                old_order != new_order
+            ),
+            "shadow_only": True,
         }
+
+        event["selection_delta"] = (
+            _selection_delta(
+                old_order,
+                new_order,
+            )
+        )
+
+        return event
 
     def emit(
         self,
         report: dict[str, Any],
     ) -> None:
-        """Log one privacy-safe shadow report."""
+        """Log one privacy-safe shadow event."""
 
         _logger.info(
             "%s %s",
@@ -236,12 +239,28 @@ class RetrievalQualityShadow:
             ),
         )
 
+    @staticmethod
+    def reranked(
+        old_candidates: Iterable[Any],
+        *,
+        top_k: int | None = None,
+    ) -> list[RetrievalCandidate]:
+        """The candidate list the shadow WOULD produce.
+
+        Never returned to the real retrieval path.
+        """
+
+        return rerank_candidates(
+            old_candidates,
+            top_k=top_k,
+        )
+
     @classmethod
     def observe_failed(
         cls,
         reason: str = "observe_failed",
     ) -> dict[str, Any]:
-        """Fail-open report used when observe() raises.
+        """Fail-open event used when observe() raises.
 
         Keeps the shadow contract: never breaks the real
         retrieval path, never leaks anything.
@@ -252,11 +271,11 @@ class RetrievalQualityShadow:
             "mode": _MODE,
             "candidate_count": 0,
             "selected_count": 0,
+            "top_score": None,
+            "average_score": None,
             "score_distribution": (
                 _empty_distribution()
             ),
-            "top_score": None,
-            "average_score": None,
             "would_change": False,
             "shadow_only": True,
             "reason": reason,
