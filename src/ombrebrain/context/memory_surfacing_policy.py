@@ -23,6 +23,20 @@ from ombrebrain.context.validators.freshness import (
 # re-ranks and never re-runs retrieval: the candidate order is the
 # order the canonical Context pipeline already produced.
 #
+# Real evidence only. Eligibility consumes the request-local
+# ``shadow_evidence`` sidecar produced for THIS request from the real
+# retrieval candidate set by the existing conservative.v1
+# ``RetrievalDecisionShadowObserver`` (recent-24h echo, duplicate id,
+# exact text duplicate). There is deliberately NO synthetic
+# per-candidate flag contract: the Unified memory item shape stays
+# ``id`` / ``content`` / ``context_relevance`` / ``metadata`` and is
+# never widened with shadow-only fields.
+#
+# Deduplication by memory id is the policy's own real check over the
+# candidate ids; the admission-time dedup (duplicate id / exact
+# duplicate content) has already removed candidates before they reach
+# ``sections.memories``.
+#
 # Confidence is a signal, never a live gate. A persisted
 # deny_shadow Confidence decision must NOT globally block every
 # candidate: a valid memory candidate can still be worth surfacing.
@@ -38,18 +52,76 @@ _NO_SURFACE = "no_surface"
 
 _CUE_PROBE_MAX_CHARS = 160
 
+# The real conservative.v1 drop reasons mapped to the reason code this
+# policy reports. Nothing else is inferred from the evidence.
+_EVIDENCE_REASONS = {
+    "recent_24h": "anti_echo_recent_24h",
+    "duplicate_id": "retrieval_dedup_duplicate_id",
+    "exact_text_duplicate":
+        "retrieval_dedup_exact_text_duplicate",
+}
+
+
+def _evidence_index(
+    shadow_evidence: Any,
+) -> dict[str, dict[str, Any]]:
+    """First-wins id -> evidence entry map. Total and read-only."""
+
+    index: dict[str, dict[str, Any]] = {}
+
+    if not isinstance(
+        shadow_evidence,
+        list,
+    ):
+        return index
+
+    for entry in shadow_evidence:
+        if not isinstance(
+            entry,
+            dict,
+        ):
+            continue
+
+        memory_id = entry.get(
+            "memory_id"
+        )
+
+        if (
+            not isinstance(
+                memory_id,
+                str,
+            )
+            or not memory_id.strip()
+        ):
+            continue
+
+        memory_id = memory_id.strip()
+
+        if memory_id in index:
+            continue
+
+        index[memory_id] = entry
+
+    return index
+
 
 def evaluate_surfacing_policy(
     *,
     conversation_id: str,
     unified: Any = None,
     confidence_report: Any = None,
+    shadow_evidence: Any = None,
 ) -> dict[str, Any]:
     """Decide which retrieved candidates are eligible to be surfaced.
 
     Pure and read-only: it touches no file, no request and no live
     pipeline. It never raises on malformed input -- it reports
     ``no_surface`` instead.
+
+    ``shadow_evidence`` is the request-local conservative.v1 evidence
+    for this request's retrieval candidate set. Without it there is
+    no honest anti-echo / dedup evidence, so the policy surfaces
+    nothing rather than pretending.
     """
 
     report: dict[str, Any] = {
@@ -76,6 +148,8 @@ def evaluate_surfacing_policy(
             0,
         "eligible_candidate_count":
             0,
+        "evidence_count":
+            0,
         "eligible": [],
         "ineligible": [],
     }
@@ -95,55 +169,14 @@ def evaluate_surfacing_policy(
         return report
 
     # --------------------------------------------------
-    # 1. Confidence observation must be reliable
-    # --------------------------------------------------
-
-    if not isinstance(
-        confidence_report,
-        dict,
-    ):
-        report["reason"] = (
-            "confidence_observation_missing"
-        )
-
-        report["reasons"] = [
-            "confidence_observation_missing"
-        ]
-
-        return report
-
-    confidence = confidence_report
-
-    report["source_confidence_revision"] = (
-        confidence.get("revision")
-    )
-
-    report["confidence_decision"] = (
-        confidence.get(
-            "decision"
-        )
-    )
-
-    report["confidence_reason"] = (
-        confidence.get("reason")
-    )
-
-    if confidence.get("stored") is not True:
-        # A structural / identity / revision / out-of-order
-        # observation is not a valid evidence chain, so this shadow
-        # does not use it.
-        report["reason"] = (
-            "confidence_observation_invalid"
-        )
-
-        report["reasons"] = [
-            "confidence_observation_invalid"
-        ]
-
-        return report
-
-    # --------------------------------------------------
-    # 2. Unified observation must be the real, current one
+    # 1. Unified observation must be the real, current one
+    #
+    # It is validated before Confidence so that a valid, bound
+    # ``source_unified_revision`` is always recorded -- even when the
+    # Confidence observation later turns out to be unusable. That is
+    # what lets the Flash report ``no_surface`` with
+    # ``confidence_observation_invalid`` instead of refusing to build
+    # an artifact at all, while the Ledger records ``retrieved``.
     # --------------------------------------------------
 
     if (
@@ -260,7 +293,81 @@ def evaluate_surfacing_policy(
         return report
 
     # --------------------------------------------------
-    # 3. Per-candidate eligibility, in canonical order
+    # 2. Confidence observation must be reliable
+    # --------------------------------------------------
+
+    if not isinstance(
+        confidence_report,
+        dict,
+    ):
+        report["reason"] = (
+            "confidence_observation_missing"
+        )
+
+        report["reasons"] = [
+            "confidence_observation_missing"
+        ]
+
+        return report
+
+    confidence = confidence_report
+
+    report["source_confidence_revision"] = (
+        confidence.get("revision")
+    )
+
+    report["confidence_decision"] = (
+        confidence.get(
+            "decision"
+        )
+    )
+
+    report["confidence_reason"] = (
+        confidence.get("reason")
+    )
+
+    if confidence.get("stored") is not True:
+        # A structural / identity / revision / out-of-order
+        # observation is not a valid evidence chain, so this shadow
+        # does not use it.
+        report["reason"] = (
+            "confidence_observation_invalid"
+        )
+
+        report["reasons"] = [
+            "confidence_observation_invalid"
+        ]
+
+        return report
+
+    # --------------------------------------------------
+    # 3. Real request-local anti-echo / dedup evidence
+    # --------------------------------------------------
+
+    if not isinstance(
+        shadow_evidence,
+        list,
+    ):
+        report["reason"] = (
+            "shadow_evidence_unavailable"
+        )
+
+        report["reasons"] = [
+            "shadow_evidence_unavailable"
+        ]
+
+        return report
+
+    evidence = _evidence_index(
+        shadow_evidence
+    )
+
+    report["evidence_count"] = len(
+        evidence
+    )
+
+    # --------------------------------------------------
+    # 4. Per-candidate eligibility, in canonical order
     # --------------------------------------------------
 
     eligible: list[Any] = []
@@ -273,6 +380,7 @@ def evaluate_surfacing_policy(
             _candidate_eligibility(
                 candidate,
                 seen_ids=seen_ids,
+                evidence=evidence,
             )
         )
 
@@ -336,6 +444,7 @@ def _candidate_eligibility(
     candidate: Any,
     *,
     seen_ids: set[str],
+    evidence: dict[str, dict[str, Any]],
 ) -> tuple[str | None, str]:
     """Return (memory_id, reason). Deterministic and total."""
 
@@ -355,23 +464,27 @@ def _candidate_eligibility(
     if memory_id in seen_ids:
         return memory_id, "duplicate_memory_id"
 
-    # Defensive: the legacy anti-echo / dedup observers are
-    # observe-only and carry no per-candidate flag today, so these
-    # rules only fire when a flag is actually present. The policy
-    # never infers a per-candidate rejection from the global
-    # observer counts.
-    if candidate.get("anti_echo_rejected") is True:
-        return memory_id, "anti_echo_rejected"
+    entry = evidence.get(memory_id)
 
-    if (
-        candidate.get("dedup_rejected")
-        is True
-        or candidate.get("duplicate")
-        is True
-    ):
+    if entry is None:
+        # No real evidence for this candidate: surface nothing rather
+        # than inventing a decision.
+        return memory_id, "missing_shadow_evidence"
+
+    if entry.get("would_keep") is not True:
+        raw_reason = entry.get("reason")
+
         return (
             memory_id,
-            "retrieval_dedup_rejected",
+            _EVIDENCE_REASONS.get(
+                raw_reason
+                if isinstance(
+                    raw_reason,
+                    str,
+                )
+                else "",
+                "shadow_evidence_rejected",
+            ),
         )
 
     if (

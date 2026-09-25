@@ -127,6 +127,37 @@ def observe_context_sources(body: bytes) -> str | None:
         )
     )
 
+    # Downstream Context consumers. Like Real Injection they are not
+    # observability-only flags: the Confidence Gate and the Memory
+    # Flash / Exposure Ledger observers consume Conversation Candidate
+    # + Unified evidence, so enabling any of them must drive the
+    # required upstream chain (Conversation Shadow -> Snapshot ->
+    # Compact -> Trusted Facts / Semantic -> Semantic State ->
+    # Conversation Candidate) instead of silently doing nothing.
+    confidence_gate_enabled = _truthy(
+        os.environ.get(
+            "OMBRE_GATEWAY_CONTEXT_CONFIDENCE_GATE_SHADOW"
+        )
+    )
+
+    memory_flash_enabled = _truthy(
+        os.environ.get(
+            "OMBRE_GATEWAY_CONTEXT_MEMORY_FLASH_SHADOW"
+        )
+    )
+
+    exposure_ledger_enabled = _truthy(
+        os.environ.get(
+            "OMBRE_GATEWAY_CONTEXT_EXPOSURE_LEDGER_SHADOW"
+        )
+    )
+
+    memory_downstream_enabled = (
+        confidence_gate_enabled
+        or memory_flash_enabled
+        or exposure_ledger_enabled
+    )
+
     if not (
         context_log_enabled
         or snapshot_enabled
@@ -140,6 +171,7 @@ def observe_context_sources(body: bytes) -> str | None:
         or injection_gate_enabled
         or request_mutation_shadow_enabled
         or real_injection_enabled
+        or memory_downstream_enabled
     ):
         return
 
@@ -232,6 +264,7 @@ def observe_context_sources(body: bytes) -> str | None:
         or injection_gate_enabled
         or request_mutation_shadow_enabled
         or real_injection_enabled
+        or memory_downstream_enabled
     ):
         return
 
@@ -310,6 +343,7 @@ def observe_context_sources(body: bytes) -> str | None:
         or injection_gate_enabled
         or request_mutation_shadow_enabled
         or real_injection_enabled
+        or memory_downstream_enabled
     ):
         return
 
@@ -396,6 +430,7 @@ def observe_context_sources(body: bytes) -> str | None:
         or injection_gate_enabled
         or request_mutation_shadow_enabled
         or real_injection_enabled
+        or memory_downstream_enabled
     ):
         try:
             trusted_facts = (
@@ -484,6 +519,7 @@ def observe_context_sources(body: bytes) -> str | None:
         or injection_gate_enabled
         or request_mutation_shadow_enabled
         or real_injection_enabled
+        or memory_downstream_enabled
     ):
         return
 
@@ -581,6 +617,7 @@ def observe_context_sources(body: bytes) -> str | None:
         or injection_gate_enabled
         or request_mutation_shadow_enabled
         or real_injection_enabled
+        or memory_downstream_enabled
     ):
         return
 
@@ -700,6 +737,7 @@ def observe_context_sources(body: bytes) -> str | None:
         or injection_gate_enabled
         or request_mutation_shadow_enabled
         or real_injection_enabled
+        or memory_downstream_enabled
     ):
         return conversation_id
 

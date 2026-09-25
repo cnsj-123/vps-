@@ -9,6 +9,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from ombrebrain.context.retrieval_decision_shadow import (
+    build_candidate_evidence,
+)
 from ombrebrain.context.retrieval_shadow_metrics import (
     record_retrieval_shadow_metrics,
 )
@@ -180,6 +183,8 @@ async def update_unified_context_candidate_from_runtime(
         query=query
     )
 
+    shadow_observation: dict[str, Any] = {}
+
     result = update_unified_context_candidate(
         conversation_id=
             conversation_id,
@@ -190,11 +195,48 @@ async def update_unified_context_candidate_from_runtime(
             if query
             else ()
         ),
+        shadow_observation=
+            shadow_observation,
     )
 
     result["retrieval_query_used"] = bool(
         query
     )
+
+    # Request-local, shadow-only Memory observation snapshot.
+    #
+    # It is returned only to the in-process shadow Memory observers so
+    # they consume THIS request's own Unified artifact and retrieval
+    # evidence instead of re-reading the shared conversation-level
+    # file (which a concurrent request may already have overwritten).
+    # It is never persisted, never logged and never part of Unified
+    # sections, Preview, Real Injection or a cache key.
+    try:
+        result["memory_shadow_snapshot"] = (
+            build_memory_shadow_snapshot(
+                conversation_id=
+                    conversation_id,
+                unified=(
+                    shadow_observation.get(
+                        "unified_artifact"
+                    )
+                ),
+                retrieval_memories=(
+                    context_candidates.get(
+                        "memories"
+                    )
+                    if isinstance(
+                        context_candidates,
+                        dict,
+                    )
+                    else []
+                ),
+            )
+        )
+
+    except Exception:
+        # Observation must remain fail-open.
+        result["memory_shadow_snapshot"] = None
 
     # Privacy-safe rolling metrics only.
     # This is observation-only and must never affect retrieval,
@@ -1224,7 +1266,18 @@ def update_unified_context_candidate(
     conversation_id: str,
     context_candidates: dict[str, Any],
     excluded_texts: tuple[str, ...] | list[str] = (),
+    shadow_observation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    """Persist the Unified candidate and return its privacy-safe summary.
+
+    ``shadow_observation`` is an optional out-parameter for the
+    in-process shadow Memory observers: when a dict is passed, the
+    full artifact built for THIS request is stored under
+    ``"unified_artifact"`` so no observer ever has to re-read the
+    shared conversation-level file. It is never persisted, never
+    logged and never part of the live rendered Context. The default
+    (None) keeps every existing caller byte-for-byte unchanged.
+    """
 
     candidate_path = _path(
         "context_candidate",
@@ -1300,6 +1353,14 @@ def update_unified_context_candidate(
                 )
                 or {}
             )
+
+            if isinstance(
+                shadow_observation,
+                dict,
+            ):
+                shadow_observation[
+                    "unified_artifact"
+                ] = previous
 
             return {
                 "stored": True,
@@ -1440,6 +1501,14 @@ def update_unified_context_candidate(
             result,
         )
 
+        if isinstance(
+            shadow_observation,
+            dict,
+        ):
+            shadow_observation[
+                "unified_artifact"
+            ] = result
+
     telemetry = (
         result.get(
             "telemetry"
@@ -1552,30 +1621,61 @@ def update_unified_context_candidate(
     }
 
 
-def read_unified_context_candidate(
+def build_memory_shadow_snapshot(
+    *,
     conversation_id: str,
+    unified: Any,
+    retrieval_memories: Any,
 ) -> dict[str, Any] | None:
-    """Read the persisted Unified artifact for shadow observers.
+    """Request-local, shadow-only Memory observation snapshot.
 
-    Read-only and total: returns the full stored artifact (``sections``
-    included) or None. It never changes candidate selection and exists
-    only so the shadow Memory Flash / Exposure Ledger observers can
-    consume the retrieval observation this request already produced.
+    It carries the Unified artifact THIS request just built plus the
+    per-candidate conservative.v1 evidence derived from the same
+    request's retrieval candidate set. It exists only so the shadow
+    Memory Surfacing / Flash / Exposure Ledger observers can consume
+    this request's own evidence instead of re-reading the shared,
+    conversation-level Unified file (which a concurrent request may
+    already have overwritten).
+
+    It is never persisted, never logged, never added to Unified
+    sections, Preview, Real Injection, a header or a cache key, and
+    it never changes retrieval candidate selection. Returns None when
+    no valid Unified artifact was produced for this request.
     """
 
-    try:
-        _validate_conversation_id(
-            conversation_id
-        )
-    except ValueError:
+    if (
+        not isinstance(unified, dict)
+        or unified.get("version") != _VERSION
+        or unified.get("conversation_id")
+        != conversation_id
+    ):
         return None
 
-    return _read_json(
-        _path(
-            "unified_context_candidate",
-            conversation_id,
+    memories = (
+        retrieval_memories
+        if isinstance(
+            retrieval_memories,
+            list,
         )
+        else []
     )
+
+    return {
+        "version":
+            "memory-shadow-snapshot.v1",
+        "mode":
+            "shadow_only",
+        "conversation_id":
+            conversation_id,
+        "revision":
+            unified.get("revision"),
+        "unified":
+            unified,
+        "evidence":
+            build_candidate_evidence(
+                memories
+            ),
+    }
 
 
 def unified_context_candidate_status(

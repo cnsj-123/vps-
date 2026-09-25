@@ -8,6 +8,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from ombrebrain.context.validators.freshness import (
+    validate_context_freshness,
+)
+
 
 # Memory Flash — shadow only.
 #
@@ -47,6 +51,13 @@ from typing import Any
 
 _VERSION = "memory-flash.v1"
 _MODE = "shadow_only"
+
+# The Surfacing Policy contract this artifact may be built from. The
+# name is repeated here (rather than imported) because
+# memory_surfacing_policy imports memory_flash, not the other way
+# round.
+_POLICY_VERSION = "memory-surfacing-policy.v1"
+_POLICY_MODE = "shadow_only"
 
 _DEFAULT_ROOT = "/app/buckets/.context"
 
@@ -629,6 +640,19 @@ def build_memory_flash(
     }
 
 
+def _not_stored(
+    reason: str,
+) -> dict[str, Any]:
+    """Refuse to build a Flash artifact, without raising."""
+
+    return {
+        "stored": False,
+        "mode": _MODE,
+        "decision": "no_surface",
+        "reason": reason,
+    }
+
+
 def update_memory_flash(
     *,
     conversation_id: str,
@@ -639,10 +663,18 @@ def update_memory_flash(
 ) -> dict[str, Any]:
     """Persist one Flash artifact per (conversation, request).
 
-    Shadow-only and fail-open at the caller: this function reads the
-    Unified candidate this request produced, binds it to
-    ``expected_unified_revision`` and, when the policy allowed a
-    surface, writes the cue artifact. It never raises.
+    Shadow-only and fail-open at the caller. It refuses to build
+    anything (``stored=False``, no artifact file) unless the Surfacing
+    Policy report is a well-formed ``memory-surfacing-policy.v1``
+    ``shadow_only`` report AND its ``source_unified_revision`` is a
+    valid revision that equals ``expected_unified_revision``. That
+    binding is checked with the shared
+    ``validate_context_freshness()`` helper, so a policy produced for
+    a different Unified revision can never be turned into a cue
+    artifact for this request.
+
+    Never raises for a refused report; it only raises on an invalid
+    conversation / request id, exactly like the rest of this module.
     """
 
     _validate_conversation_id(
@@ -653,14 +685,47 @@ def update_memory_flash(
         cognitive_request_id
     )
 
-    policy = (
-        policy_report
-        if isinstance(
-            policy_report,
-            dict,
+    if not isinstance(
+        policy_report,
+        dict,
+    ):
+        return _not_stored(
+            "invalid_policy_report"
         )
-        else {}
+
+    policy = policy_report
+
+    if (
+        policy.get("version")
+        != _POLICY_VERSION
+        or policy.get("mode")
+        != _POLICY_MODE
+    ):
+        return _not_stored(
+            "malformed_policy_report"
+        )
+
+    freshness = validate_context_freshness(
+        checked_revision=(
+            policy.get(
+                "source_unified_revision"
+            )
+        ),
+        expected_revision=(
+            expected_unified_revision
+        ),
+        invalid_reason=(
+            "invalid_flash_policy_unified_revision"
+        ),
+        mismatch_reason=(
+            "flash_policy_unified_revision_mismatch"
+        ),
     )
+
+    if not freshness["valid"]:
+        return _not_stored(
+            freshness["reason"]
+        )
 
     retrieved_candidate_count = (
         policy.get(

@@ -45,6 +45,12 @@ from ombrebrain.context.validators.freshness import (
 _VERSION = "memory-exposure-ledger.v1"
 _MODE = "shadow_only"
 
+# The Unified observation shape this ledger may attribute to a
+# request. A snapshot with the right revision but the wrong version
+# or the wrong conversation must never be recorded against this
+# conversation's ledger.
+_UNIFIED_VERSION = "unified-context-candidate.v1"
+
 _STAGE_RETRIEVED = "retrieved"
 _STAGE_SURFACED = "surfaced_as_flash"
 
@@ -451,6 +457,36 @@ def update_exposure_ledger(
                 "no_record",
             "reason":
                 "unified_observation_invalid",
+        }
+
+    if (
+        unified.get("version")
+        != _UNIFIED_VERSION
+    ):
+        return {
+            "stored":
+                False,
+            "mode":
+                _MODE,
+            "decision":
+                "no_record",
+            "reason":
+                "unified_observation_invalid",
+        }
+
+    if (
+        unified.get("conversation_id")
+        != conversation_id
+    ):
+        return {
+            "stored":
+                False,
+            "mode":
+                _MODE,
+            "decision":
+                "no_record",
+            "reason":
+                "unified_conversation_mismatch",
         }
 
     observed_revision = unified.get(

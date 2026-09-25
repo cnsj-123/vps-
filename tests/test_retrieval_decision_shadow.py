@@ -318,5 +318,209 @@ class RetrievalDecisionShadowTests(
         )
 
 
+class PerCandidateObservationTests(
+    unittest.TestCase
+):
+    """The per-candidate API of the same conservative.v1 policy."""
+
+    def _items(self):
+        now = datetime(
+            2026,
+            9,
+            26,
+            12,
+            0,
+            tzinfo=timezone.utc,
+        )
+
+        def ts(hours):
+            return (
+                now
+                - timedelta(hours=hours)
+            ).isoformat()
+
+        return now, [
+            {
+                "id": "recent",
+                "content": "recent text",
+                "metadata": {
+                    "last_active": ts(2),
+                },
+            },
+            {
+                "id": "base",
+                "content": "same text",
+                "metadata": {
+                    "last_active": ts(100),
+                },
+            },
+            {
+                "id": "base",
+                "content": "other text",
+                "metadata": {
+                    "last_active": ts(100),
+                },
+            },
+            {
+                "id": "other",
+                "content": "same text",
+                "metadata": {
+                    "last_active": ts(100),
+                },
+            },
+            {
+                "id": "middle",
+                "content": "middle text",
+                "metadata": {
+                    "last_active": ts(48),
+                },
+            },
+            {
+                "id": "missing",
+                "content": "missing text",
+                "metadata": {},
+            },
+        ]
+
+    def test_per_candidate_decisions(self):
+        now, items = self._items()
+
+        observer = (
+            RetrievalDecisionShadowObserver()
+        )
+
+        decisions = (
+            observer.observe_candidates(
+                items,
+                now=now,
+            )
+        )
+
+        self.assertEqual(
+            [
+                (
+                    decision.memory_id,
+                    decision.would_keep,
+                    decision.reason,
+                )
+                for decision in decisions
+            ],
+            [
+                ("recent", False, "recent_24h"),
+                ("base", True, "keep"),
+                ("base", False, "duplicate_id"),
+                (
+                    "other",
+                    False,
+                    "exact_text_duplicate",
+                ),
+                ("middle", True, "keep"),
+                ("missing", True, "keep"),
+            ],
+        )
+
+        # ``to_dict`` carries ids / order / decision only.
+        self.assertEqual(
+            set(decisions[0].to_dict()),
+            {
+                "memory_id",
+                "index",
+                "would_keep",
+                "reason",
+            },
+        )
+
+    def test_aggregate_is_derived_from_per_candidate(
+        self,
+    ):
+        now, items = self._items()
+
+        observer = (
+            RetrievalDecisionShadowObserver()
+        )
+
+        aggregate = observer.observe(
+            items,
+            now=now,
+        )
+
+        decisions = (
+            observer.observe_candidates(
+                items,
+                now=now,
+            )
+        )
+
+        self.assertEqual(
+            aggregate.would_keep,
+            sum(
+                1
+                for decision in decisions
+                if decision.would_keep
+            ),
+        )
+
+        self.assertEqual(
+            aggregate.would_drop_total,
+            sum(
+                1
+                for decision in decisions
+                if not decision.would_keep
+            ),
+        )
+
+        self.assertEqual(
+            aggregate.would_drop_recent_24h,
+            1,
+        )
+        self.assertEqual(
+            aggregate.would_drop_duplicate_id,
+            1,
+        )
+        self.assertEqual(
+            aggregate.would_drop_exact_text_duplicate,
+            1,
+        )
+        self.assertEqual(
+            aggregate.would_keep_recent_24_72h,
+            1,
+        )
+        self.assertEqual(
+            aggregate.would_keep_missing_last_active,
+            1,
+        )
+
+    def test_input_is_not_mutated(self):
+        now, items = self._items()
+        snapshot = repr(items)
+
+        (
+            RetrievalDecisionShadowObserver()
+            .observe_candidates(
+                items,
+                now=now,
+            )
+        )
+
+        self.assertEqual(repr(items), snapshot)
+
+    def test_non_dict_items_fail_open(self):
+        decisions = (
+            RetrievalDecisionShadowObserver()
+            .observe_candidates(
+                ["not-a-dict", None],
+                now=datetime.now(
+                    timezone.utc
+                ),
+            )
+        )
+
+        self.assertEqual(len(decisions), 2)
+
+        for decision in decisions:
+            self.assertTrue(decision.would_keep)
+            self.assertEqual(decision.reason, "keep")
+
+
 if __name__ == "__main__":
     unittest.main()

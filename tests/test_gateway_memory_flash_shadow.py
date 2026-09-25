@@ -1,12 +1,22 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import importlib.util
 import json
 import os
 import re
 import tempfile
+import threading
 import unittest
+from concurrent.futures import (
+    ThreadPoolExecutor,
+)
+from datetime import (
+    datetime,
+    timedelta,
+    timezone,
+)
 from pathlib import Path
 from unittest.mock import (
     AsyncMock,
@@ -46,6 +56,9 @@ _SPEC.loader.exec_module(
 from ombrebrain.context import (
     context_pipeline_coordinator as coordinator,
 )
+from ombrebrain.context.retrieval_decision_shadow import (
+    build_candidate_evidence,
+)
 
 
 CID = "ctx_0123456789abcdef"
@@ -80,6 +93,13 @@ _ISOLATED_ENV = {
 }
 
 
+def _old_ts():
+    return (
+        datetime.now(timezone.utc)
+        - timedelta(days=5)
+    ).isoformat()
+
+
 def _allow_confidence(
     revision=1,
 ):
@@ -105,18 +125,50 @@ def _allow_confidence(
     }
 
 
+def _invalid_confidence():
+    return {
+        "version":
+            "context-confidence-gate.v1",
+        "mode":
+            "shadow_only",
+        "decision":
+            "deny_shadow",
+        "allowed":
+            False,
+        "reason":
+            "unified_request_revision_mismatch",
+        "reasons": [
+            "unified_request_revision_mismatch",
+        ],
+        "stored":
+            False,
+        "duplicate":
+            False,
+        "revision":
+            None,
+    }
+
+
 def _memory(
     memory_id,
-    content="cue text",
+    content=None,
     name=None,
 ):
     item = {
         "id": memory_id,
-        "content": content,
+        "content": (
+            content
+            if content is not None
+            else ("cue for " + memory_id)
+        ),
+        "context_relevance": 0.9,
+        "metadata": {
+            "last_active": _old_ts(),
+        },
     }
 
     if name is not None:
-        item["metadata"] = {"name": name}
+        item["metadata"]["name"] = name
 
     return item
 
@@ -141,32 +193,28 @@ def _unified_artifact(
     }
 
 
-def _write_unified(
-    root,
+def _snapshot(
     memories,
     *,
     revision=5,
 ):
-    path = (
-        Path(root)
-        / "unified_context_candidate"
-        / (CID + ".json")
-    )
-
-    path.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    path.write_text(
-        json.dumps(
-            _unified_artifact(
-                memories,
-                revision=revision,
+    return {
+        "version":
+            "memory-shadow-snapshot.v1",
+        "mode":
+            "shadow_only",
+        "conversation_id": CID,
+        "revision": revision,
+        "unified": _unified_artifact(
+            memories,
+            revision=revision,
+        ),
+        "evidence": (
+            build_candidate_evidence(
+                memories
             )
         ),
-        encoding="utf-8",
-    )
+    }
 
 
 def _flash_dir(root):
@@ -185,19 +233,17 @@ def _ledger_dir(root):
     )
 
 
-def _read_only_file(directory):
-    files = sorted(
-        directory.iterdir()
-    )
-
-    if not files:
-        return None
-
-    return json.loads(
-        files[0].read_text(
-            encoding="utf-8"
+def _read_all(directory):
+    return [
+        json.loads(
+            path.read_text(
+                encoding="utf-8"
+            )
         )
-    )
+        for path in sorted(
+            directory.iterdir()
+        )
+    ]
 
 
 class MemoryFlashPipelineTests(
@@ -219,8 +265,6 @@ class MemoryFlashPipelineTests(
                 _memory("mem-1"),
                 _memory("mem-2"),
             ]
-
-        _write_unified(root, memories)
 
         selected_body = body + b" "
 
@@ -272,6 +316,8 @@ class MemoryFlashPipelineTests(
                     return_value={
                         "stored": True,
                         "revision": 5,
+                        "memory_shadow_snapshot":
+                            _snapshot(memories),
                     }
                 ),
             ), patch.object(
@@ -358,13 +404,13 @@ class MemoryFlashPipelineTests(
                 real_injection=True,
             )
 
-            flash = _read_only_file(
+            flash = _read_all(
                 _flash_dir(on_root)
-            )
+            )[0]
 
-            ledger = _read_only_file(
+            ledger = _read_all(
                 _ledger_dir(on_root)
-            )
+            )[0]
 
         # Real Injection is the only thing that may change the body.
         self.assertNotEqual(
@@ -412,9 +458,9 @@ class MemoryFlashPipelineTests(
                 ],
             )
 
-            flash = _read_only_file(
+            flash = _read_all(
                 _flash_dir(root)
-            )
+            )[0]
 
         self.assertEqual(
             flash["surfaced_count"],
@@ -446,9 +492,9 @@ class MemoryFlashPipelineTests(
                 _flash_dir(root).exists()
             )
 
-            ledger = _read_only_file(
+            ledger = _read_all(
                 _ledger_dir(root)
-            )
+            )[0]
 
         self.assertEqual(
             ledger["retrieved_count"],
@@ -485,11 +531,6 @@ class MemoryFlashPipelineTests(
         body = b'{"messages":[]}'
 
         with tempfile.TemporaryDirectory() as root:
-            _write_unified(
-                root,
-                [_memory("mem-1")],
-            )
-
             with patch.dict(
                 os.environ,
                 {
@@ -512,6 +553,14 @@ class MemoryFlashPipelineTests(
                         return_value={
                             "stored": True,
                             "revision": 5,
+                            "memory_shadow_snapshot":
+                                _snapshot(
+                                    [
+                                        _memory(
+                                            "mem-1"
+                                        )
+                                    ]
+                                ),
                         }
                     ),
                 ), patch.object(
@@ -560,6 +609,198 @@ class MemoryFlashPipelineTests(
         self.assertNotIn(
             "secret-failure",
             logged,
+        )
+
+    async def test_surfacing_failure_still_records_retrieved(
+        self,
+    ):
+        # retrieved != surfaced: a Surfacing Policy failure must not
+        # erase the fact that retrieval happened for this request.
+        body = b'{"messages":[]}'
+
+        with tempfile.TemporaryDirectory() as root:
+            with patch.dict(
+                os.environ,
+                {
+                    **_ISOLATED_ENV,
+                    _CONFIDENCE_ENV: "1",
+                    _FLASH_ENV: "1",
+                    _LEDGER_ENV: "1",
+                    "OMBRE_CONTEXT_STATE_DIR":
+                        root,
+                },
+                clear=False,
+            ):
+                with patch.object(
+                    coordinator,
+                    "observe_context_sources",
+                    Mock(return_value=CID),
+                ), patch.object(
+                    coordinator,
+                    "update_unified_context_candidate_from_runtime",
+                    AsyncMock(
+                        return_value={
+                            "stored": True,
+                            "revision": 5,
+                            "memory_shadow_snapshot":
+                                _snapshot(
+                                    [
+                                        _memory(
+                                            "mem-1"
+                                        ),
+                                        _memory(
+                                            "mem-2"
+                                        ),
+                                    ]
+                                ),
+                        }
+                    ),
+                ), patch.object(
+                    coordinator,
+                    "update_context_confidence_gate",
+                    Mock(
+                        return_value=(
+                            _allow_confidence()
+                        )
+                    ),
+                ), patch.object(
+                    coordinator,
+                    "evaluate_surfacing_policy",
+                    Mock(
+                        side_effect=RuntimeError(
+                            "secret-policy"
+                        )
+                    ),
+                ):
+                    with self.assertLogs(
+                        "ombre_brain.gateway",
+                        level="INFO",
+                    ) as captured:
+                        selected = await (
+                            coordinator
+                            .run_context_pipeline(
+                                body
+                            )
+                        )
+
+            self.assertIs(selected, body)
+
+            ledger = _read_all(
+                _ledger_dir(root)
+            )[0]
+
+            self.assertFalse(
+                _flash_dir(root).exists()
+            )
+
+        self.assertTrue(ledger["retrieved_count"] >= 2)
+        self.assertEqual(
+            ledger["surfaced_count"],
+            0,
+        )
+
+        logged = "\n".join(
+            record.getMessage()
+            for record in captured.records
+        )
+
+        self.assertIn(
+            "policy_failed",
+            logged,
+        )
+        self.assertNotIn(
+            "secret-policy",
+            logged,
+        )
+
+    async def test_invalid_confidence_keeps_ledger_retrieved(
+        self,
+    ):
+        # A structural Confidence observation blocks the Flash (with
+        # reason confidence_observation_invalid) but must not erase
+        # this request's retrieved stage from the Ledger.
+        body = b'{"messages":[]}'
+
+        with tempfile.TemporaryDirectory() as root:
+            with patch.dict(
+                os.environ,
+                {
+                    **_ISOLATED_ENV,
+                    _CONFIDENCE_ENV: "1",
+                    _FLASH_ENV: "1",
+                    _LEDGER_ENV: "1",
+                    "OMBRE_CONTEXT_STATE_DIR":
+                        root,
+                },
+                clear=False,
+            ):
+                with patch.object(
+                    coordinator,
+                    "observe_context_sources",
+                    Mock(return_value=CID),
+                ), patch.object(
+                    coordinator,
+                    "update_unified_context_candidate_from_runtime",
+                    AsyncMock(
+                        return_value={
+                            "stored": True,
+                            "revision": 5,
+                            "memory_shadow_snapshot":
+                                _snapshot(
+                                    [
+                                        _memory(
+                                            "mem-1"
+                                        )
+                                    ]
+                                ),
+                        }
+                    ),
+                ), patch.object(
+                    coordinator,
+                    "update_context_confidence_gate",
+                    Mock(
+                        return_value=(
+                            _invalid_confidence()
+                        )
+                    ),
+                ):
+                    selected = await (
+                        coordinator
+                        .run_context_pipeline(
+                            body
+                        )
+                    )
+
+            self.assertIs(selected, body)
+
+            flash = _read_all(
+                _flash_dir(root)
+            )[0]
+
+            ledger = _read_all(
+                _ledger_dir(root)
+            )[0]
+
+        self.assertEqual(
+            flash["decision"],
+            "no_surface",
+        )
+        self.assertEqual(
+            flash["reason"],
+            "confidence_observation_invalid",
+        )
+        self.assertEqual(
+            flash["surfaced_count"],
+            0,
+        )
+
+        self.assertEqual(
+            ledger["retrieved_count"],
+            1,
+        )
+        self.assertEqual(
+            ledger["surfaced_count"],
+            0,
         )
 
 
@@ -647,11 +888,6 @@ class CognitiveRequestIdTests(
             return real_flash(**kwargs)
 
         with tempfile.TemporaryDirectory() as root:
-            _write_unified(
-                root,
-                [_memory("mem-1")],
-            )
-
             with patch.dict(
                 os.environ,
                 {
@@ -675,6 +911,14 @@ class CognitiveRequestIdTests(
                         return_value={
                             "stored": True,
                             "revision": 5,
+                            "memory_shadow_snapshot":
+                                _snapshot(
+                                    [
+                                        _memory(
+                                            "mem-1"
+                                        )
+                                    ]
+                                ),
                         }
                     ),
                 ), patch.object(
@@ -754,17 +998,6 @@ class MemoryShadowPrivacyTests(
             return real_flash(**kwargs)
 
         with tempfile.TemporaryDirectory() as root:
-            _write_unified(
-                root,
-                [
-                    _memory(
-                        memory_id,
-                        content=raw,
-                        name=cue,
-                    )
-                ],
-            )
-
             with patch.dict(
                 os.environ,
                 {
@@ -788,6 +1021,16 @@ class MemoryShadowPrivacyTests(
                         return_value={
                             "stored": True,
                             "revision": 5,
+                            "memory_shadow_snapshot":
+                                _snapshot(
+                                    [
+                                        _memory(
+                                            memory_id,
+                                            content=raw,
+                                            name=cue,
+                                        )
+                                    ]
+                                ),
                         }
                     ),
                 ), patch.object(
@@ -904,7 +1147,7 @@ class MemoryStageOrderTests(
 
         order: list = []
 
-        artifact = _unified_artifact(
+        snapshot = _snapshot(
             [_memory("mem-1")]
         )
 
@@ -937,6 +1180,8 @@ class MemoryStageOrderTests(
                     return_value={
                         "stored": True,
                         "revision": 5,
+                        "memory_shadow_snapshot":
+                            snapshot,
                     }
                 ),
             ), patch.object(
@@ -952,21 +1197,23 @@ class MemoryStageOrderTests(
                 ),
             ), patch.object(
                 coordinator,
-                "read_unified_context_candidate",
-                Mock(
-                    return_value=artifact
-                ),
-            ), patch.object(
-                coordinator,
                 "evaluate_surfacing_policy",
                 Mock(
                     side_effect=lambda **k: (
                         record(
                             "surfacing",
                             {
+                                "version":
+                                    "memory-surfacing-policy.v1",
+                                "mode":
+                                    "shadow_only",
                                 "decision":
-                                    "allow_shadow",
+                                    "no_surface",
+                                "reason":
+                                    "no_eligible_candidates",
                                 "eligible": [],
+                                "source_unified_revision":
+                                    5,
                             },
                         )
                     )
@@ -1136,6 +1383,281 @@ class MemoryStageOrderTests(
         ledger.assert_not_called()
 
         self.assertIs(selected, body)
+
+
+class SameConversationConcurrencyTests(
+    unittest.TestCase,
+):
+    """Two same-conversation requests entering at the same time."""
+
+    def test_concurrent_requests_are_isolated(
+        self,
+    ):
+        body = b'{"messages":[]}'
+
+        memory_a = "mem_A_111111111111"
+        memory_b = "mem_B_222222222222"
+
+        cue_a = "CUE_ALPHA_SECRET"
+        cue_b = "CUE_BETA_SECRET"
+
+        snapshot_a = _snapshot(
+            [_memory(memory_a, cue_a)]
+        )
+        snapshot_b = _snapshot(
+            [_memory(memory_b, cue_b)]
+        )
+
+        barrier = threading.Barrier(
+            2,
+            timeout=30,
+        )
+
+        local = threading.local()
+        rendezvous: list = []
+
+        real_flash = (
+            coordinator.update_memory_flash
+        )
+
+        def synchronized_flash(**kwargs):
+            rendezvous.append(
+                kwargs.get(
+                    "cognitive_request_id"
+                )
+            )
+
+            # Force both requests to be inside the Flash stage at the
+            # same moment. Deterministic: no sleep anywhere.
+            barrier.wait()
+
+            return real_flash(**kwargs)
+
+        async def fake_unified(
+            conversation_id,
+        ):
+            return {
+                "stored": True,
+                "revision": 5,
+                "memory_shadow_snapshot":
+                    local.snapshot,
+            }
+
+        def worker(snapshot):
+            local.snapshot = snapshot
+
+            return asyncio.run(
+                coordinator.run_context_pipeline(
+                    body
+                )
+            )
+
+        with tempfile.TemporaryDirectory() as root:
+            with patch.dict(
+                os.environ,
+                {
+                    **_ISOLATED_ENV,
+                    _CONFIDENCE_ENV: "1",
+                    _FLASH_ENV: "1",
+                    _LEDGER_ENV: "1",
+                    "OMBRE_CONTEXT_STATE_DIR":
+                        root,
+                },
+                clear=False,
+            ):
+                with patch.object(
+                    coordinator,
+                    "observe_context_sources",
+                    Mock(return_value=CID),
+                ), patch.object(
+                    coordinator,
+                    "update_unified_context_candidate_from_runtime",
+                    AsyncMock(
+                        side_effect=fake_unified
+                    ),
+                ), patch.object(
+                    coordinator,
+                    "update_context_confidence_gate",
+                    Mock(
+                        return_value=(
+                            _allow_confidence()
+                        )
+                    ),
+                ), patch.object(
+                    coordinator,
+                    "update_memory_flash",
+                    synchronized_flash,
+                ):
+                    with ThreadPoolExecutor(
+                        max_workers=2
+                    ) as pool:
+                        futures = [
+                            pool.submit(
+                                worker,
+                                snapshot_a,
+                            ),
+                            pool.submit(
+                                worker,
+                                snapshot_b,
+                            ),
+                        ]
+
+                        results = [
+                            future.result(
+                                timeout=30
+                            )
+                            for future in futures
+                        ]
+
+            for result in results:
+                self.assertIs(result, body)
+
+            flash_files = _read_all(
+                _flash_dir(root)
+            )
+            ledger_files = _read_all(
+                _ledger_dir(root)
+            )
+            flash_names = sorted(
+                path.name
+                for path in _flash_dir(
+                    root
+                ).iterdir()
+            )
+
+        # Both requests reached the shared rendezvous point...
+        self.assertEqual(
+            len(rendezvous),
+            2,
+        )
+
+        for request_id in rendezvous:
+            self.assertRegex(
+                request_id,
+                _REQUEST_ID_RE,
+            )
+
+        self.assertNotEqual(
+            rendezvous[0],
+            rendezvous[1],
+        )
+
+        # ...and each produced its OWN artifacts, with its own
+        # request id, and no overwrite.
+        self.assertEqual(
+            flash_names,
+            sorted(
+                request_id + ".json"
+                for request_id
+                in rendezvous
+            ),
+        )
+
+        self.assertEqual(
+            len(flash_files),
+            2,
+        )
+        self.assertEqual(
+            len(ledger_files),
+            2,
+        )
+
+        flash_ids = {
+            frozenset(
+                item["memory_id"]
+                for item
+                in artifact["flashes"]
+            )
+            for artifact in flash_files
+        }
+
+        self.assertEqual(
+            flash_ids,
+            {
+                frozenset([memory_a]),
+                frozenset([memory_b]),
+            },
+        )
+
+        # No cross-request contamination: each artifact carries only
+        # its own memory id, its own cue and its own request id.
+        for artifact in flash_files:
+            ids = {
+                item["memory_id"]
+                for item in artifact["flashes"]
+            }
+
+            own, other = (
+                (memory_a, memory_b)
+                if memory_a in ids
+                else (memory_b, memory_a)
+            )
+
+            own_cue, other_cue = (
+                (cue_a, cue_b)
+                if own == memory_a
+                else (cue_b, cue_a)
+            )
+
+            self.assertNotIn(
+                other,
+                artifact["retrieved_memory_ids"]
+                if "retrieved_memory_ids"
+                in artifact
+                else [
+                    item["memory_id"]
+                    for item in artifact["flashes"]
+                ],
+            )
+
+            self.assertIn(
+                artifact["cognitive_request_id"],
+                rendezvous,
+            )
+
+            self.assertEqual(
+                artifact[
+                    "source_unified_revision"
+                ],
+                5,
+            )
+
+            serialized = json.dumps(
+                artifact
+            )
+
+            self.assertNotIn(other, serialized)
+            self.assertNotIn(
+                other_cue,
+                serialized,
+            )
+            self.assertIn(own_cue, serialized)
+
+        ledger_ids = {
+            frozenset(
+                artifact["retrieved_memory_ids"]
+            )
+            for artifact in ledger_files
+        }
+
+        self.assertEqual(
+            ledger_ids,
+            {
+                frozenset([memory_a]),
+                frozenset([memory_b]),
+            },
+        )
+
+        for artifact in ledger_files:
+            self.assertIn(
+                artifact["cognitive_request_id"],
+                rendezvous,
+            )
+
+            self.assertNotIn(
+                "cue",
+                json.dumps(artifact),
+            )
 
 
 class MemoryFlashGatewayThinnessTests(

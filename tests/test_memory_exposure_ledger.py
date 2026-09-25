@@ -24,6 +24,7 @@ def unified(
     *,
     revision=3,
     conversation_id=CID,
+    version="unified-context-candidate.v1",
 ):
     memories = []
 
@@ -40,7 +41,7 @@ def unified(
 
     return {
         "version":
-            "unified-context-candidate.v1",
+            version,
         "conversation_id":
             conversation_id,
         "revision": revision,
@@ -237,6 +238,86 @@ class UpdateLedgerTests(
         self.assertEqual(
             result["reason"],
             "unified_observation_invalid",
+        )
+
+    def test_wrong_unified_version_is_rejected(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as root:
+            with patch.dict(
+                os.environ,
+                {
+                    "OMBRE_CONTEXT_STATE_DIR":
+                        root,
+                },
+                clear=False,
+            ):
+                result = update_exposure_ledger(
+                    conversation_id=CID,
+                    cognitive_request_id=RID,
+                    unified=unified(
+                        ["a"],
+                        version=(
+                            "some-other-candidate.v9"
+                        ),
+                    ),
+                    surfaced_ids=[],
+                    expected_unified_revision=3,
+                )
+
+                self.assertFalse(
+                    (
+                        Path(root)
+                        / "exposure_ledger"
+                        / CID
+                        / (RID + ".json")
+                    ).exists()
+                )
+
+        self.assertFalse(result["stored"])
+        self.assertEqual(
+            result["reason"],
+            "unified_observation_invalid",
+        )
+
+    def test_conversation_mismatch_is_rejected(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as root:
+            with patch.dict(
+                os.environ,
+                {
+                    "OMBRE_CONTEXT_STATE_DIR":
+                        root,
+                },
+                clear=False,
+            ):
+                result = update_exposure_ledger(
+                    conversation_id=CID,
+                    cognitive_request_id=RID,
+                    unified=unified(
+                        ["a"],
+                        conversation_id=(
+                            "ctx_ffffffffffffffff"
+                        ),
+                    ),
+                    surfaced_ids=["a"],
+                    expected_unified_revision=3,
+                )
+
+                self.assertFalse(
+                    (
+                        Path(root)
+                        / "exposure_ledger"
+                        / CID
+                        / (RID + ".json")
+                    ).exists()
+                )
+
+        self.assertFalse(result["stored"])
+        self.assertEqual(
+            result["reason"],
+            "unified_conversation_mismatch",
         )
 
     def test_revision_mismatch_writes_nothing(

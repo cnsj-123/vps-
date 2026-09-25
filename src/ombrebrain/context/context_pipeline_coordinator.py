@@ -39,7 +39,6 @@ from ombrebrain.context.pipeline_events import (
     build_context_chain_event,
 )
 from ombrebrain.context.unified_context_candidate import (
-    read_unified_context_candidate,
     update_unified_context_candidate_from_runtime,
 )
 
@@ -77,10 +76,13 @@ from ombrebrain.context.unified_context_candidate import (
 #     Unified / Preview / Mutation / Real Injection, and no
 #     reinforcement of any memory ever occurs here;
 #   - no HTTP error is produced and the request is never blocked;
-#   - only privacy-safe telemetry (counts, revisions, hashes,
-#     booleans, reason codes) is logged — never query, memory,
-#     fact, rendered Context, memory id, cognitive request id or
-#     conversation id.
+#   - the NEW Memory Flash / Exposure Ledger log lines are
+#     privacy-safe (counts, revisions, booleans, reason codes) and
+#     never include a conversation id, a cognitive request id, a
+#     memory id or any cue / memory / query text. That guarantee is
+#     scoped to those new stages: the pre-existing Unified /
+#     Preview / Gate / Mutation / Real Injection log lines are
+#     unchanged, and some of them do still include conversation_id.
 #
 # This module performs no retrieval and no selection: it composes
 # existing context stages only. All surfacing rules live in
@@ -266,6 +268,7 @@ def observe_memory_exposure_shadow(
     conversation_id: str | None,
     *,
     cognitive_request_id: str | None,
+    snapshot: Any,
     expected_unified_revision: Any,
     confidence_report: Any,
 ) -> None:
@@ -281,15 +284,22 @@ def observe_memory_exposure_shadow(
     source file, activation count, importance, strength, weight,
     score, decay or archive state is ever written.
 
-    It consumes the retrieval observation THIS request already
-    produced (the persisted Unified candidate) and never re-runs
-    retrieval, re-embeds, re-vector-searches, re-ranks or calls a
-    model / external API.
+    It consumes the request-local snapshot THIS request produced
+    (Unified artifact + conservative.v1 candidate evidence). It never
+    re-reads the shared conversation-level Unified file -- which a
+    concurrent same-conversation request may already have overwritten
+    -- and never re-runs retrieval, re-embeds, re-vector-searches,
+    re-ranks or calls a model / external API.
 
     Responsibilities are split: all eligibility rules live in
     memory_surfacing_policy, all cue construction and Flash
-    persistence live in memory_flash, all ledger persistence lives
-    in exposure_ledger. This function only orchestrates them.
+    persistence live in memory_flash, all ledger persistence lives in
+    exposure_ledger. This function only orchestrates them.
+
+    The Flash stage and the Ledger stage are independent. Because
+    retrieved != surfaced, a Surfacing Policy / Flash failure still
+    lets the Ledger record the ``retrieved`` stage for this request;
+    only the Ledger's own failure (or the flag being OFF) skips it.
 
     Only privacy-safe telemetry is logged (mode, stored, decision,
     reason, counts, estimated tokens, token budget, revisions,
@@ -323,23 +333,23 @@ def observe_memory_exposure_shadow(
     ):
         return
 
-    # Read the Unified artifact this request just produced. A failure
-    # to read simply means this shadow has no evidence to observe.
-    try:
-        unified = read_unified_context_candidate(
-            conversation_id
+    # Request-local Unified observation for THIS request only. The
+    # conversation-level Unified file is shared state, so it is never
+    # the source of a Memory observation.
+    unified = (
+        snapshot.get("unified")
+        if (
+            isinstance(snapshot, dict)
+            and snapshot.get("version")
+            == "memory-shadow-snapshot.v1"
+            and snapshot.get(
+                "conversation_id"
+            )
+            == conversation_id
         )
-    except Exception as exc:
-        logger.warning(
-            "[gateway.context_memory_flash] "
-            "read_failed=%s fail_open=true",
-            type(exc).__name__,
-        )
-        return
+        else None
+    )
 
-    # Bind to the Unified revision THIS request produced. A Unified
-    # file already overwritten by a concurrent request is not this
-    # request's evidence, so nothing is attributed to it.
     if (
         not isinstance(unified, dict)
         or unified.get("revision")
@@ -354,50 +364,88 @@ def observe_memory_exposure_shadow(
                         "stored": False,
                         "decision": "no_surface",
                         "reason":
-                            "unified_observation_stale",
+                            "unified_observation_unavailable",
                     },
                     ensure_ascii=False,
                     separators=(",", ":"),
                 ),
             )
+
+        if ledger_enabled:
+            logger.info(
+                "[gateway.context_exposure_ledger] %s",
+                json.dumps(
+                    {
+                        "mode": "shadow_only",
+                        "stored": False,
+                        "decision": "no_record",
+                        "reason":
+                            "unified_observation_unavailable",
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            )
+
         return
 
-    # Surfacing Policy: deterministic, rule-based, canonical order.
-    try:
-        policy = evaluate_surfacing_policy(
-            conversation_id=conversation_id,
-            unified=unified,
-            confidence_report=confidence_report,
-        )
-    except Exception as exc:
-        logger.warning(
-            "[gateway.context_memory_flash] "
-            "policy_failed=%s fail_open=true",
-            type(exc).__name__,
-        )
-        return
+    # --------------------------------------------------
+    # 1. Surfacing Policy -> Memory Flash
+    # --------------------------------------------------
 
     flash_output = None
 
     if flash_enabled:
+        policy = None
+
+        # Surfacing Policy: deterministic, rule-based, canonical
+        # order, and fed the real request-local evidence.
         try:
-            flash_output = update_memory_flash(
+            policy = evaluate_surfacing_policy(
                 conversation_id=conversation_id,
-                cognitive_request_id=(
-                    cognitive_request_id
+                unified=unified,
+                confidence_report=(
+                    confidence_report
                 ),
-                policy_report=policy,
-                expected_unified_revision=(
-                    expected_unified_revision
+                shadow_evidence=(
+                    snapshot.get("evidence")
+                    if isinstance(
+                        snapshot,
+                        dict,
+                    )
+                    else None
                 ),
             )
         except Exception as exc:
             logger.warning(
                 "[gateway.context_memory_flash] "
-                "store_failed=%s fail_open=true",
+                "policy_failed=%s fail_open=true",
                 type(exc).__name__,
             )
-        else:
+
+        if isinstance(policy, dict):
+            try:
+                flash_output = update_memory_flash(
+                    conversation_id=(
+                        conversation_id
+                    ),
+                    cognitive_request_id=(
+                        cognitive_request_id
+                    ),
+                    policy_report=policy,
+                    expected_unified_revision=(
+                        expected_unified_revision
+                    ),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[gateway.context_memory_flash] "
+                    "store_failed=%s fail_open=true",
+                    type(exc).__name__,
+                )
+                flash_output = None
+
+        if isinstance(flash_output, dict):
             logger.info(
                 "[gateway.context_memory_flash] %s",
                 json.dumps(
@@ -452,12 +500,20 @@ def observe_memory_exposure_shadow(
                 ),
             )
 
+    # --------------------------------------------------
+    # 2. Exposure Ledger (independent of Surfacing / Flash)
+    #
+    # retrieved != surfaced: this stage records that retrieval
+    # happened for THIS request even when Surfacing or Flash failed,
+    # was refused, or is turned off. Only its own failure skips it.
+    # --------------------------------------------------
+
     if not ledger_enabled:
         return
 
     # Only a memory that actually entered the Flash artifact is
     # surfaced. An eligible memory rejected by the item / token
-    # budget never counts as surfaced.
+    # budget never counts as surfaced, and with Flash OFF nothing is.
     surfaced_ids: list[str] = []
 
     if isinstance(flash_output, dict):
@@ -798,6 +854,11 @@ async def observe_unified_preview_gate(
                 conversation_id,
                 cognitive_request_id=(
                     cognitive_request_id
+                ),
+                snapshot=(
+                    unified.get(
+                        "memory_shadow_snapshot"
+                    )
                 ),
                 expected_unified_revision=(
                     unified.get("revision")

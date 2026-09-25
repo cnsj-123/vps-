@@ -4,6 +4,11 @@ import json
 import os
 import tempfile
 import unittest
+from datetime import (
+    datetime,
+    timedelta,
+    timezone,
+)
 from pathlib import Path
 from unittest.mock import patch
 
@@ -18,10 +23,58 @@ from ombrebrain.context.memory_flash import (
 from ombrebrain.context.memory_surfacing_policy import (
     evaluate_surfacing_policy,
 )
+from ombrebrain.context.retrieval_decision_shadow import (
+    build_candidate_evidence,
+)
 
 
 CID = "ctx_0123456789abcdef"
 RID = "ctxreq_0123456789abcdef0123456789abcdef"
+
+_NOW = datetime(
+    2026,
+    9,
+    26,
+    12,
+    0,
+    tzinfo=timezone.utc,
+)
+
+
+def _ts(hours):
+    return (
+        _NOW
+        - timedelta(hours=hours)
+    ).isoformat()
+
+
+def candidate(
+    memory_id="m1",
+    content="cue text",
+    *,
+    age_hours=100,
+    name=None,
+):
+    item = {
+        "id": memory_id,
+        "content": content,
+        "context_relevance": 0.9,
+    }
+
+    metadata = {}
+
+    if age_hours is not None:
+        metadata["last_active"] = _ts(
+            age_hours
+        )
+
+    if name is not None:
+        metadata["name"] = name
+
+    if metadata:
+        item["metadata"] = metadata
+
+    return item
 
 
 def allow_confidence():
@@ -51,7 +104,6 @@ def unified(
     memories,
     *,
     revision=3,
-    current_user_excluded=True,
 ):
     return {
         "version":
@@ -62,36 +114,30 @@ def unified(
             "memories": memories,
         },
         "telemetry": {
-            "current_user_excluded":
-                current_user_excluded,
+            "current_user_excluded": True,
         },
     }
 
 
-def memory(
-    memory_id,
-    content="cue text",
-    name=None,
-):
-    item = {
-        "id": memory_id,
-        "content": content,
-    }
-
-    if name is not None:
-        item["metadata"] = {"name": name}
-
-    return item
-
-
 def policy_for(
     memories,
+    *,
+    revision=3,
 ):
     return evaluate_surfacing_policy(
         conversation_id=CID,
-        unified=unified(memories),
+        unified=unified(
+            memories,
+            revision=revision,
+        ),
         confidence_report=(
             allow_confidence()
+        ),
+        shadow_evidence=(
+            build_candidate_evidence(
+                memories,
+                now=_NOW,
+            )
         ),
     )
 
@@ -288,18 +334,186 @@ class FlashCueTests(
         )
 
 
-class MemoryFlashArtifactTests(
+class FlashPolicyBindingTests(
     unittest.TestCase
 ):
+    """A Flash artifact may only be built from a bound policy."""
 
-    def _write(self, root, *, memories):
-        policy = policy_for(memories)
+    def _flash_path(self, root):
+        return (
+            Path(root)
+            / "memory_flash"
+            / CID
+            / (RID + ".json")
+        )
 
+    def _call(self, root, policy):
         return update_memory_flash(
             conversation_id=CID,
             cognitive_request_id=RID,
             policy_report=policy,
             expected_unified_revision=3,
+        )
+
+    def test_valid_policy_is_accepted(self):
+        with tempfile.TemporaryDirectory() as root:
+            with patch.dict(
+                os.environ,
+                {
+                    "OMBRE_CONTEXT_STATE_DIR":
+                        root,
+                },
+                clear=False,
+            ):
+                output = self._call(
+                    root,
+                    policy_for(
+                        [candidate("m1")]
+                    ),
+                )
+
+                self.assertTrue(
+                    self._flash_path(
+                        root
+                    ).is_file()
+                )
+
+        self.assertTrue(output["stored"])
+
+    def test_policy_unified_revision_mismatch(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as root:
+            with patch.dict(
+                os.environ,
+                {
+                    "OMBRE_CONTEXT_STATE_DIR":
+                        root,
+                },
+                clear=False,
+            ):
+                policy = policy_for(
+                    [candidate("m1")],
+                    revision=4,
+                )
+
+                output = self._call(
+                    root,
+                    policy,
+                )
+
+                self.assertFalse(
+                    self._flash_path(
+                        root
+                    ).exists()
+                )
+
+        self.assertFalse(output["stored"])
+        self.assertEqual(
+            output["reason"],
+            "flash_policy_unified_revision_mismatch",
+        )
+
+    def test_invalid_policy_source_revision(
+        self,
+    ):
+        policy = policy_for(
+            [candidate("m1")]
+        )
+        policy["source_unified_revision"] = None
+
+        with tempfile.TemporaryDirectory() as root:
+            with patch.dict(
+                os.environ,
+                {
+                    "OMBRE_CONTEXT_STATE_DIR":
+                        root,
+                },
+                clear=False,
+            ):
+                output = self._call(
+                    root,
+                    policy,
+                )
+
+                self.assertFalse(
+                    self._flash_path(
+                        root
+                    ).exists()
+                )
+
+        self.assertFalse(output["stored"])
+        self.assertEqual(
+            output["reason"],
+            "invalid_flash_policy_unified_revision",
+        )
+
+    def test_malformed_policy_report(self):
+        for policy in (
+            {
+                "version": "wrong",
+                "mode": "shadow_only",
+                "source_unified_revision": 3,
+            },
+            {
+                "version":
+                    "memory-surfacing-policy.v1",
+                "mode": "live",
+                "source_unified_revision": 3,
+            },
+            [],
+            None,
+            "nope",
+        ):
+            with tempfile.TemporaryDirectory() as root:
+                with patch.dict(
+                    os.environ,
+                    {
+                        "OMBRE_CONTEXT_STATE_DIR":
+                            root,
+                    },
+                    clear=False,
+                ):
+                    output = self._call(
+                        root,
+                        policy,
+                    )
+
+                    self.assertFalse(
+                        self._flash_path(
+                            root
+                        ).exists()
+                    )
+
+            self.assertFalse(output["stored"])
+
+            self.assertIn(
+                output["reason"],
+                (
+                    "malformed_policy_report",
+                    "invalid_policy_report",
+                ),
+            )
+
+
+class MemoryFlashArtifactTests(
+    unittest.TestCase
+):
+
+    def _write(
+        self,
+        *,
+        memories,
+        revision=3,
+    ):
+        return update_memory_flash(
+            conversation_id=CID,
+            cognitive_request_id=RID,
+            policy_report=policy_for(
+                memories,
+                revision=revision,
+            ),
+            expected_unified_revision=revision,
         )
 
     def test_artifact_is_written_per_request(
@@ -315,11 +529,16 @@ class MemoryFlashArtifactTests(
                 clear=False,
             ):
                 output = self._write(
-                    root,
                     memories=[
-                        memory("m1"),
-                        memory("m2"),
-                    ],
+                        candidate(
+                            "m1",
+                            "cue one",
+                        ),
+                        candidate(
+                            "m2",
+                            "cue two",
+                        ),
+                    ]
                 )
 
                 path = (
@@ -370,7 +589,10 @@ class MemoryFlashArtifactTests(
                     cognitive_request_id=RID,
                     policy_report=policy_for(
                         [
-                            memory(f"m{i}")
+                            candidate(
+                                f"m{i}",
+                                f"cue {i}",
+                            )
                             for i in range(5)
                         ]
                     ),
@@ -404,17 +626,17 @@ class MemoryFlashArtifactTests(
                     cognitive_request_id=RID,
                     policy_report=policy_for(
                         [
-                            memory(
+                            candidate(
                                 "m1",
-                                content="aaa",
+                                "aaa",
                             ),
-                            memory(
+                            candidate(
                                 "m2",
-                                content="bbb",
+                                "bbb",
                             ),
-                            memory(
+                            candidate(
                                 "m3",
-                                content="ccc",
+                                "ccc",
                             ),
                         ]
                     ),
@@ -453,13 +675,12 @@ class MemoryFlashArtifactTests(
                 clear=False,
             ):
                 self._write(
-                    root,
                     memories=[
-                        memory(
+                        candidate(
                             "m1",
-                            content=secret,
+                            secret,
                         )
-                    ],
+                    ]
                 )
 
                 text = (
@@ -496,26 +717,13 @@ class MemoryFlashArtifactTests(
                 },
                 clear=False,
             ):
-                policy = evaluate_surfacing_policy(
-                    conversation_id=CID,
-                    unified=unified(
-                        [
-                            memory(
-                                "m1",
-                                content="",
-                            )
-                        ]
-                    ),
-                    confidence_report=(
-                        allow_confidence()
-                    ),
-                )
-
-                output = update_memory_flash(
-                    conversation_id=CID,
-                    cognitive_request_id=RID,
-                    policy_report=policy,
-                    expected_unified_revision=3,
+                output = self._write(
+                    memories=[
+                        candidate(
+                            "m1",
+                            "",
+                        )
+                    ]
                 )
 
                 status = memory_flash_status(
@@ -531,6 +739,10 @@ class MemoryFlashArtifactTests(
         self.assertEqual(
             output["surfaced_count"],
             0,
+        )
+        self.assertEqual(
+            output["reason"],
+            "no_flashable_cue",
         )
         self.assertTrue(status["exists"])
         self.assertEqual(
@@ -549,13 +761,12 @@ class MemoryFlashArtifactTests(
                 clear=False,
             ):
                 self._write(
-                    root,
                     memories=[
-                        memory(
+                        candidate(
                             "m1",
                             name="SECRET_CUE",
                         )
-                    ],
+                    ]
                 )
 
                 status = memory_flash_status(
@@ -589,7 +800,7 @@ class MemoryFlashArtifactTests(
                 clear=False,
             ):
                 policy = policy_for(
-                    [memory("m1")]
+                    [candidate("m1")]
                 )
 
                 update_memory_flash(
@@ -689,8 +900,7 @@ class MemoryFlashArtifactTests(
                 clear=False,
             ):
                 self._write(
-                    root,
-                    memories=[memory("m1")],
+                    memories=[candidate("m1")],
                 )
 
             self.assertEqual(

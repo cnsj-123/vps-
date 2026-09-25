@@ -41,6 +41,35 @@ class RetrievalDecisionShadowObservation:
         }
 
 
+@dataclass(frozen=True)
+class RetrievalDecisionShadowCandidate:
+    """One candidate's conservative.v1 decision.
+
+    Observation only. ``keep_bucket`` distinguishes the two keep
+    cases that ``observe()`` aggregates separately; it is deliberately
+    not part of ``to_dict()`` because downstream observers only need
+    the id, the order and the keep/drop reason.
+    """
+
+    memory_id: str = ""
+    index: int = 0
+    would_keep: bool = True
+    reason: str = "keep"
+    keep_bucket: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "memory_id":
+                self.memory_id,
+            "index":
+                self.index,
+            "would_keep":
+                self.would_keep,
+            "reason":
+                self.reason,
+        }
+
+
 class RetrievalDecisionShadowObserver:
     """Simulate a conservative future retrieval filter.
 
@@ -55,6 +84,11 @@ class RetrievalDecisionShadowObserver:
 
     Drop-reason precedence:
     recent_24h -> duplicate_id -> exact_text_duplicate.
+
+    ``observe_candidates()`` is the per-candidate form of exactly the
+    same policy and ``observe()`` aggregates it, so the conservative
+    rules are defined once. Neither call filters, reorders, re-scores
+    or changes a retrieval result; `to_dict()` stays byte-compatible.
     """
 
     @staticmethod
@@ -108,7 +142,7 @@ class RetrievalDecisionShadowObserver:
 
         return value.strip()
 
-    def observe(
+    def observe_candidates(
         self,
         items: (
             list[dict[str, Any]]
@@ -116,7 +150,15 @@ class RetrievalDecisionShadowObserver:
         ),
         *,
         now: datetime | None = None,
-    ) -> RetrievalDecisionShadowObservation:
+    ) -> list[
+        RetrievalDecisionShadowCandidate
+    ]:
+        """Per-candidate decisions of the same conservative.v1 policy.
+
+        Observation only: the input is never mutated, filtered or
+        reordered, and no retrieval result, scorer weight, threshold
+        or ranking is affected.
+        """
 
         now = (
             now
@@ -128,15 +170,11 @@ class RetrievalDecisionShadowObserver:
         seen_ids: set[str] = set()
         seen_text: set[str] = set()
 
-        would_keep = 0
-        drop_recent = 0
-        drop_id = 0
-        drop_text = 0
+        decisions: list[
+            RetrievalDecisionShadowCandidate
+        ] = []
 
-        keep_24_72 = 0
-        keep_missing = 0
-
-        for item in items:
+        for index, item in enumerate(items):
 
             if not isinstance(
                 item,
@@ -144,7 +182,15 @@ class RetrievalDecisionShadowObserver:
             ):
                 # Retrieval currently only returns dicts.
                 # Fail-open if that invariant ever changes.
-                would_keep += 1
+                decisions.append(
+                    RetrievalDecisionShadowCandidate(
+                        "",
+                        index,
+                        True,
+                        "keep",
+                        None,
+                    )
+                )
                 continue
 
             metadata = (
@@ -176,26 +222,42 @@ class RetrievalDecisionShadowObserver:
                     / 3600.0,
                 )
 
+            bucket_id = str(
+                item.get("id")
+                or ""
+            ).strip()
+
             # Conservative anti-echo simulation:
             # only <24h would be dropped.
             if (
                 age_hours is not None
                 and age_hours < 24.0
             ):
-                drop_recent += 1
+                decisions.append(
+                    RetrievalDecisionShadowCandidate(
+                        bucket_id,
+                        index,
+                        False,
+                        "recent_24h",
+                        None,
+                    )
+                )
                 continue
-
-            bucket_id = str(
-                item.get("id")
-                or ""
-            ).strip()
 
             if (
                 bucket_id
                 and bucket_id
                 in seen_ids
             ):
-                drop_id += 1
+                decisions.append(
+                    RetrievalDecisionShadowCandidate(
+                        bucket_id,
+                        index,
+                        False,
+                        "duplicate_id",
+                        None,
+                    )
+                )
                 continue
 
             text = self._text(
@@ -206,11 +268,30 @@ class RetrievalDecisionShadowObserver:
                 text
                 and text in seen_text
             ):
-                drop_text += 1
+                decisions.append(
+                    RetrievalDecisionShadowCandidate(
+                        bucket_id,
+                        index,
+                        False,
+                        "exact_text_duplicate",
+                        None,
+                    )
+                )
                 continue
 
             # Candidate survives the simulated filter.
-            would_keep += 1
+            keep_bucket = None
+
+            if last_active is None:
+                keep_bucket = (
+                    "missing_last_active"
+                )
+
+            elif (
+                age_hours is not None
+                and age_hours < 72.0
+            ):
+                keep_bucket = "recent_24_72h"
 
             if bucket_id:
                 seen_ids.add(
@@ -218,18 +299,77 @@ class RetrievalDecisionShadowObserver:
                 )
 
             if text:
-                seen_text.add(
-                    text
+                seen_text.add(text)
+
+            decisions.append(
+                RetrievalDecisionShadowCandidate(
+                    bucket_id,
+                    index,
+                    True,
+                    "keep",
+                    keep_bucket,
                 )
+            )
 
-            if last_active is None:
-                keep_missing += 1
+        return decisions
 
-            elif (
-                age_hours is not None
-                and age_hours < 72.0
-            ):
-                keep_24_72 += 1
+    def observe(
+        self,
+        items: (
+            list[dict[str, Any]]
+            | tuple[dict[str, Any], ...]
+        ),
+        *,
+        now: datetime | None = None,
+    ) -> RetrievalDecisionShadowObservation:
+
+        candidates = (
+            self.observe_candidates(
+                items,
+                now=now,
+            )
+        )
+
+        would_keep = sum(
+            1
+            for candidate in candidates
+            if candidate.would_keep
+        )
+
+        drop_recent = sum(
+            1
+            for candidate in candidates
+            if candidate.reason
+            == "recent_24h"
+        )
+
+        drop_id = sum(
+            1
+            for candidate in candidates
+            if candidate.reason
+            == "duplicate_id"
+        )
+
+        drop_text = sum(
+            1
+            for candidate in candidates
+            if candidate.reason
+            == "exact_text_duplicate"
+        )
+
+        keep_24_72 = sum(
+            1
+            for candidate in candidates
+            if candidate.keep_bucket
+            == "recent_24_72h"
+        )
+
+        keep_missing = sum(
+            1
+            for candidate in candidates
+            if candidate.keep_bucket
+            == "missing_last_active"
+        )
 
         total = len(items)
 
@@ -259,3 +399,35 @@ class RetrievalDecisionShadowObserver:
                     keep_missing,
             )
         )
+
+
+def build_candidate_evidence(
+    items: (
+        list[Any]
+        | tuple[Any, ...]
+    ),
+    *,
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    """Request-local, shadow-only per-candidate evidence.
+
+    One entry per candidate, in canonical retrieval order, carrying
+    only ``memory_id`` / ``index`` / ``would_keep`` / ``reason`` from
+    the existing conservative.v1 policy. No text, no score, no
+    threshold and no timestamp is included, and nothing is persisted
+    or logged by this function.
+    """
+
+    observer = (
+        RetrievalDecisionShadowObserver()
+    )
+
+    return [
+        candidate.to_dict()
+        for candidate in (
+            observer.observe_candidates(
+                items,
+                now=now,
+            )
+        )
+    ]
