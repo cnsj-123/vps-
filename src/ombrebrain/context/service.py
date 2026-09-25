@@ -201,6 +201,15 @@ class ContextService:
                         )
                         or {}
                     ),
+                # Retrieval v2 shadow report (counts and
+                # score statistics only, never text or ids).
+                "retrieval_quality_v2":
+                    dict(
+                        telemetry.get(
+                            "retrieval_quality_v2"
+                        )
+                        or {}
+                    ),
                 "outcome":
                     str(
                         telemetry.get(

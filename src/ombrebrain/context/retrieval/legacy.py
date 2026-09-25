@@ -12,6 +12,9 @@ from ombrebrain.context.dedup import (
 from ombrebrain.context.retrieval_decision_shadow import (
     RetrievalDecisionShadowObserver,
 )
+from ombrebrain.context.retrieval.quality import (
+    RetrievalQualityShadow,
+)
 
 
 _SEMANTIC_RECALL_FLOOR = 0.55
@@ -33,6 +36,13 @@ class ContextRetrievalAdapter:
     decision_shadow_observer: (
         RetrievalDecisionShadowObserver
     ) = RetrievalDecisionShadowObserver()
+
+    # Retrieval v2 shadow pipeline. Observation-only: it
+    # re-ranks the already-included results in parallel and
+    # never changes what retrieve() returns.
+    quality_v2_shadow: RetrievalQualityShadow = (
+        RetrievalQualityShadow()
+    )
 
     async def _semantic_scores(
         self,
@@ -168,6 +178,27 @@ class ContextRetrievalAdapter:
                 included
             )
         )
+
+        # Retrieval v2 shadow: score + rerank the same
+        # included results and record what would change.
+        # Fail-open: a shadow error never breaks retrieval.
+        try:
+            quality_v2 = (
+                self.quality_v2_shadow
+                .observe(included)
+            )
+        except Exception:
+            quality_v2 = (
+                RetrievalQualityShadow
+                .observe_failed()
+            )
+
+        try:
+            self.quality_v2_shadow.emit(
+                quality_v2
+            )
+        except Exception:
+            pass
 
         context_relevances = [
             float(
@@ -306,6 +337,11 @@ class ContextRetrievalAdapter:
             # Retrieval results above are NOT changed.
             "decision_shadow":
                 decision_shadow.to_dict(),
+
+            # Retrieval v2 shadow pipeline report.
+            # Counts and score statistics only.
+            "retrieval_quality_v2":
+                quality_v2,
         }
 
     async def retrieve(
