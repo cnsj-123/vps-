@@ -810,6 +810,34 @@ def update_memory_flash(
     return output
 
 
+def read_memory_flash(
+    *,
+    conversation_id: str,
+    cognitive_request_id: str,
+) -> dict[str, Any] | None:
+    """Read the raw Flash artifact for one (conversation, request).
+
+    Minimal read-only accessor for the Recall control plane: an
+    explicit Recall Request must be validated against the exact set
+    of memories that were truly ``surfaced_as_flash`` for THIS
+    request, so it needs the real ``flashes[].memory_id`` values and
+    the ``source_unified_revision`` the Flash was built from.
+
+    It reads one artifact and never writes, mutates or re-derives
+    anything. The per-request path means a concurrent same-
+    conversation request can never be mistaken for this one. Returns
+    None when the artifact does not exist or is not a JSON object.
+    """
+
+    return _read_json(
+        _path(
+            "memory_flash",
+            conversation_id,
+            cognitive_request_id,
+        )
+    )
+
+
 def memory_flash_status(
     *,
     conversation_id: str,
