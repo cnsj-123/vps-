@@ -726,7 +726,14 @@ class LiveRecallMCPViewTests(unittest.TestCase):
         with self._state_env(root):
             token = self._mint(root)
 
-            for name in ("hold", "trace"):
+            for name in (
+                "hold",
+                "trace",
+                "grow",
+                "breath",
+                "breath_search",
+                "plan",
+            ):
                 app, fake = self._capability_app()
 
                 sent = _run(
@@ -1134,6 +1141,171 @@ class LiveRecallMCPViewTests(unittest.TestCase):
             view_module.LiveRecallMCPView(fake),
             fake,
         )
+
+
+class MCPAuthPrecedenceTests(unittest.TestCase):
+    """Normal-token semantics are evaluated BEFORE the capability fallback."""
+
+    def test_normal_auth_wins_over_capability_fallback(self):
+        resolver_calls = []
+
+        def resolver(token):
+            resolver_calls.append(token)
+            return {
+                "conversation_id": CID,
+                "cognitive_request_id": RID,
+            }
+
+        # A normal token whose SHAPE looks exactly like a capability
+        # token. The normal validator accepts it.
+        app, fake = _build(
+            auth_required=True,
+            auth_mode="token",
+            token_validator=(
+                lambda token, resource="": token
+                == _CAPABILITY_TOKEN
+            ),
+            resolver=resolver,
+        )
+
+        listing = _run(
+            _drive(
+                app,
+                _tools_list(),
+                auth_header=_CAPABILITY_TOKEN,
+            )
+        )
+
+        status, _headers, payload, raw = _parse(listing)
+
+        self.assertEqual(status, 200)
+
+        names = [
+            tool["name"]
+            for tool in payload["result"]["tools"]
+        ]
+
+        # Normal public view, Recall hidden.
+        self.assertEqual(
+            names, ["hold", "grow", "trace"]
+        )
+        self.assertNotIn("Recall", names)
+        self.assertNotIn("Recall", raw.decode("utf-8"))
+
+        # The resolver must not have been consulted at all.
+        self.assertEqual(resolver_calls, [])
+
+        # And it is not a capability view: calling Recall is refused.
+        call = _run(
+            _drive(
+                app,
+                _tools_call(
+                    "Recall", {"memref": _MEMREF_A}
+                ),
+                auth_header=_CAPABILITY_TOKEN,
+            )
+        )
+
+        _s, _h, error, _r = _parse(call)
+
+        self.assertEqual(error["error"]["code"], -32601)
+        self.assertEqual(fake.handler_calls, [])
+
+    def test_plain_token_never_becomes_capability_when_auth_off(self):
+        resolver_calls = []
+
+        def resolver(token):
+            resolver_calls.append(token)
+            return {
+                "conversation_id": CID,
+                "cognitive_request_id": RID,
+            }
+
+        app, fake = _build(
+            auth_required=False,
+            resolver=resolver,
+        )
+
+        sent = _run(
+            _drive(
+                app,
+                _tools_list(),
+                auth_header="plain-normal-token",
+            )
+        )
+
+        status, _headers, payload, raw = _parse(sent)
+
+        self.assertEqual(status, 200)
+
+        names = [
+            tool["name"]
+            for tool in payload["result"]["tools"]
+        ]
+
+        self.assertNotIn("Recall", names)
+        self.assertNotIn("Recall", raw.decode("utf-8"))
+        self.assertEqual(resolver_calls, [])
+        self.assertEqual(fake.handler_calls, [])
+
+    def test_capability_view_still_reachable_when_auth_off(self):
+        tmp = tempfile.TemporaryDirectory()
+
+        self.addCleanup(tmp.cleanup)
+
+        seed_live_exposure(
+            tmp.name,
+            [
+                memory("m-1", "alpha text", name="alpha"),
+                memory("m-2", "beta text", name="beta"),
+            ],
+        )
+
+        fake = FakeMCP()
+
+        with patch.dict(
+            os.environ,
+            {"OMBRE_CONTEXT_STATE_DIR": tmp.name},
+            clear=False,
+        ):
+            from ombrebrain.context.live_recall_transport_capability import (
+                mint_live_recall_transport_capability,
+            )
+
+            token, _report = (
+                mint_live_recall_transport_capability(
+                    conversation_id=CID,
+                    cognitive_request_id=RID,
+                )
+            )
+
+            app, fake = _build(
+                auth_required=False,
+                resolver=(
+                    resolve_live_recall_transport_capability
+                ),
+                probe=(
+                    live_recall_transport_capability_expired
+                ),
+            )
+
+            sent = _run(
+                _drive(
+                    app,
+                    _tools_list(),
+                    auth_header=token,
+                )
+            )
+
+        status, _headers, payload, _raw = _parse(sent)
+
+        self.assertEqual(status, 200)
+
+        tools = payload["result"]["tools"]
+
+        self.assertEqual(len(tools), 1)
+        self.assertEqual(tools[0]["name"], "Recall")
+        self.assertEqual(fake.handler_calls, [])
 
 
 class BuildHttpAppOrderTests(unittest.TestCase):

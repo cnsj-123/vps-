@@ -299,23 +299,17 @@ class MCPAuthMiddleware:
             headers = {key.lower(): value for key, value in scope.get("headers", [])}
             auth = headers.get(b"authorization", b"").decode("latin-1")
             bearer_token = _extract_bearer_token(auth)
-            # Capability resolution is independent of
-            # ``mcp_require_auth``: even with auth disabled, Recall
-            # still requires a valid capability. A normal token (or an
-            # anonymous request) simply resolves to no binding.
-            capability_binding = (
-                self._resolve_live_recall_capability(
-                    bearer_token
-                )
-                if bearer_token
-                else None
-            )
+            capability_binding = None
             if self.auth_required:
                 base = _canonical_mcp_base(scope, headers, self.public_origin)
                 # OAuth discovery currently exposes one canonical MCP resource.
                 resource = f"{base}{self.resource_path}"
-                valid = capability_binding is not None
-                if bearer_token and capability_binding is None:
+                # Existing normal-token semantics come FIRST. A normal
+                # OAuth / static token that happens to look like a
+                # capability token is still a normal token and must
+                # never be resolved (or scoped) as a capability.
+                valid = False
+                if bearer_token:
                     primary_valid = bool(
                         self.token_validator(bearer_token, resource=resource)
                     )
@@ -328,7 +322,6 @@ class MCPAuthMiddleware:
                     valid = primary_valid | static_valid
                 if (
                     not valid
-                    and capability_binding is None
                     and self.auth_mode in ("token", "hybrid")
                 ):
                     # Fallback header for MCP clients that can't customize
@@ -345,6 +338,16 @@ class MCPAuthMiddleware:
                         valid = bool(static_validator) and static_validator(
                             alt_token, resource=resource
                         )
+                if not valid:
+                    # Normal auth failed: only now fall back to a
+                    # short-lived live recall capability, and only for
+                    # an ``Authorization: Bearer obrcap_...`` token.
+                    capability_binding = (
+                        self._resolve_live_recall_capability(
+                            bearer_token
+                        )
+                    )
+                    valid = capability_binding is not None
                 if not valid:
                     endpoint = self.resource_path.strip("/")
                     if self.auth_mode == "token":
@@ -385,6 +388,18 @@ class MCPAuthMiddleware:
                         }
                     )
                     return
+            else:
+                # With auth disabled the anonymous view is the normal
+                # view; Recall still requires a valid capability, so a
+                # bearer capability is resolved here too. A normal
+                # (non-obrcap) token resolves to no binding and can
+                # never become a capability view.
+                if bearer_token:
+                    capability_binding = (
+                        self._resolve_live_recall_capability(
+                            bearer_token
+                        )
+                    )
             if capability_binding is not None:
                 # Downstream middleware (the MCP view) reads these scope
                 # keys. The token itself is deliberately never stored.
