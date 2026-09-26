@@ -20,6 +20,9 @@ from ombrebrain.context.memory_flash import (
 from ombrebrain.context.memory_recall_surface import (
     update_recall_surface,
 )
+from ombrebrain.context.memory_flash_live_exposure import (
+    select_live_memory_flash_body,
+)
 from ombrebrain.context.memory_surfacing_lifecycle import (
     apply_lifecycle_surfacing_gate,
 )
@@ -53,18 +56,21 @@ from ombrebrain.context.unified_context_candidate import (
 # Owns the Context chain that used to be orchestrated inline by
 # src/web/gateway.py:
 #
-#   Unified
-#     -> Confidence Gate (shadow only)
-#       -> Memory Surfacing Policy (shadow only)
-#         -> Lifecycle Surfacing gate (shadow only, default OFF)
-#           -> Memory Flash (shadow only)
-#             -> Exposure Ledger (shadow only)
-#               -> Preview
-#                 -> Gate
-#                   -> per-request freshness latch
-#                     -> Mutation Shadow
-#                       -> Real Injection selector
-#                         -> selected_body
+#   conversation sources
+#     -> Unified
+#       -> Confidence Gate (shadow only)
+#         -> Memory Surfacing Policy (shadow only)
+#           -> Lifecycle Surfacing gate (shadow only, default OFF)
+#             -> Memory Flash (shadow only)
+#               -> Recall Surface (shadow only, default OFF)
+#                 -> Exposure Ledger (shadow only)
+#                   -> Preview
+#                     -> Gate
+#                       -> per-request freshness latch
+#                         -> Mutation Shadow
+#                           -> Real Context Injection selector
+#                             -> Live Memory Flash Exposure
+#                               -> upstream body
 #
 # The gateway only forwards the bytes returned by
 # ``run_context_pipeline()``. It no longer decides when a stage
@@ -73,23 +79,32 @@ from ombrebrain.context.unified_context_candidate import (
 #
 # Safety invariants (unchanged, owned here):
 #   - real injection is default OFF;
+#   - Live Memory Flash Exposure is default OFF, is a strictly
+#     post-Real-Injection mutation stage, and is fail-open relative to
+#     its own input (a Live Exposure failure never undoes an already
+#     applied Context Real Injection);
 #   - every stage is fail-open: the live request keeps forward_body;
 #   - the Mutation Shadow and the Real Injection selector may only
 #     read Preview/Gate refreshed by THIS request;
 #   - the Confidence Gate is an observer: its decision is never a
 #     prerequisite and never changes the forwarded body;
-#   - Memory Surfacing / Memory Flash / Exposure Ledger are observers
-#     too: flash is a cue, not a full memory, it never enters
-#     Unified / Preview / Mutation / Real Injection, and no
-#     reinforcement of any memory ever occurs here;
+#   - Memory Surfacing / Memory Flash / Exposure Ledger / Recall
+#     Surface are observers too: a flash is a cue, not a full memory,
+#     it never enters Unified / Preview / Mutation / Real Injection,
+#     and no reinforcement of any memory ever occurs here;
+#   - Live Memory Flash Exposure only ever forwards the small,
+#     already-bounded cue + opaque memref from THIS request's Recall
+#     Surface. It exposes nothing else, performs no Recall, records no
+#     usage and changes no memory / lifecycle state;
 #   - no HTTP error is produced and the request is never blocked;
-#   - the NEW Memory Flash / Exposure Ledger log lines are
-#     privacy-safe (counts, revisions, booleans, reason codes) and
+#   - the NEW Memory Flash / Exposure Ledger / Live Exposure log lines
+#     are privacy-safe (counts, revisions, booleans, reason codes) and
 #     never include a conversation id, a cognitive request id, a
-#     memory id or any cue / memory / query text. That guarantee is
-#     scoped to those new stages: the pre-existing Unified /
-#     Preview / Gate / Mutation / Real Injection log lines are
-#     unchanged, and some of them do still include conversation_id.
+#     memory id, a memref or any cue / memory / query text. That
+#     guarantee is scoped to those new stages: the pre-existing
+#     Unified / Preview / Gate / Mutation / Real Injection log lines
+#     are unchanged, and some of them do still include
+#     conversation_id.
 #
 # This module performs no retrieval and no selection: it composes
 # existing context stages only. All surfacing rules live in
@@ -104,6 +119,15 @@ logger = logging.getLogger("ombre_brain.gateway")
 # pipeline on its own. Default OFF.
 _MEMORY_SURFACING_LIFECYCLE_ENV = (
     "OMBRE_GATEWAY_CONTEXT_MEMORY_SURFACING_LIFECYCLE"
+)
+
+# Live Memory Flash Exposure master flag. It is a strictly post-Real-
+# Injection mutation stage and never starts the Memory observer
+# pipeline on its own: the existing Memory Flash / Exposure Ledger /
+# Recall Surface flags still decide whether that observer runs.
+# Default OFF.
+_MEMORY_FLASH_LIVE_EXPOSURE_ENV = (
+    "OMBRE_GATEWAY_CONTEXT_MEMORY_FLASH_LIVE_EXPOSURE"
 )
 
 
@@ -1441,6 +1465,214 @@ def select_real_injection(
     return selected_body
 
 
+def select_live_memory_flash_exposure(
+    conversation_id: str | None,
+    cognitive_request_id: str | None,
+    body: bytes,
+) -> bytes:
+    """Live Memory Flash Exposure v1 (limited_live_exposure).
+
+    A strictly post-Real-Injection mutation stage: the body it receives
+    is already the (possibly Context-injected) selected body, and it
+    only ever returns either that exact body or a body with one extra
+    DATA-ONLY Memory Flash block at the start of the current user
+    message.
+
+    Default-OFF contract:
+      - without OMBRE_GATEWAY_CONTEXT_MEMORY_FLASH_LIVE_EXPOSURE=1 the
+        selector is not even called and the exact body is returned;
+      - the selector itself re-checks the master flag, both upstream
+        shadow flags and the request-scoped Recall Surface;
+      - any exception, missing dependency, missing / corrupt surface,
+        unsupported request shape, failed invariant or receipt failure
+        returns the exact input body;
+      - it is fail-open *relative to its own input*: a Live Exposure
+        failure returns the body it was given, so it never undoes an
+        already applied Context Real Injection;
+      - it never blocks the request and produces no HTTP error;
+      - only privacy-safe telemetry is logged: no conversation id, no
+        cognitive request id, no memref and no cue.
+
+    This wrapper never raises: every failure path returns ``body``.
+    """
+
+    try:
+        if not _truthy(
+            os.environ.get(
+                _MEMORY_FLASH_LIVE_EXPOSURE_ENV
+            )
+        ):
+            return body
+
+        if (
+            not isinstance(body, bytes)
+            or not isinstance(
+                conversation_id,
+                str,
+            )
+            or not isinstance(
+                cognitive_request_id,
+                str,
+            )
+        ):
+            return body
+
+        try:
+            selected_body, report = (
+                select_live_memory_flash_body(
+                    body,
+                    conversation_id=(
+                        conversation_id
+                    ),
+                    cognitive_request_id=(
+                        cognitive_request_id
+                    ),
+                )
+            )
+        except Exception as exc:
+            logger.warning(
+                "[gateway.context_memory_flash_live_exposure] "
+                "select_failed=%s fail_open=true",
+                type(exc).__name__,
+            )
+            return body
+
+        if (
+            not isinstance(selected_body, bytes)
+            or not isinstance(report, dict)
+        ):
+            logger.warning(
+                "[gateway.context_memory_flash_live_exposure] "
+                "invalid_selection fail_open=true"
+            )
+            return body
+
+        applied = report.get("applied")
+
+        if applied is not True:
+            if selected_body != body:
+                # Safety net: the body must never change without an
+                # explicit applied=true decision.
+                logger.warning(
+                    "[gateway.context_memory_flash_live_exposure] "
+                    "unapplied_body_change fail_open=true"
+                )
+                return body
+        else:
+            # Defense-in-depth: never blindly trust an applied=true
+            # report from the selector.
+            if (
+                selected_body == body
+                or report.get("version")
+                != "memory-flash-live-exposure.v1"
+                or report.get("reason")
+                != "live_exposure_applied"
+                or report.get("original_sha256")
+                != hashlib.sha256(
+                    body
+                ).hexdigest()
+                or report.get("selected_sha256")
+                != hashlib.sha256(
+                    selected_body
+                ).hexdigest()
+            ):
+                logger.warning(
+                    "[gateway.context_memory_flash_live_exposure] "
+                    "invalid_applied_selection "
+                    "fail_open=true"
+                )
+                return body
+
+        # Privacy-safe telemetry only. Explicit allowlist: no
+        # conversation id, request id, memref, cue, raw memory id,
+        # query or rendered body can leak, even if the report grew an
+        # unexpected field.
+        logger.info(
+            "[gateway.context_memory_flash_live_exposure] %s",
+            json.dumps(
+                {
+                    "enabled":
+                        report.get("enabled"),
+                    "applied":
+                        report.get("applied"),
+                    "reason":
+                        report.get("reason"),
+                    "duplicate":
+                        report.get("duplicate"),
+                    "surface_count":
+                        report.get(
+                            "surface_count"
+                        ),
+                    "live_exposed_count":
+                        report.get(
+                            "live_exposed_count"
+                        ),
+                    "estimated_tokens":
+                        report.get(
+                            "estimated_tokens"
+                        ),
+                    "token_budget":
+                        report.get(
+                            "token_budget"
+                        ),
+                    "byte_delta":
+                        report.get("byte_delta"),
+                    "source_flash_unified_revision":
+                        report.get(
+                            "source_flash_unified_revision"
+                        ),
+                    "boundary_preserved":
+                        report.get(
+                            "boundary_preserved"
+                        ),
+                    "history_preserved":
+                        report.get(
+                            "history_preserved"
+                        ),
+                    "system_preserved":
+                        report.get(
+                            "system_preserved"
+                        ),
+                    "tools_preserved":
+                        report.get(
+                            "tools_preserved"
+                        ),
+                    "params_preserved":
+                        report.get(
+                            "params_preserved"
+                        ),
+                    "model_preserved":
+                        report.get(
+                            "model_preserved"
+                        ),
+                    "message_count_preserved":
+                        report.get(
+                            "message_count_preserved"
+                        ),
+                    "cache_marker_count_preserved":
+                        report.get(
+                            "cache_marker_count_preserved"
+                        ),
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        )
+
+        return selected_body
+    except Exception as exc:
+        # Absolute fail-open *relative to this stage's input*: never
+        # break forwarding and never undo a successful Context Real
+        # Injection. Only the exception type is logged.
+        logger.warning(
+            "[gateway.context_memory_flash_live_exposure] "
+            "stage_failed=%s fail_open=true",
+            type(exc).__name__,
+        )
+
+        return body
+
+
 async def run_context_pipeline(
     forward_body: bytes,
 ) -> bytes:
@@ -1453,20 +1685,31 @@ async def run_context_pipeline(
     Injection itself.
 
     Ordering matters: conversation sources -> Unified -> Confidence
-    Shadow -> Memory Surfacing Policy Shadow -> Memory Flash Shadow ->
-    Exposure Ledger Shadow -> Preview -> Injection Gate -> freshness
-    -> Mutation Shadow -> Real Injection. The Mutation Shadow must
-    never read Preview/Gate left on disk by an earlier request.
+    Shadow -> Memory Surfacing Policy Shadow -> Lifecycle Surfacing ->
+    Memory Flash Shadow -> Recall Surface Shadow -> Exposure Ledger
+    Shadow -> Preview -> Injection Gate -> freshness -> Mutation
+    Shadow -> Real Context Injection -> Live Memory Flash Exposure.
+    The Mutation Shadow must never read Preview/Gate left on disk by an
+    earlier request.
+
+    Live Memory Flash Exposure is a strictly POST-Real-Injection
+    mutation stage: it receives whatever Real Context Injection
+    produced and only ever adds one small DATA-ONLY Memory Flash block
+    (opaque memref + bounded cue) at the start of the current user
+    message. It is default OFF, is fail-open relative to its own input
+    (so a Live Exposure failure returns the Context-injected body, not
+    the earliest forward_body) and never performs a Recall.
 
     The Confidence Shadow stage is observation-only: it is bound to
     the Unified revision this request just produced, and neither its
     result nor its presence is a prerequisite for any later stage.
 
     A per-request cognitive request id (``ctxreq_<32 hex>``) is
-    minted here. It is used only by the Memory Flash / Exposure
-    Ledger shadows; it is never added to the body, a header, a cache
-    key, a request hash or a log, and it never reaches the model or
-    affects Real Injection.
+    minted here. It remains internal and is never serialized into the
+    model-facing request; it is only used to bind the Recall Surface
+    and Live Exposure internally. The cue + memref found through it
+    may reach the model, but the id itself never does, and it is never
+    added to the body, a header, a cache key, a request hash or a log.
 
     Default-OFF and fail-open: with
     OMBRE_GATEWAY_CONTEXT_REAL_INJECTION unset (or on any deny /
@@ -1480,7 +1723,8 @@ async def run_context_pipeline(
 
     try:
         # Internal, per-request identity for the shadow Memory
-        # observers only. Never leaves shadow state.
+        # observers and for the request-scoped Recall Surface / Live
+        # Exposure binding only. Never leaves internal state.
         cognitive_request_id = (
             "ctxreq_"
             + secrets.token_hex(16)
@@ -1507,11 +1751,20 @@ async def run_context_pipeline(
                 forward_body,
             )
 
-        return select_real_injection(
+        selected_body = select_real_injection(
             conversation_id,
             forward_body,
             context_chain_fresh=
                 context_chain_fresh,
+        )
+
+        # Strictly post-Real-Injection, fail-open relative to its own
+        # input: a Live Exposure failure returns ``selected_body`` and
+        # never reverts an already applied Context injection.
+        return select_live_memory_flash_exposure(
+            conversation_id,
+            cognitive_request_id,
+            selected_body,
         )
 
     except Exception as exc:
