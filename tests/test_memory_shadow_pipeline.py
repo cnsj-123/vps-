@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import os
 import tempfile
+import threading
 import unittest
+from concurrent.futures import (
+    ThreadPoolExecutor,
+)
 from datetime import (
     datetime,
     timedelta,
@@ -13,6 +18,7 @@ from datetime import (
 from pathlib import Path
 from unittest.mock import (
     AsyncMock,
+    Mock,
     patch,
 )
 
@@ -31,7 +37,10 @@ from ombrebrain.context.retrieval_decision_shadow import (
 from ombrebrain.context.unified_context_candidate import (
     bind_context_service,
     build_unified_context_candidate,
+    update_unified_context_candidate_from_runtime,
 )
+
+import ombrebrain.context.unified_context_candidate as unified_module
 
 
 CID = "ctx_0123456789abcdef"
@@ -185,6 +194,49 @@ def _source_candidates(memories):
     }
 
 
+def _compact_file(
+    *,
+    source_revision,
+    text,
+    source_index=21,
+):
+    return {
+        "conversation_id": CID,
+        "source_revision": source_revision,
+        "recent_messages": [
+            {
+                "role": "user",
+                "text": text,
+                "source_index": source_index,
+            }
+        ],
+    }
+
+
+def _candidate_file(
+    *,
+    revision,
+    source_revision,
+    fact,
+    source_index=21,
+):
+    payload = _conversation_candidate()
+
+    payload["revision"] = revision
+    payload["source_revision"] = source_revision
+    payload["sections"]["trusted_facts"] = [
+        {
+            "id": "fact",
+            "text": fact,
+        }
+    ]
+    payload["telemetry"][
+        "latest_user_source_index"
+    ] = source_index
+
+    return payload
+
+
 def _read_json_at(root, *parts):
     return json.loads(
         Path(
@@ -257,6 +309,25 @@ class RealPipelineTestCase(
             *parts,
         )
 
+    def write(self, kind, value):
+        path = self.path(
+            kind,
+            CID + ".json",
+        )
+
+        path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        path.write_text(
+            json.dumps(
+                value,
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
     def read_json(self, *parts):
         return json.loads(
             self.path(*parts).read_text(
@@ -315,9 +386,12 @@ class SourcePipelineDependencyTests(
                 )
             )
 
-    async def test_memory_only_flag_drives_prerequisites(
+    async def test_memory_observer_flags_drive_prerequisites(
         self,
     ):
+        # Flash + Ledger + Confidence on, every legacy Context shadow
+        # flag off. (Flash-only is covered separately by
+        # FlashOnlyDependencyTests.)
         self.bind(
             [
                 _memory("m1", "past decision one"),
@@ -504,6 +578,7 @@ class RealDuplicateChainTests(
                 "version":
                     "context-confidence-gate.v1",
                 "mode": "shadow_only",
+                "conversation_id": CID,
                 "decision": "allow_shadow",
                 "allowed": True,
                 "reason": None,
@@ -511,6 +586,7 @@ class RealDuplicateChainTests(
                 "stored": True,
                 "duplicate": False,
                 "revision": 1,
+                "source_unified_revision": 1,
             },
             shadow_evidence=(
                 build_candidate_evidence(
@@ -933,6 +1009,420 @@ class LiveIsolationTests(
         ):
             with self.subTest(field=field):
                 self.assertNotIn(field, serialized)
+
+
+class CandidateRaceTests(
+    RealPipelineTestCase,
+):
+    """The runtime must use the candidate captured before the await.
+
+    The real producer (``update_unified_context_candidate_from_runtime``)
+    is used; it is NOT mocked. Synchronization is event based -- no
+    sleep anywhere.
+    """
+
+    async def test_captured_candidate_is_not_replaced_by_disk(
+        self,
+    ):
+        self.write(
+            "compact",
+            _compact_file(
+                source_revision=5,
+                text="QUERY_A",
+            ),
+        )
+        self.write(
+            "context_candidate",
+            _candidate_file(
+                revision=10,
+                source_revision=5,
+                fact="A fact",
+            ),
+        )
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+        queries: list = []
+
+        bound = self.bind([])
+
+        async def get_candidates(
+            query="",
+        ):
+            queries.append(query)
+
+            # Only request A blocks; the later request B in this test
+            # must run freely.
+            if len(queries) == 1:
+                started.set()
+                await release.wait()
+
+            return _source_candidates(
+                [_memory("m-retrieved")]
+            )
+
+        bound.get_candidates.side_effect = (
+            get_candidates
+        )
+
+        task_a = asyncio.create_task(
+            update_unified_context_candidate_from_runtime(
+                CID
+            )
+        )
+
+        await started.wait()
+
+        # While A is still awaiting retrieval, the shared
+        # conversation-level candidate is replaced by "request B".
+        self.write(
+            "compact",
+            _compact_file(
+                source_revision=6,
+                text="QUERY_B",
+            ),
+        )
+        self.write(
+            "context_candidate",
+            _candidate_file(
+                revision=11,
+                source_revision=6,
+                fact="B fact",
+            ),
+        )
+
+        result_b = (
+            await update_unified_context_candidate_from_runtime(
+                CID
+            )
+        )
+
+        b_disk = self.read_json(
+            "unified_context_candidate",
+            CID + ".json",
+        )
+
+        self.assertEqual(
+            b_disk["source_revisions"][
+                "conversation_candidate"
+            ],
+            11,
+        )
+
+        release.set()
+
+        result_a = await task_a
+
+        a_disk = self.read_json(
+            "unified_context_candidate",
+            CID + ".json",
+        )
+
+        # A's query came from the pre-await capture...
+        self.assertEqual(
+            queries[0],
+            "QUERY_A",
+        )
+        self.assertEqual(
+            queries[1],
+            "QUERY_B",
+        )
+
+        # ...A used candidate 10, never B's 11...
+        self.assertEqual(
+            a_disk["source_revisions"][
+                "conversation_candidate"
+            ],
+            10,
+        )
+
+        facts = [
+            item["text"]
+            for item in a_disk["sections"][
+                "trusted_facts"
+            ]
+        ]
+
+        self.assertEqual(facts, ["A fact"])
+
+        # ...and the request-local snapshot agrees.
+        snapshot = result_a[
+            "memory_shadow_snapshot"
+        ]
+
+        self.assertEqual(
+            snapshot["unified"][
+                "source_revisions"
+            ][
+                "conversation_candidate"
+            ],
+            10,
+        )
+
+        self.assertEqual(
+            [
+                item["text"]
+                for item in snapshot[
+                    "unified"
+                ]["sections"]["trusted_facts"]
+            ],
+            ["A fact"],
+        )
+
+        # B kept its own candidate.
+        self.assertEqual(
+            result_b[
+                "memory_shadow_snapshot"
+            ]["unified"]["source_revisions"][
+                "conversation_candidate"
+            ],
+            11,
+        )
+
+
+class ProducerEvidenceIsolationTests(
+    RealPipelineTestCase,
+):
+    """Two concurrent producers keep their own retrieval evidence."""
+
+    def test_two_producers_keep_their_own_evidence(
+        self,
+    ):
+        self.write(
+            "compact",
+            _compact_file(
+                source_revision=5,
+                text="QUERY",
+            ),
+        )
+        self.write(
+            "context_candidate",
+            _candidate_file(
+                revision=10,
+                source_revision=5,
+                fact="shared fact",
+            ),
+        )
+
+        memory_a = "mem_A_111111111111"
+        memory_b = "mem_B_222222222222"
+
+        local = threading.local()
+        barrier = threading.Barrier(2, timeout=30)
+
+        class _Service:
+
+            async def get_candidates(
+                self,
+                query="",
+            ):
+                # Both producers are inside retrieval at once.
+                barrier.wait()
+
+                return _source_candidates(
+                    [
+                        _memory(
+                            local.memory_id,
+                            "cue "
+                            + local.memory_id,
+                        )
+                    ]
+                )
+
+        bind_context_service(_Service())
+
+        results: dict = {}
+
+        def worker(name, memory_id):
+            local.memory_id = memory_id
+
+            results[name] = asyncio.run(
+                update_unified_context_candidate_from_runtime(
+                    CID
+                )
+            )
+
+        with patch.object(
+            unified_module,
+            "record_retrieval_shadow_metrics",
+            Mock(
+                return_value={
+                    "stored": False,
+                }
+            ),
+        ):
+            with ThreadPoolExecutor(
+                max_workers=2
+            ) as pool:
+                futures = [
+                    pool.submit(
+                        worker,
+                        "A",
+                        memory_a,
+                    ),
+                    pool.submit(
+                        worker,
+                        "B",
+                        memory_b,
+                    ),
+                ]
+
+                for future in futures:
+                    future.result(timeout=30)
+
+        for name, own in (
+            ("A", memory_a),
+            ("B", memory_b),
+        ):
+            with self.subTest(request=name):
+                snapshot = results[name][
+                    "memory_shadow_snapshot"
+                ]
+
+                self.assertIsNotNone(snapshot)
+
+                self.assertEqual(
+                    snapshot["unified"][
+                        "source_revisions"
+                    ][
+                        "conversation_candidate"
+                    ],
+                    10,
+                )
+
+                # Only this request's retrieval evidence.
+                self.assertEqual(
+                    {
+                        entry["memory_id"]
+                        for entry in snapshot[
+                            "evidence"
+                        ]
+                    },
+                    {own},
+                )
+
+                self.assertEqual(
+                    [
+                        item["id"]
+                        for item in snapshot[
+                            "unified"
+                        ]["sections"]["memories"]
+                    ],
+                    [own],
+                )
+
+
+class FlashOnlyDependencyTests(
+    RealPipelineTestCase,
+):
+    """MEMORY_FLASH_SHADOW alone must drive the real upstream chain."""
+
+    async def test_flash_only_flag_uses_real_pipeline(
+        self,
+    ):
+        self.bind(
+            [
+                _memory("m1", "first memory"),
+                _memory("m2", "second memory"),
+            ]
+        )
+
+        environ = {
+            **_ISOLATED_ENV,
+            _FLASH_ENV: "1",
+        }
+
+        with patch.dict(
+            os.environ,
+            environ,
+            clear=False,
+        ):
+            selected = await (
+                coordinator.run_context_pipeline(
+                    _body()
+                )
+            )
+
+        cid = self.conversation_id()
+
+        for path in (
+            self.path(
+                "snapshots",
+                cid + ".json",
+            ),
+            self.path(
+                "compact",
+                cid + ".json",
+            ),
+            self.path(
+                "context_candidate",
+                cid + ".json",
+            ),
+            self.path(
+                "unified_context_candidate",
+                cid + ".json",
+            ),
+        ):
+            with self.subTest(path=path.name):
+                self.assertTrue(path.is_file())
+
+        unified = self.read_json(
+            "unified_context_candidate",
+            cid + ".json",
+        )
+
+        flash_files = list(
+            self.path(
+                "memory_flash",
+                cid,
+            ).iterdir()
+        )
+
+        self.assertEqual(len(flash_files), 1)
+
+        artifact = json.loads(
+            flash_files[0].read_text(
+                encoding="utf-8"
+            )
+        )
+
+        # Confidence is OFF, so the Flash reports it could not use a
+        # confidence observation -- but the artifact exists, is bound
+        # to a valid revision and keeps the real retrieved count.
+        self.assertEqual(
+            artifact["decision"],
+            "no_surface",
+        )
+        self.assertEqual(
+            artifact["reason"],
+            "confidence_observation_missing",
+        )
+        self.assertEqual(
+            artifact["surfaced_count"],
+            0,
+        )
+        self.assertEqual(
+            artifact["source_unified_revision"],
+            unified["revision"],
+        )
+        self.assertEqual(
+            artifact["retrieved_candidate_count"],
+            2,
+        )
+
+        # Ledger is OFF: nothing is written there.
+        self.assertFalse(
+            self.path(
+                "exposure_ledger",
+                cid,
+            ).exists()
+        )
+
+        # The live body is untouched.
+        self.assertEqual(
+            selected,
+            _body(),
+        )
 
 
 if __name__ == "__main__":

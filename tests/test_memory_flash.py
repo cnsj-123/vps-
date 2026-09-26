@@ -77,12 +77,15 @@ def candidate(
     return item
 
 
-def allow_confidence():
+def allow_confidence(
+    source_unified_revision=3,
+):
     return {
         "version":
             "context-confidence-gate.v1",
         "mode":
             "shadow_only",
+        "conversation_id": CID,
         "decision":
             "allow_shadow",
         "allowed":
@@ -97,6 +100,8 @@ def allow_confidence():
             False,
         "revision":
             1,
+        "source_unified_revision":
+            source_unified_revision,
     }
 
 
@@ -131,7 +136,11 @@ def policy_for(
             revision=revision,
         ),
         confidence_report=(
-            allow_confidence()
+            allow_confidence(
+                source_unified_revision=(
+                    revision
+                )
+            )
         ),
         shadow_evidence=(
             build_candidate_evidence(
@@ -446,6 +455,45 @@ class FlashPolicyBindingTests(
         self.assertEqual(
             output["reason"],
             "invalid_flash_policy_unified_revision",
+        )
+
+    def test_policy_conversation_mismatch(
+        self,
+    ):
+        # Another conversation's policy must never be written into
+        # this conversation's Flash path, even with the same revision
+        # number.
+        policy = policy_for(
+            [candidate("m1")]
+        )
+        policy["conversation_id"] = (
+            "ctx_ffffffffffffffff"
+        )
+
+        with tempfile.TemporaryDirectory() as root:
+            with patch.dict(
+                os.environ,
+                {
+                    "OMBRE_CONTEXT_STATE_DIR":
+                        root,
+                },
+                clear=False,
+            ):
+                output = self._call(
+                    root,
+                    policy,
+                )
+
+                self.assertFalse(
+                    self._flash_path(
+                        root
+                    ).exists()
+                )
+
+        self.assertFalse(output["stored"])
+        self.assertEqual(
+            output["reason"],
+            "flash_policy_conversation_mismatch",
         )
 
     def test_malformed_policy_report(self):

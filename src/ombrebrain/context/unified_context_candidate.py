@@ -15,9 +15,16 @@ from ombrebrain.context.retrieval_decision_shadow import (
 from ombrebrain.context.retrieval_shadow_metrics import (
     record_retrieval_shadow_metrics,
 )
+from ombrebrain.context.validators.freshness import (
+    is_valid_revision,
+)
 
 
 _VERSION = "unified-context-candidate.v1"
+
+_CANDIDATE_VERSION = (
+    "conversation-context-candidate.v1"
+)
 
 _DEFAULT_ROOT = "/app/buckets/.context"
 _DEFAULT_TOKEN_BUDGET = 1200
@@ -197,6 +204,11 @@ async def update_unified_context_candidate_from_runtime(
         ),
         shadow_observation=
             shadow_observation,
+        # The candidate captured BEFORE the retrieval await above is
+        # THE candidate for this request.
+        conversation_candidate_snapshot=(
+            conversation_candidate
+        ),
     )
 
     result["retrieval_query_used"] = bool(
@@ -1261,14 +1273,68 @@ def build_unified_context_candidate(
     }
 
 
+def _validated_candidate_snapshot(
+    snapshot: Any,
+    conversation_id: str,
+) -> dict[str, Any] | None:
+    """Validate a request-captured Conversation Candidate snapshot.
+
+    Returns the snapshot when it is a well-formed
+    ``conversation-context-candidate.v1`` for this conversation with a
+    valid ``revision`` and ``source_revision``; None otherwise. Pure
+    and read-only: it reads no file.
+    """
+
+    if not isinstance(
+        snapshot,
+        dict,
+    ):
+        return None
+
+    if (
+        snapshot.get("version")
+        != _CANDIDATE_VERSION
+    ):
+        return None
+
+    if (
+        snapshot.get("conversation_id")
+        != conversation_id
+    ):
+        return None
+
+    if not is_valid_revision(
+        snapshot.get("revision")
+    ):
+        return None
+
+    if not is_valid_revision(
+        snapshot.get("source_revision")
+    ):
+        return None
+
+    return snapshot
+
+
 def update_unified_context_candidate(
     *,
     conversation_id: str,
     context_candidates: dict[str, Any],
     excluded_texts: tuple[str, ...] | list[str] = (),
     shadow_observation: dict[str, Any] | None = None,
+    conversation_candidate_snapshot: (
+        dict[str, Any] | None
+    ) = None,
 ) -> dict[str, Any]:
     """Persist the Unified candidate and return its privacy-safe summary.
+
+    ``conversation_candidate_snapshot`` is the Conversation Candidate
+    captured BEFORE this request awaited retrieval. When it is given
+    it is validated and used as THE request's candidate, so a
+    concurrent request that rewrote the conversation-level candidate
+    file during the retrieval await can never mix its context into
+    this request's Unified. When it is omitted the candidate is read
+    from disk, exactly as before.
 
     ``shadow_observation`` is an optional out-parameter for the
     in-process shadow Memory observers: when a dict is passed, the
@@ -1290,20 +1356,40 @@ def update_unified_context_candidate(
     )
 
     with _LOCK:
-        conversation_candidate = (
-            _read_json(
-                candidate_path
-            )
-        )
-
-        if conversation_candidate is None:
-            return {
-                "stored": False,
-                "reason":
-                    "conversation_candidate_not_found",
-                "conversation_id":
+        if conversation_candidate_snapshot is not None:
+            # THIS request already captured its candidate before it
+            # awaited retrieval: never re-read the shared file here.
+            conversation_candidate = (
+                _validated_candidate_snapshot(
+                    conversation_candidate_snapshot,
                     conversation_id,
-            }
+                )
+            )
+
+            if conversation_candidate is None:
+                return {
+                    "stored": False,
+                    "reason":
+                        "invalid_conversation_candidate_snapshot",
+                    "conversation_id":
+                        conversation_id,
+                }
+
+        else:
+            conversation_candidate = (
+                _read_json(
+                    candidate_path
+                )
+            )
+
+            if conversation_candidate is None:
+                return {
+                    "stored": False,
+                    "reason":
+                        "conversation_candidate_not_found",
+                    "conversation_id":
+                        conversation_id,
+                }
 
         result = (
             build_unified_context_candidate(

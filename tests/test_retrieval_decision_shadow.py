@@ -419,15 +419,63 @@ class PerCandidateObservationTests(
             ],
         )
 
-        # ``to_dict`` carries ids / order / decision only.
+        # ``to_dict`` carries identity / order / decision only.
         self.assertEqual(
             set(decisions[0].to_dict()),
             {
                 "memory_id",
+                "candidate_fingerprint",
                 "index",
                 "would_keep",
                 "reason",
             },
+        )
+
+    def test_fingerprint_is_deterministic_and_content_bound(
+        self,
+    ):
+        from ombrebrain.context.retrieval_decision_shadow import (
+            candidate_fingerprint,
+        )
+
+        first = {
+            "id": "m1",
+            "content": "same text",
+        }
+
+        second = {
+            "id": "m1",
+            "content": "other text",
+        }
+
+        self.assertEqual(
+            candidate_fingerprint(first),
+            candidate_fingerprint(
+                dict(first)
+            ),
+        )
+
+        # Same id, different content -> different identity.
+        self.assertNotEqual(
+            candidate_fingerprint(first),
+            candidate_fingerprint(second),
+        )
+
+        # Normalization is stable across whitespace.
+        self.assertEqual(
+            candidate_fingerprint(
+                {
+                    "id": " m1 ",
+                    "content": "  same text ",
+                }
+            ),
+            candidate_fingerprint(first),
+        )
+
+        # No raw text ever appears in the fingerprint.
+        self.assertNotIn(
+            "same text",
+            candidate_fingerprint(first),
         )
 
     def test_aggregate_is_derived_from_per_candidate(

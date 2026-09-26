@@ -1,8 +1,78 @@
 from __future__ import annotations
 
+import hashlib
+
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
+
+
+def candidate_text(
+    item: Any,
+) -> str:
+    """The text a candidate's identity is computed from.
+
+    Mirrors the Context memory projection (``content`` first, then
+    ``text``) so the same value is used on the retrieval side and on
+    the Unified side. Pure and total.
+    """
+
+    if not isinstance(
+        item,
+        dict,
+    ):
+        return ""
+
+    for key in (
+        "content",
+        "text",
+    ):
+        value = item.get(key)
+
+        if (
+            isinstance(
+                value,
+                str,
+            )
+            and value.strip()
+        ):
+            return value.strip()
+
+    return ""
+
+
+def candidate_fingerprint(
+    item: Any,
+) -> str:
+    """Deterministic, request-local identity for one candidate.
+
+    ``sha256(normalized memory_id + "\\0" + normalized content)``.
+    Only the digest is emitted -- no memory text, cue or raw memory
+    ever leaves this function, and nothing here is persisted or
+    logged. It exists so shadow evidence can be bound to the exact
+    retrieval candidate instead of only to its memory id (which is
+    ambiguous when the same id appears twice).
+    """
+
+    memory_id = ""
+
+    if isinstance(
+        item,
+        dict,
+    ):
+        memory_id = str(
+            item.get("id") or ""
+        ).strip()
+
+    payload = (
+        memory_id
+        + "\0"
+        + candidate_text(item)
+    )
+
+    return hashlib.sha256(
+        payload.encode("utf-8")
+    ).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -48,7 +118,7 @@ class RetrievalDecisionShadowCandidate:
     Observation only. ``keep_bucket`` distinguishes the two keep
     cases that ``observe()`` aggregates separately; it is deliberately
     not part of ``to_dict()`` because downstream observers only need
-    the id, the order and the keep/drop reason.
+    the identity, the order and the keep/drop reason.
     """
 
     memory_id: str = ""
@@ -56,11 +126,14 @@ class RetrievalDecisionShadowCandidate:
     would_keep: bool = True
     reason: str = "keep"
     keep_bucket: str | None = None
+    candidate_fingerprint: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "memory_id":
                 self.memory_id,
+            "candidate_fingerprint":
+                self.candidate_fingerprint,
             "index":
                 self.index,
             "would_keep":
@@ -176,6 +249,10 @@ class RetrievalDecisionShadowObserver:
 
         for index, item in enumerate(items):
 
+            fingerprint = candidate_fingerprint(
+                item
+            )
+
             if not isinstance(
                 item,
                 dict,
@@ -184,11 +261,14 @@ class RetrievalDecisionShadowObserver:
                 # Fail-open if that invariant ever changes.
                 decisions.append(
                     RetrievalDecisionShadowCandidate(
-                        "",
-                        index,
-                        True,
-                        "keep",
-                        None,
+                        memory_id="",
+                        index=index,
+                        would_keep=True,
+                        reason="keep",
+                        keep_bucket=None,
+                        candidate_fingerprint=(
+                            fingerprint
+                        ),
                     )
                 )
                 continue
@@ -235,11 +315,14 @@ class RetrievalDecisionShadowObserver:
             ):
                 decisions.append(
                     RetrievalDecisionShadowCandidate(
-                        bucket_id,
-                        index,
-                        False,
-                        "recent_24h",
-                        None,
+                        memory_id=bucket_id,
+                        index=index,
+                        would_keep=False,
+                        reason="recent_24h",
+                        keep_bucket=None,
+                        candidate_fingerprint=(
+                            fingerprint
+                        ),
                     )
                 )
                 continue
@@ -251,11 +334,14 @@ class RetrievalDecisionShadowObserver:
             ):
                 decisions.append(
                     RetrievalDecisionShadowCandidate(
-                        bucket_id,
-                        index,
-                        False,
-                        "duplicate_id",
-                        None,
+                        memory_id=bucket_id,
+                        index=index,
+                        would_keep=False,
+                        reason="duplicate_id",
+                        keep_bucket=None,
+                        candidate_fingerprint=(
+                            fingerprint
+                        ),
                     )
                 )
                 continue
@@ -270,11 +356,16 @@ class RetrievalDecisionShadowObserver:
             ):
                 decisions.append(
                     RetrievalDecisionShadowCandidate(
-                        bucket_id,
-                        index,
-                        False,
-                        "exact_text_duplicate",
-                        None,
+                        memory_id=bucket_id,
+                        index=index,
+                        would_keep=False,
+                        reason=(
+                            "exact_text_duplicate"
+                        ),
+                        keep_bucket=None,
+                        candidate_fingerprint=(
+                            fingerprint
+                        ),
                     )
                 )
                 continue
@@ -303,11 +394,14 @@ class RetrievalDecisionShadowObserver:
 
             decisions.append(
                 RetrievalDecisionShadowCandidate(
-                    bucket_id,
-                    index,
-                    True,
-                    "keep",
-                    keep_bucket,
+                    memory_id=bucket_id,
+                    index=index,
+                    would_keep=True,
+                    reason="keep",
+                    keep_bucket=keep_bucket,
+                    candidate_fingerprint=(
+                        fingerprint
+                    ),
                 )
             )
 
@@ -412,10 +506,13 @@ def build_candidate_evidence(
     """Request-local, shadow-only per-candidate evidence.
 
     One entry per candidate, in canonical retrieval order, carrying
-    only ``memory_id`` / ``index`` / ``would_keep`` / ``reason`` from
-    the existing conservative.v1 policy. No text, no score, no
-    threshold and no timestamp is included, and nothing is persisted
-    or logged by this function.
+    only ``memory_id`` / ``candidate_fingerprint`` / ``index`` /
+    ``would_keep`` / ``reason`` from the existing conservative.v1
+    policy. The fingerprint is the digest of the normalized memory id
+    plus the normalized content, so evidence can be bound to the exact
+    candidate even when the same memory id appears twice. No text, no
+    score, no threshold and no timestamp is included, and nothing is
+    persisted or logged by this function.
     """
 
     observer = (

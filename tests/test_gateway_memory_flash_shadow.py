@@ -108,6 +108,7 @@ def _allow_confidence(
             "context-confidence-gate.v1",
         "mode":
             "shadow_only",
+        "conversation_id": CID,
         "decision":
             "allow_shadow",
         "allowed":
@@ -122,6 +123,8 @@ def _allow_confidence(
             False,
         "revision":
             revision,
+        "source_unified_revision":
+            5,
     }
 
 
@@ -131,6 +134,7 @@ def _invalid_confidence():
             "context-confidence-gate.v1",
         "mode":
             "shadow_only",
+        "conversation_id": CID,
         "decision":
             "deny_shadow",
         "allowed":
@@ -750,7 +754,13 @@ class MemoryFlashPipelineTests(
                                     [
                                         _memory(
                                             "mem-1"
-                                        )
+                                        ),
+                                        _memory(
+                                            "mem-2"
+                                        ),
+                                        _memory(
+                                            "mem-3"
+                                        ),
                                     ]
                                 ),
                         }
@@ -790,13 +800,24 @@ class MemoryFlashPipelineTests(
             "confidence_observation_invalid",
         )
         self.assertEqual(
+            flash["source_confidence_binding"],
+            "confidence_observation_invalid",
+        )
+        self.assertEqual(
             flash["surfaced_count"],
             0,
         )
 
+        # A structural Confidence failure must never erase the real
+        # retrieved count: retrieval already happened.
+        self.assertEqual(
+            flash["retrieved_candidate_count"],
+            3,
+        )
+
         self.assertEqual(
             ledger["retrieved_count"],
-            1,
+            3,
         )
         self.assertEqual(
             ledger["surfaced_count"],

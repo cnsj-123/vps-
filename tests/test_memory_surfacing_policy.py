@@ -12,6 +12,7 @@ from ombrebrain.context.memory_surfacing_policy import (
 )
 from ombrebrain.context.retrieval_decision_shadow import (
     build_candidate_evidence,
+    candidate_fingerprint,
 )
 
 
@@ -75,70 +76,76 @@ def candidate(
     return item
 
 
-def allow_confidence(
+def confidence_report(
+    *,
     revision=1,
+    source_unified_revision=3,
+    conversation_id=CID,
+    version="context-confidence-gate.v1",
+    mode="shadow_only",
+    decision="allow_shadow",
+    reason=None,
+    stored=True,
 ):
     return {
         "version":
-            "context-confidence-gate.v1",
+            version,
         "mode":
-            "shadow_only",
+            mode,
+        "conversation_id":
+            conversation_id,
         "decision":
-            "allow_shadow",
+            decision,
         "allowed":
-            True,
+            decision == "allow_shadow",
         "reason":
-            None,
+            reason,
         "reasons":
-            [],
+            [reason] if reason else [],
         "stored":
-            True,
+            stored,
         "duplicate":
             False,
         "revision":
             revision,
+        "source_unified_revision":
+            source_unified_revision,
     }
+
+
+def allow_confidence(
+    revision=1,
+    *,
+    source_unified_revision=3,
+):
+    return confidence_report(
+        revision=revision,
+        source_unified_revision=(
+            source_unified_revision
+        ),
+    )
 
 
 def deny_confidence(
     reason="semantic_source_stale",
     revision=1,
 ):
-    report = allow_confidence(
-        revision=revision
+    return confidence_report(
+        revision=revision,
+        decision="deny_shadow",
+        reason=reason,
     )
-
-    report["decision"] = "deny_shadow"
-    report["allowed"] = False
-    report["reason"] = reason
-    report["reasons"] = [reason]
-
-    return report
 
 
 def invalid_confidence(
     reason="unified_request_revision_mismatch",
 ):
-    return {
-        "version":
-            "context-confidence-gate.v1",
-        "mode":
-            "shadow_only",
-        "decision":
-            "deny_shadow",
-        "allowed":
-            False,
-        "reason":
-            reason,
-        "reasons":
-            [reason],
-        "stored":
-            False,
-        "duplicate":
-            False,
-        "revision":
-            None,
-    }
+    return confidence_report(
+        revision=None,
+        stored=False,
+        decision="deny_shadow",
+        reason=reason,
+    )
 
 
 def unified(
@@ -335,12 +342,20 @@ class RealEvidenceTests(
             evidence=[
                 {
                     "memory_id": "m1",
+                    "candidate_fingerprint":
+                        candidate_fingerprint(
+                            candidate("m1")
+                        ),
                     "index": 0,
                     "would_keep": False,
                     "reason": "duplicate_id",
                 },
                 {
                     "memory_id": "m2",
+                    "candidate_fingerprint":
+                        candidate_fingerprint(
+                            candidate("m2")
+                        ),
                     "index": 1,
                     "would_keep": False,
                     "reason":
@@ -369,6 +384,10 @@ class RealEvidenceTests(
             evidence=[
                 {
                     "memory_id": "m1",
+                    "candidate_fingerprint":
+                        candidate_fingerprint(
+                            candidate("m1")
+                        ),
                     "index": 0,
                     "would_keep": False,
                     "reason": "something_new",
@@ -379,6 +398,126 @@ class RealEvidenceTests(
         self.assertEqual(
             report["reason"],
             "shadow_evidence_rejected",
+        )
+
+    def test_fingerprint_binds_evidence_not_id_alone(
+        self,
+    ):
+        # Same memory id twice, different content and different
+        # conservative decisions. Unified re-sorts by relevance, so the
+        # RECENT (<24h) candidate comes first: it must NOT inherit the
+        # other candidate's "keep" evidence.
+        old = candidate(
+            "dup",
+            "OLD",
+            age_hours=100,
+        )
+        old["context_relevance"] = 0.70
+
+        recent = candidate(
+            "dup",
+            "RECENT",
+            age_hours=1,
+        )
+        recent["context_relevance"] = 0.95
+
+        report = run_policy(
+            memories=[recent, old],
+            retrieval=[old, recent],
+        )
+
+        reasons = {
+            entry["reason"]
+            for entry in report["ineligible"]
+        }
+
+        self.assertIn(
+            "anti_echo_recent_24h",
+            reasons,
+        )
+
+        eligible_contents = [
+            item["content"]
+            for item in report["eligible"]
+        ]
+
+        self.assertEqual(
+            eligible_contents,
+            ["OLD"],
+        )
+        self.assertNotIn(
+            "RECENT",
+            eligible_contents,
+        )
+
+    def test_ambiguous_evidence_fails_closed(
+        self,
+    ):
+        # Identical id AND content -> same fingerprint, but the
+        # conservative decisions disagree. Never guess.
+        item = candidate(
+            "x",
+            "same",
+            age_hours=100,
+        )
+
+        report = run_policy(
+            memories=[item],
+            retrieval=[item, dict(item)],
+        )
+
+        self.assertEqual(
+            report["decision"],
+            "no_surface",
+        )
+        self.assertEqual(
+            report["reason"],
+            "ambiguous_shadow_evidence",
+        )
+        self.assertEqual(
+            report["eligible_candidate_count"],
+            0,
+        )
+
+    def test_consistent_duplicate_evidence_is_usable(
+        self,
+    ):
+        # Identical identity AND identical decisions -> not ambiguous.
+        item = candidate(
+            "x",
+            "same",
+            age_hours=100,
+        )
+
+        report = run_policy(
+            memories=[item],
+            evidence=[
+                {
+                    "memory_id": "x",
+                    "candidate_fingerprint":
+                        candidate_fingerprint(
+                            item
+                        ),
+                    "index": 0,
+                    "would_keep": True,
+                    "reason": "keep",
+                },
+                {
+                    "memory_id": "x",
+                    "candidate_fingerprint":
+                        candidate_fingerprint(
+                            item
+                        ),
+                    "index": 1,
+                    "would_keep": True,
+                    "reason": "keep",
+                },
+            ],
+        )
+
+        self.assertEqual(
+            report["decision"],
+            "allow_shadow",
         )
 
     def test_missing_evidence_for_candidate(
@@ -652,6 +791,175 @@ class ConfidenceIntegrationTests(
         self.assertEqual(
             len(report["eligible"]),
             1,
+        )
+
+
+class ConfidenceBindingTests(
+    unittest.TestCase
+):
+    """Confidence must be bound to THIS conversation and revision."""
+
+    def _report_with(self, **overrides):
+        return run_policy(
+            memories=[candidate("m1")],
+            confidence=confidence_report(
+                **overrides
+            ),
+        )
+
+    def test_source_unified_revision_mismatch(
+        self,
+    ):
+        report = self._report_with(
+            source_unified_revision=9
+        )
+
+        self.assertEqual(
+            report["decision"],
+            "no_surface",
+        )
+        self.assertEqual(
+            report["reason"],
+            "confidence_observation_invalid",
+        )
+        self.assertEqual(
+            report["confidence_binding"],
+            "confidence_unified_revision_mismatch",
+        )
+
+    def test_source_unified_revision_invalid(
+        self,
+    ):
+        for bad in (
+            None,
+            0,
+            "3",
+        ):
+            report = self._report_with(
+                source_unified_revision=bad
+            )
+
+            self.assertEqual(
+                report["reason"],
+                "confidence_observation_invalid",
+                bad,
+            )
+
+            self.assertEqual(
+                report["confidence_binding"],
+                "confidence_source_unified_revision_invalid",
+                bad,
+            )
+
+    def test_conversation_mismatch(self):
+        report = self._report_with(
+            conversation_id=(
+                "ctx_ffffffffffffffff"
+            )
+        )
+
+        self.assertEqual(
+            report["reason"],
+            "confidence_observation_invalid",
+        )
+        self.assertEqual(
+            report["confidence_binding"],
+            "confidence_conversation_mismatch",
+        )
+
+    def test_version_mismatch(self):
+        report = self._report_with(
+            version="some-other-gate.v9"
+        )
+
+        self.assertEqual(
+            report["reason"],
+            "confidence_observation_invalid",
+        )
+        self.assertEqual(
+            report["confidence_binding"],
+            "confidence_contract_mismatch",
+        )
+
+    def test_mode_mismatch(self):
+        report = self._report_with(
+            mode="live"
+        )
+
+        self.assertEqual(
+            report["reason"],
+            "confidence_observation_invalid",
+        )
+        self.assertEqual(
+            report["confidence_binding"],
+            "confidence_contract_mismatch",
+        )
+
+    def test_revision_malformed(self):
+        report = self._report_with(
+            revision=None
+        )
+
+        self.assertEqual(
+            report["reason"],
+            "confidence_observation_invalid",
+        )
+        self.assertEqual(
+            report["confidence_binding"],
+            "confidence_revision_invalid",
+        )
+
+    def test_structural_invalid_keeps_retrieved_count(
+        self,
+    ):
+        report = run_policy(
+            memories=[
+                candidate("m1"),
+                candidate("m2"),
+                candidate("m3"),
+            ],
+            confidence=confidence_report(
+                stored=False,
+                revision=None,
+            ),
+        )
+
+        self.assertEqual(
+            report["decision"],
+            "no_surface",
+        )
+        self.assertEqual(
+            report["reason"],
+            "confidence_observation_invalid",
+        )
+        self.assertEqual(
+            report["retrieved_candidate_count"],
+            3,
+        )
+        self.assertEqual(
+            report["eligible_candidate_count"],
+            0,
+        )
+
+    def test_evidence_unavailable_keeps_retrieved_count(
+        self,
+    ):
+        report = run_policy(
+            memories=[
+                candidate("m1"),
+                candidate("m2"),
+                candidate("m3"),
+            ],
+            evidence=None,
+        )
+
+        self.assertEqual(
+            report["reason"],
+            "shadow_evidence_unavailable",
+        )
+        self.assertEqual(
+            report["retrieved_candidate_count"],
+            3,
         )
 
 

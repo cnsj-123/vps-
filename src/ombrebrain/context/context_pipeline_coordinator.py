@@ -494,6 +494,10 @@ def observe_memory_exposure_shadow(
                             flash_output.get(
                                 "source_confidence_revision"
                             ),
+                        "source_confidence_binding":
+                            flash_output.get(
+                                "source_confidence_binding"
+                            ),
                     },
                     ensure_ascii=False,
                     separators=(",", ":"),

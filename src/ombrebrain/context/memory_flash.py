@@ -617,6 +617,10 @@ def build_memory_flash(
             policy.get(
                 "confidence_reason"
             ),
+        "source_confidence_binding":
+            policy.get(
+                "confidence_binding"
+            ),
         "decision":
             decision,
         "reason":
@@ -666,12 +670,14 @@ def update_memory_flash(
     Shadow-only and fail-open at the caller. It refuses to build
     anything (``stored=False``, no artifact file) unless the Surfacing
     Policy report is a well-formed ``memory-surfacing-policy.v1``
-    ``shadow_only`` report AND its ``source_unified_revision`` is a
-    valid revision that equals ``expected_unified_revision``. That
-    binding is checked with the shared
-    ``validate_context_freshness()`` helper, so a policy produced for
-    a different Unified revision can never be turned into a cue
-    artifact for this request.
+    ``shadow_only`` report for THIS conversation AND its
+    ``source_unified_revision`` is a valid revision that equals
+    ``expected_unified_revision``. The revision binding is checked with
+    the shared ``validate_context_freshness()`` helper, so a policy
+    produced for a different Unified revision can never be turned into
+    a cue artifact for this request, and the conversation binding
+    stops a same-numbered revision from another conversation being
+    written into this conversation's Flash path.
 
     Never raises for a refused report; it only raises on an invalid
     conversation / request id, exactly like the rest of this module.
@@ -703,6 +709,17 @@ def update_memory_flash(
     ):
         return _not_stored(
             "malformed_policy_report"
+        )
+
+    if (
+        policy.get("conversation_id")
+        != conversation_id
+    ):
+        # A policy produced for another conversation must never be
+        # written into this conversation's Flash path, even if the
+        # Unified revision number happens to match.
+        return _not_stored(
+            "flash_policy_conversation_mismatch"
         )
 
     freshness = validate_context_freshness(
