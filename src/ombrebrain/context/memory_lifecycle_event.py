@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -58,6 +59,12 @@ from ombrebrain.context.recall_types import (
 #
 #     artifact structurally valid  !=  authorized to persist
 #
+# That path is ALSO gated by the lifecycle feature flag, read here
+# directly (no import of ``memory_reinforcement``, so there is no
+# cycle): while the shadow is OFF a direct call refuses with
+# ``lifecycle_disabled`` and touches nothing at all. The observer
+# keeps its own early flag check as defense in depth.
+#
 # ``build_lifecycle_event`` stays available as a pure builder for unit
 # tests, and ``_persist_verified_lifecycle_event`` stays available as
 # the low-level, content-addressed storage primitive, but neither is
@@ -90,6 +97,13 @@ STAGE_USED = "used"
 # The Usage Signal contract every event must have been derived from.
 SOURCE_USAGE_VERSION = "memory-usage-signal.v1"
 
+# The lifecycle feature flag. Defined here as well as in
+# ``memory_reinforcement`` so the authorized write path can be gated
+# without importing that module (no cycle). Default OFF.
+LIFECYCLE_SHADOW_ENV = (
+    "OMBRE_GATEWAY_MEMORY_LIFECYCLE_SHADOW"
+)
+
 EVENT_ID_RE = re.compile(r"^mlcevt_[0-9a-f]{64}$")
 
 _HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -106,12 +120,33 @@ _REASON_USAGE_INVALID = (
     "usage_not_found_or_invalid"
 )
 _REASON_NOT_USED = "source_event_not_used"
+_REASON_DISABLED = "lifecycle_disabled"
 
 # Public: the observer classifies this reason separately so a bad
 # timestamp is never reported as a storage conflict.
 REASON_INVALID_USAGE_EVENT_TIME = (
     "invalid_usage_event_time"
 )
+
+
+def _truthy(value: Any) -> bool:
+    return str(value or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _lifecycle_shadow_enabled() -> bool:
+    """Is the Memory Lifecycle shadow allowed to write at all?
+
+    Default OFF: unset, false, 0 or off all mean "no".
+    """
+
+    return _truthy(
+        os.environ.get(LIFECYCLE_SHADOW_ENV)
+    )
 
 
 def parse_iso_utc(
@@ -557,6 +592,7 @@ def record_lifecycle_event_from_usage(
     timestamp -- is taken from THAT persisted event, so the caller can
     name nothing but the slot:
 
+      - lifecycle shadow OFF        -> ``lifecycle_disabled``
       - no Usage artifact           -> ``usage_not_found_or_invalid``
       - invalid / corrupt Usage     -> ``usage_not_found_or_invalid``
       - bad slot                    -> ``invalid_usage_event_index``
@@ -564,9 +600,16 @@ def record_lifecycle_event_from_usage(
       - illegal event timestamp     -> ``invalid_usage_event_time``
       - structurally valid artifact -> the ONLY write path
 
+    The feature flag is checked FIRST, before anything is read or
+    written, so a direct call while the shadow is OFF creates no
+    event, no event directory and no state.
+
     Reinforcing a memory that was never explicitly used, at a time the
     Usage artifact never recorded, is therefore not representable.
     """
+
+    if not _lifecycle_shadow_enabled():
+        return _no_record(_REASON_DISABLED)
 
     if not _valid_event_binding(
         conversation_id,

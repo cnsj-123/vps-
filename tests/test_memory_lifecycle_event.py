@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
 import tempfile
 import unittest
 from concurrent.futures import (
@@ -9,9 +10,11 @@ from concurrent.futures import (
 )
 from datetime import timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 from _lifecycle_fixtures import (
     CID,
+    LIFECYCLE_ENV,
     M1,
     M2,
     M3,
@@ -40,6 +43,9 @@ from ombrebrain.context.memory_lifecycle_event import (
     # authorization boundary: tests use it to seed and to exercise
     # atomicity / idempotency directly.
     _persist_verified_lifecycle_event,
+)
+from ombrebrain.context.memory_lifecycle_state import (
+    lifecycle_state_path,
 )
 from ombrebrain.context.memory_reinforcement import (
     derive_memory_lifecycle_state,
@@ -1298,6 +1304,140 @@ class LifecycleEventProvenanceGateTests(
                 store = read_lifecycle_events(M1)
 
         self.assertEqual(len(store["events"]), 1)
+        self.assertEqual(
+            store["events"][0]["memory_id"], M1
+        )
+
+    def test_direct_record_is_gated_by_the_flag(self):
+        with tempfile.TemporaryDirectory() as root:
+            write_usage(
+                root,
+                usage_artifact(
+                    recall_id=RECALL_A,
+                    loaded_memory_ids=(M1,),
+                    used_memory_ids=(M1,),
+                    at=iso(T0),
+                ),
+            )
+
+            # A real, persisted Usage.used M1 exists, yet the shadow
+            # OFF must refuse a direct call and touch nothing.
+            disabled = ("0", "off", "false", "no", "")
+
+            for value in disabled:
+                with self.subTest(value=value):
+                    with patch.dict(
+                        os.environ,
+                        {
+                            "OMBRE_CONTEXT_STATE_DIR":
+                                root,
+                            LIFECYCLE_ENV: value,
+                        },
+                        clear=False,
+                    ):
+                        result = (
+                            record_lifecycle_event_from_usage(
+                                CID, RID, RECALL_A, 2
+                            )
+                        )
+
+                        self.assertFalse(
+                            result["stored"]
+                        )
+                        self.assertFalse(
+                            result["duplicate"]
+                        )
+                        self.assertEqual(
+                            result["decision"],
+                            "no_record",
+                        )
+                        self.assertEqual(
+                            result["reason"],
+                            "lifecycle_disabled",
+                        )
+                        self.assertIsNone(
+                            result["event_id"]
+                        )
+
+                        self.assertEqual(
+                            read_lifecycle_events(M1)[
+                                "events"
+                            ],
+                            [],
+                        )
+                        self.assertFalse(
+                            lifecycle_events_dir(
+                                memory_key(M1)
+                            ).exists()
+                        )
+                        self.assertFalse(
+                            lifecycle_state_path(
+                                memory_key(M1)
+                            ).exists()
+                        )
+
+            # Unset is OFF too.
+            with patch.dict(
+                os.environ,
+                {"OMBRE_CONTEXT_STATE_DIR": root},
+                clear=False,
+            ):
+                os.environ.pop(LIFECYCLE_ENV, None)
+
+                result = (
+                    record_lifecycle_event_from_usage(
+                        CID, RID, RECALL_A, 2
+                    )
+                )
+
+                self.assertEqual(
+                    result["reason"],
+                    "lifecycle_disabled",
+                )
+                self.assertFalse(result["stored"])
+                self.assertEqual(
+                    read_lifecycle_events(M1)[
+                        "events"
+                    ],
+                    [],
+                )
+
+    def test_direct_record_with_flag_on(self):
+        with tempfile.TemporaryDirectory() as root:
+            write_usage(
+                root,
+                usage_artifact(
+                    recall_id=RECALL_A,
+                    loaded_memory_ids=(M1,),
+                    used_memory_ids=(M1,),
+                    at=iso(T0),
+                ),
+            )
+
+            with lifecycle_env(root):
+                first = (
+                    record_lifecycle_event_from_usage(
+                        CID, RID, RECALL_A, 2
+                    )
+                )
+
+                second = (
+                    record_lifecycle_event_from_usage(
+                        CID, RID, RECALL_A, 2
+                    )
+                )
+
+                store = read_lifecycle_events(M1)
+
+        self.assertTrue(first["stored"])
+        self.assertFalse(first["duplicate"])
+        self.assertTrue(second["stored"])
+        self.assertTrue(second["duplicate"])
+
+        self.assertEqual(len(store["events"]), 1)
+        self.assertEqual(
+            store["events"][0]["stage"], "used"
+        )
         self.assertEqual(
             store["events"][0]["memory_id"], M1
         )
