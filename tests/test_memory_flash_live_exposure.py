@@ -40,6 +40,9 @@ from ombrebrain.context.memory_recall_surface import (
     recall_surface_for_model,
     update_recall_surface,
 )
+from ombrebrain.context.recall_types import (
+    estimate_tokens,
+)
 
 
 _LIVE_ENV = (
@@ -490,7 +493,10 @@ class ValidExposureTests(unittest.TestCase):
 
             body = _body()
 
-            with live_env(root):
+            with live_env(
+                root,
+                OMBRE_MEMORY_FLASH_LIVE_TOKEN_BUDGET="192",
+            ):
                 selected, report = (
                     select_live_memory_flash_body(
                         body,
@@ -690,7 +696,10 @@ class MaliciousCueTests(unittest.TestCase):
 
             body = _body()
 
-            with live_env(root):
+            with live_env(
+                root,
+                OMBRE_MEMORY_FLASH_LIVE_TOKEN_BUDGET="192",
+            ):
                 selected, report = (
                     select_live_memory_flash_body(
                         body,
@@ -785,7 +794,70 @@ class MaliciousCueTests(unittest.TestCase):
 
 
 class BudgetTests(unittest.TestCase):
-    def test_max_three_items_keep_order(self):
+    def _expose(self, root, *, budget=None):
+        env = {}
+
+        if budget is not None:
+            env[
+                "OMBRE_MEMORY_FLASH_LIVE_TOKEN_BUDGET"
+            ] = str(budget)
+
+        with live_env(root, **env):
+            return select_live_memory_flash_body(
+                _body(),
+                conversation_id=CID,
+                cognitive_request_id=RID,
+            )
+
+    def _block_text(self, selected):
+        return json.loads(selected)["messages"][
+            -1
+        ]["content"][0]["text"]
+
+    def test_default_budget_bounds_full_envelope(
+        self,
+    ):
+        # A. The authoritative cost is the whole rendered block, not
+        # the sum of cue costs.
+        with tempfile.TemporaryDirectory() as root:
+            _seed_surface(
+                root,
+                [
+                    memory("mem-1", name="alpha"),
+                    memory("mem-2", name="beta"),
+                ],
+            )
+
+            selected, report = self._expose(root)
+
+            self.assertTrue(report["applied"])
+
+            block_text = self._block_text(selected)
+            actual = estimate_tokens(block_text)
+
+            self.assertEqual(
+                actual, report["estimated_tokens"]
+            )
+            self.assertLessEqual(
+                report["estimated_tokens"],
+                report["token_budget"],
+            )
+            self.assertEqual(
+                report["token_budget"], 160
+            )
+
+            receipt = _read_receipt(root)
+
+            self.assertEqual(
+                receipt["estimated_tokens"], actual
+            )
+
+    def test_max_three_items_never_exceeds_budget(
+        self,
+    ):
+        # 8 tiny cues. The full safety envelope has its own cost, so
+        # the number that fits is whatever the budget allows -- never
+        # more than 3 and never over budget.
         with tempfile.TemporaryDirectory() as root:
             memories = [
                 memory(
@@ -803,72 +875,134 @@ class BudgetTests(unittest.TestCase):
                 for surface in _model_surfaces(root)
             ]
 
-            body = _body()
+            selected, report = self._expose(
+                root, budget=192
+            )
 
-            with live_env(root):
-                _selected, report = (
-                    select_live_memory_flash_body(
-                        body,
-                        conversation_id=CID,
-                        cognitive_request_id=RID,
-                    )
-                )
-
-            self.assertEqual(
+            self.assertEqual(report["surface_count"], 8)
+            self.assertLessEqual(
                 report["live_exposed_count"], 3
             )
-            self.assertEqual(report["surface_count"], 8)
-
-            receipt = _read_receipt(root)
-
-            self.assertEqual(
-                receipt["exposed_memrefs"],
-                memrefs[:3],
+            self.assertGreaterEqual(
+                report["live_exposed_count"], 1
             )
 
+            block_text = self._block_text(selected)
+            actual = estimate_tokens(block_text)
+
+            self.assertEqual(
+                actual, report["estimated_tokens"]
+            )
             self.assertLessEqual(
                 report["estimated_tokens"],
                 report["token_budget"],
             )
+            self.assertLessEqual(
+                report["token_budget"], 192
+            )
+
+            receipt = _read_receipt(root)
+
+            # Order preserved: an initial prefix of the surface.
+            expected = memrefs[
+                : report["live_exposed_count"]
+            ]
+
+            self.assertEqual(
+                receipt["exposed_memrefs"], expected
+            )
+
+    def test_default_budget_bounds_a_single_item(
+        self,
+    ):
+        # The default budget must still bound the real envelope even
+        # for one item.
+        with tempfile.TemporaryDirectory() as root:
+            _seed_surface(
+                root, [memory("mem-1", name="alpha")]
+            )
+
+            selected, report = self._expose(root)
+
+            self.assertTrue(report["applied"])
+            self.assertEqual(
+                report["live_exposed_count"], 1
+            )
+
+            actual = estimate_tokens(
+                self._block_text(selected)
+            )
+
+            self.assertEqual(
+                actual, report["estimated_tokens"]
+            )
+            self.assertLessEqual(actual, 160)
 
     def test_partial_exposure_is_recorded(self):
+        # Choose a budget >= two full items and < three full items, so
+        # exactly two are exposed.
         with tempfile.TemporaryDirectory() as root:
             memories = [
-                memory(
-                    "mem-%d" % index,
-                    "y" * 40,
-                )
+                memory("mem-%d" % index, "c%05d" % index)
                 for index in range(4)
             ]
 
             _seed_surface(root, memories)
 
+            surfaces = _model_surfaces(root)
+
             memrefs = [
                 surface["memref"]
-                for surface in _model_surfaces(root)
+                for surface in surfaces
             ]
 
-            body = _body()
+            cues = [
+                surface["cue"]
+                for surface in surfaces
+            ]
 
-            with live_env(
-                root,
-                OMBRE_MEMORY_FLASH_LIVE_TOKEN_BUDGET="30",
-            ):
-                _selected, report = (
-                    select_live_memory_flash_body(
-                        body,
-                        conversation_id=CID,
-                        cognitive_request_id=RID,
-                    )
+            def cost(count):
+                items = [
+                    {
+                        "memref": memrefs[index],
+                        "cue": cues[index],
+                    }
+                    for index in range(count)
+                ]
+
+                return estimate_tokens(
+                    render_memory_flash(items)
                 )
+
+            two_item_cost = cost(2)
+            three_item_cost = cost(3)
+
+            self.assertGreater(
+                three_item_cost, two_item_cost
+            )
+
+            selected, report = self._expose(
+                root, budget=two_item_cost
+            )
 
             self.assertEqual(report["surface_count"], 4)
             self.assertEqual(
                 report["live_exposed_count"], 2
             )
-            self.assertLessEqual(
-                report["estimated_tokens"],
+            self.assertEqual(
                 report["token_budget"],
+                two_item_cost,
+            )
+
+            actual = estimate_tokens(
+                self._block_text(selected)
+            )
+
+            self.assertEqual(
+                actual, report["estimated_tokens"]
+            )
+            self.assertLessEqual(
+                actual, two_item_cost
             )
 
             receipt = _read_receipt(root)
@@ -885,6 +1019,142 @@ class BudgetTests(unittest.TestCase):
             self.assertNotIn(
                 memrefs[3],
                 receipt["exposed_memrefs"],
+            )
+
+    def test_actual_live_block_respects_token_budget(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as root:
+            _seed_surface(
+                root,
+                [
+                    memory("mem-1", name="alpha"),
+                    memory("mem-2", name="beta"),
+                ],
+            )
+
+            selected, report = self._expose(
+                root, budget=192
+            )
+
+            block_text = self._block_text(selected)
+            actual = estimate_tokens(block_text)
+
+            self.assertEqual(
+                actual, report["estimated_tokens"]
+            )
+            self.assertLessEqual(
+                actual, report["token_budget"]
+            )
+
+            receipt = _read_receipt(root)
+
+            self.assertEqual(
+                receipt["estimated_tokens"], actual
+            )
+
+    def test_tiny_budget_exposes_nothing(self):
+        # A budget too small for header + safety + JSON + one item
+        # must never produce an over-budget envelope.
+        with tempfile.TemporaryDirectory() as root:
+            _seed_surface(
+                root, [memory("mem-1", name="alpha")]
+            )
+
+            empty_envelope = estimate_tokens(
+                render_memory_flash([])
+            )
+
+            body = _body()
+
+            with live_env(
+                root,
+                OMBRE_MEMORY_FLASH_LIVE_TOKEN_BUDGET=str(
+                    empty_envelope
+                ),
+            ):
+                selected, report = (
+                    select_live_memory_flash_body(
+                        body,
+                        conversation_id=CID,
+                        cognitive_request_id=RID,
+                    )
+                )
+
+            self.assertIs(selected, body)
+            self.assertFalse(report["applied"])
+            self.assertEqual(
+                report["reason"],
+                "live_token_budget_exceeded",
+            )
+            self.assertEqual(
+                report["live_exposed_count"], 0
+            )
+            self.assertFalse(
+                _receipt_path(root).exists()
+            )
+
+    def test_json_escaping_is_accounted(self):
+        # Quotes / backslashes in a cue expand the rendered JSON, so
+        # the budget must be measured against the final escaped string,
+        # not the raw cue length. (Cue text is whitespace-normalized
+        # upstream, so only quote / backslash escaping is reachable.)
+        cue = 'quote " backslash \\ double " end'
+
+        with tempfile.TemporaryDirectory() as root:
+            _seed_surface(
+                root, [memory("mem-1", cue)]
+            )
+
+            selected, report = self._expose(
+                root, budget=192
+            )
+
+            self.assertTrue(report["applied"])
+
+            block_text = self._block_text(selected)
+            actual = estimate_tokens(block_text)
+
+            self.assertEqual(
+                actual, report["estimated_tokens"]
+            )
+            self.assertLessEqual(
+                actual, report["token_budget"]
+            )
+
+            # The escaped forms really are in the final rendered block.
+            self.assertIn('\\"', block_text)
+            self.assertIn("\\\\", block_text)
+
+            suffix = block_text.split("\n", 2)[-1]
+            parsed_cue = json.loads(suffix)[
+                "memory_flash"
+            ][0]["cue"]
+
+            self.assertIn('quote " backslash', parsed_cue)
+            self.assertIn("double", parsed_cue)
+
+            receipt = _read_receipt(root)
+
+            self.assertEqual(
+                receipt["estimated_tokens"], actual
+            )
+
+    def test_token_budget_is_hard_capped(self):
+        with tempfile.TemporaryDirectory() as root:
+            _seed_surface(
+                root, [memory("mem-1", name="alpha")]
+            )
+
+            _selected, report = self._expose(
+                root, budget=99999
+            )
+
+            self.assertEqual(
+                report["token_budget"], 192
+            )
+            self.assertLessEqual(
+                report["estimated_tokens"], 192
             )
 
 
@@ -1318,7 +1588,10 @@ class ReceiptValidationTests(unittest.TestCase):
             ],
         )
 
-        with live_env(root):
+        with live_env(
+            root,
+            OMBRE_MEMORY_FLASH_LIVE_TOKEN_BUDGET="192",
+        ):
             select_live_memory_flash_body(
                 _body(),
                 conversation_id=CID,

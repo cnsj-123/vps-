@@ -111,6 +111,12 @@ _ENV_MAX_CUE_CHARS = (
 # Live Exposure keeps its own, much smaller budget than the shadow
 # Flash: a model must never see eight cues just because a shadow
 # budget allows it. max_items is fixed at 3 in v1.
+#
+# The token budget is measured against the FULL rendered envelope the
+# model actually receives -- header + safety wording + JSON syntax +
+# memref + cue + JSON escaping -- via
+# ``estimate_tokens(render_memory_flash(items))``. It is NOT a sum of
+# raw cue token estimates.
 _DEFAULT_MAX_ITEMS = 3
 _HARD_MAX_ITEMS = 3
 
@@ -567,6 +573,7 @@ def is_valid_live_exposure_artifact(
 
     if (
         not _is_nonnegative_int(estimated_tokens)
+        or estimated_tokens < 1
         or not _is_nonnegative_int(token_budget)
         or token_budget < 1
         or token_budget > _HARD_TOKEN_BUDGET
@@ -807,20 +814,72 @@ def _bound_cue(
     )
 
 
+def _fit_cue(
+    memref: str,
+    cue: str,
+    items_before: list[dict[str, str]],
+    *,
+    token_budget: int,
+) -> str:
+    """Deterministically shorten one cue until the FULL rendered
+    envelope fits the token budget.
+
+    The budget authority is ``estimate_tokens(render_memory_flash(...))``
+    -- the whole envelope, including the header, the safety wording,
+    the JSON syntax, the memref and the JSON escaping -- never the raw
+    cue length. The longest fitting prefix is kept, so the result is
+    stable for the same input. An empty string means no prefix fits.
+    """
+
+    candidate = cue
+
+    while candidate:
+        probe = items_before + [
+            {
+                "memref": memref,
+                "cue": candidate,
+            }
+        ]
+
+        if (
+            estimate_tokens(
+                render_memory_flash(probe)
+            )
+            <= token_budget
+        ):
+            return candidate
+
+        candidate = candidate[:-1]
+
+    return ""
+
+
 def _select_live_items(
     surfaces: list[Any],
     *,
     max_items: int,
     token_budget: int,
     max_cue_chars: int,
-) -> tuple[list[dict[str, str]], int]:
-    """Take the first bounded items that fit. Never re-orders."""
+) -> tuple[list[dict[str, str]], bool]:
+    """Take the first bounded items that fit the FULL envelope budget.
+
+    Never re-orders and never re-ranks. For each candidate the whole
+    rendered envelope (not the raw cue) must stay within
+    ``token_budget``; a cue that is too long is deterministically
+    shortened first, and a cue that still cannot fit drops the stage
+    out of this item onward.
+
+    Returns ``(items, budget_blocked)``. ``budget_blocked`` is True
+    when a valid candidate existed but could not fit the budget, so
+    the caller can distinguish "the budget is too small" from "there
+    was nothing to expose".
+    """
 
     items: list[dict[str, str]] = []
 
-    used_tokens = 0
-
     seen: set[str] = set()
+
+    budget_blocked = False
 
     for surface in surfaces:
         if len(items) >= max_items:
@@ -845,14 +904,18 @@ def _select_live_items(
         if not cue:
             continue
 
-        cost = estimate_tokens(cue)
+        fitted = _fit_cue(
+            memref,
+            cue,
+            items,
+            token_budget=token_budget,
+        )
 
-        if cost < 1:
-            continue
-
-        if used_tokens + cost > token_budget:
-            # The budget is reached; later items are not exposed and
-            # nothing is re-ranked to make room.
+        if not fitted:
+            # Even a single shortened cue cannot fit the full
+            # envelope budget. Later items are not exposed and nothing
+            # is re-ranked to make room.
+            budget_blocked = True
             break
 
         seen.add(memref)
@@ -860,13 +923,11 @@ def _select_live_items(
         items.append(
             {
                 "memref": memref,
-                "cue": cue,
+                "cue": fitted,
             }
         )
 
-        used_tokens += cost
-
-    return items, used_tokens
+    return items, budget_blocked
 
 
 def select_live_memory_flash_body(
@@ -1044,9 +1105,13 @@ def _select_enabled(
 
     # --------------------------------------------------
     # 3. Bounded items and deterministic render
+    #
+    # The token budget constrains the FULL rendered envelope that the
+    # model will actually receive (header + safety wording + JSON
+    # syntax + memref + cue + JSON escaping), never the raw cue length.
     # --------------------------------------------------
 
-    items, used_tokens = _select_live_items(
+    items, budget_blocked = _select_live_items(
         surfaces,
         max_items=budget["max_items"],
         token_budget=budget["token_budget"],
@@ -1054,15 +1119,34 @@ def _select_enabled(
     )
 
     report["live_exposed_count"] = len(items)
-    report["estimated_tokens"] = used_tokens
 
     if not items:
+        report["estimated_tokens"] = 0
+
         return body, _denied(
-            report, "no_live_items"
+            report,
+            (
+                "live_token_budget_exceeded"
+                if budget_blocked
+                else "no_live_items"
+            ),
         )
 
     rendered = render_memory_flash(items)
 
+    # The single authoritative cost: the whole rendered envelope.
+    rendered_tokens = estimate_tokens(rendered)
+
+    # Defense-in-depth: the selection already fitted this, but the
+    # budget is never exceeded even if that logic ever regressed.
+    if rendered_tokens > budget["token_budget"]:
+        report["estimated_tokens"] = rendered_tokens
+
+        return body, _denied(
+            report, "live_token_budget_exceeded"
+        )
+
+    report["estimated_tokens"] = rendered_tokens
     report["render_sha256"] = _sha256_text(
         rendered
     )
@@ -1177,6 +1261,20 @@ def _select_enabled(
     # --------------------------------------------------
     # 6. Build the mutation
     # --------------------------------------------------
+
+    # Final defense-in-depth: recompute the envelope cost right before
+    # the body may change. The reported / receipted estimate must be
+    # exactly this value and must stay within the resolved budget, or
+    # nothing is live exposed.
+    if (
+        estimate_tokens(rendered)
+        != report.get("estimated_tokens")
+        or report.get("estimated_tokens")
+        > budget["token_budget"]
+    ):
+        return body, _denied(
+            report, "live_token_budget_exceeded"
+        )
 
     mutated = deepcopy(payload)
 
@@ -1333,7 +1431,9 @@ def _select_enabled(
         "exposed_memrefs": [
             item["memref"] for item in items
         ],
-        "estimated_tokens": used_tokens,
+        "estimated_tokens": report[
+            "estimated_tokens"
+        ],
         "token_budget": budget["token_budget"],
         "original_bytes": len(body),
         "selected_bytes": len(mutated_body),

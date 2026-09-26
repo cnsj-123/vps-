@@ -1711,10 +1711,13 @@ async def run_context_pipeline(
     may reach the model, but the id itself never does, and it is never
     added to the body, a header, a cache key, a request hash or a log.
 
-    Default-OFF and fail-open: with
-    OMBRE_GATEWAY_CONTEXT_REAL_INJECTION unset (or on any deny /
-    exception / invalid report inside the selector) this returns the
-    exact ``forward_body``.
+    Default-OFF and fail-open: Real Context Injection and Live Memory
+    Flash Exposure each default OFF. When BOTH are OFF this returns the
+    exact ``forward_body``. Either stage is fail-open relative to its
+    own input, so a failed stage leaves the previous stage's body
+    untouched. Live Memory Flash Exposure is independent of Real
+    Context Injection, so it can still mutate the body when Real
+    Context Injection is OFF (and vice versa).
 
     There is also a top-level guard: a Context pipeline failure must
     never break live forwarding, so any unexpected error here returns
