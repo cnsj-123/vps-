@@ -24,7 +24,10 @@ from _recall_fixtures import (
     FakeRetrievalAdapter,
     bucket,
     memory,
+    projected_model_result,
+    read_usage,
     seed_live_exposure,
+    seed_recall_control_plane,
 )
 
 from ombrebrain.context.live_recall_authorization import (
@@ -36,6 +39,19 @@ from ombrebrain.context.live_recall_transport_capability import (
 )
 from ombrebrain.context.live_recall_transport_context import (
     current_live_recall_transport_binding,
+)
+from ombrebrain.context.live_recall_usage_attribution import (
+    attribute_live_recall_usage,
+    live_recall_usage_attribution_enabled,
+    render_live_recall_usage_ack,
+)
+from ombrebrain.context.live_recall_usage_surface import (
+    build_live_recall_usage_surface,
+    compose_live_recall_result_with_usage_refs,
+)
+from ombrebrain.context.live_memory_transport_capability import (
+    live_memory_transport_capability_expired,
+    resolve_live_memory_transport_capability,
 )
 
 
@@ -119,6 +135,19 @@ def _tools():
                 },
             },
         },
+        {
+            "name": "UseMemory",
+            "description": "internal usage attribution tool",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "userefs": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    }
+                },
+            },
+        },
     ]
 
 
@@ -134,12 +163,15 @@ class FakeMCP:
         *,
         tools=None,
         recall_handler=None,
+        usage_handler=None,
         malformed_tools_list=False,
     ):
         self.tools = tools if tools is not None else _tools()
         self.recall_handler = recall_handler
+        self.usage_handler = usage_handler
         self.malformed_tools_list = malformed_tools_list
         self.handler_calls = []
+        self.handler_arguments = []
         self.requests = 0
 
     async def __call__(self, scope, receive, send):
@@ -217,12 +249,21 @@ class FakeMCP:
 
             arguments = params.get("arguments") or {}
 
+            self.handler_arguments.append(arguments)
+
             if (
                 name == "Recall"
                 and self.recall_handler is not None
             ):
                 text = await self.recall_handler(
                     arguments.get("memref")
+                )
+            elif (
+                name == "UseMemory"
+                and self.usage_handler is not None
+            ):
+                text = await self.usage_handler(
+                    arguments.get("userefs")
                 )
             else:
                 text = "ok:" + str(name)
@@ -425,14 +466,18 @@ def _build(
     token_validator=None,
     resolver=None,
     probe=None,
+    memory_resolver=None,
+    memory_probe=None,
     auth_mode="token",
     recall_handler=None,
+    usage_handler=None,
     malformed_tools_list=False,
     tools=None,
 ):
     fake = FakeMCP(
         tools=tools,
         recall_handler=recall_handler,
+        usage_handler=usage_handler,
         malformed_tools_list=malformed_tools_list,
     )
 
@@ -455,6 +500,8 @@ def _build(
         auth_mode=auth_mode,
         live_recall_capability_resolver=resolver,
         live_recall_capability_expiry_probe=probe,
+        live_memory_capability_resolver=memory_resolver,
+        live_memory_capability_expiry_probe=memory_probe,
     )
 
     return auth, fake
@@ -1308,14 +1355,8 @@ class MCPAuthPrecedenceTests(unittest.TestCase):
         self.assertEqual(fake.handler_calls, [])
 
 
-class BuildHttpAppOrderTests(unittest.TestCase):
-    """Drive the REAL ``build_http_app`` middleware stack.
-
-    This is the ordering regression: MCPAuth -> MCPRequestBodyLimit ->
-    LiveRecallMCPView -> FastMCP. The body limit must run before the
-    view parses JSON-RPC, and the capability view must be reachable
-    only through the auth-established binding.
-    """
+class _HttpAppHarness:
+    """Shared Starlette host + settings for the real middleware stack."""
 
     def _host(self, fake):
         from starlette.applications import Starlette
@@ -1381,7 +1422,25 @@ class BuildHttpAppOrderTests(unittest.TestCase):
             live_recall_capability_expiry_probe=(
                 live_recall_transport_capability_expired
             ),
+            live_memory_capability_resolver=(
+                resolve_live_memory_transport_capability
+            ),
+            live_memory_capability_expiry_probe=(
+                live_memory_transport_capability_expired
+            ),
         )
+
+
+class BuildHttpAppOrderTests(
+    _HttpAppHarness, unittest.TestCase
+):
+    """Drive the REAL ``build_http_app`` middleware stack.
+
+    This is the ordering regression: MCPAuth -> MCPRequestBodyLimit ->
+    LiveRecallMCPView -> FastMCP. The body limit must run before the
+    view parses JSON-RPC, and the capability view must be reachable
+    only through the auth-established binding.
+    """
 
     def test_body_limit_runs_before_the_view(self):
         fake = FakeMCP()
@@ -1484,6 +1543,987 @@ class BuildHttpAppOrderTests(unittest.TestCase):
         self.assertEqual(len(tools), 1)
         self.assertEqual(tools[0]["name"], "Recall")
         self.assertNotIn("hold", raw.decode("utf-8"))
+
+
+# ------------------------------------------------------
+# UseMemory / v2 capability view
+# ------------------------------------------------------
+#
+# Tool visibility and tool reachability are two DIFFERENT facts:
+#
+#   normal MCP token : Recall hidden, UseMemory hidden
+#   v1 obrcap_       : Recall visible, UseMemory hidden
+#   v2 obmtcap_      : Recall visible, UseMemory visible
+#   stdio            : neither tool exists in the registry at all
+#                      (tested in test_live_recall_transport_registry)
+
+
+_USAGEREF = "useref_" + "a" * 32
+
+_MEMREF = "memref_" + "c" * 32
+
+
+class MemoryUsageToolVisibilityTests(unittest.TestCase):
+    """The normal view and the v1 view can never reach UseMemory."""
+
+    def test_normal_view_hides_and_refuses_use_memory(self):
+        app, fake = _normal_auth()
+
+        listing = _run(
+            _drive(
+                app,
+                _tools_list(),
+                auth_header=GOOD_TOKEN,
+            )
+        )
+
+        _status, _headers, payload, raw = _parse(listing)
+
+        names = [
+            tool["name"]
+            for tool in payload["result"]["tools"]
+        ]
+
+        self.assertEqual(
+            names, ["hold", "grow", "trace"]
+        )
+
+        for hidden in ("Recall", "UseMemory"):
+            self.assertNotIn(hidden, names)
+            self.assertNotIn(
+                hidden, raw.decode("utf-8")
+            )
+
+        for name in ("Recall", "UseMemory"):
+            call = _run(
+                _drive(
+                    app,
+                    _tools_call(name),
+                    auth_header=GOOD_TOKEN,
+                )
+            )
+
+            _s, _h, error, call_raw = _parse(call)
+
+            self.assertEqual(
+                error["error"]["code"], -32601
+            )
+            self.assertNotIn(
+                name, call_raw.decode("utf-8")
+            )
+
+        self.assertEqual(fake.handler_calls, [])
+
+    def test_anonymous_view_hides_and_refuses_use_memory(self):
+        app, fake = _build(auth_required=False)
+
+        listing = _run(_drive(app, _tools_list()))
+
+        _s, _h, payload, raw = _parse(listing)
+
+        names = [
+            tool["name"]
+            for tool in payload["result"]["tools"]
+        ]
+
+        self.assertNotIn("UseMemory", names)
+        self.assertNotIn("Recall", names)
+
+        call = _run(
+            _drive(app, _tools_call("UseMemory"))
+        )
+
+        _s2, _h2, error, _r2 = _parse(call)
+
+        self.assertEqual(error["error"]["code"], -32601)
+        self.assertEqual(fake.handler_calls, [])
+
+    def _capability_app(self):
+        return _build(
+            token_validator=(
+                lambda token, resource="": False
+            ),
+            resolver=(
+                resolve_live_recall_transport_capability
+            ),
+            probe=(
+                live_recall_transport_capability_expired
+            ),
+            memory_resolver=(
+                resolve_live_memory_transport_capability
+            ),
+            memory_probe=(
+                live_memory_transport_capability_expired
+            ),
+        )
+
+    def _state_env(self, root, **extra):
+        values = {
+            "OMBRE_CONTEXT_STATE_DIR": str(root),
+            BRIDGE_ENV: "1",
+            RECALL_ENABLED_ENV: "1",
+            LIVE_EXPOSURE_ENV: "1",
+        }
+
+        values.update(extra)
+
+        return patch.dict(
+            os.environ, values, clear=False
+        )
+
+    def _seed(self, memories=None):
+        tmp = tempfile.TemporaryDirectory()
+
+        self.addCleanup(tmp.cleanup)
+
+        memrefs = seed_live_exposure(
+            tmp.name,
+            memories
+            if memories is not None
+            else [
+                memory("mem-1", "alpha text", name="alpha"),
+                memory("mem-2", "beta text", name="beta"),
+            ],
+        )
+
+        return tmp.name, memrefs
+
+    def test_v1_capability_never_reaches_use_memory(self):
+        root, memrefs = self._seed()
+
+        with self._state_env(root):
+            from ombrebrain.context.live_recall_transport_capability import (
+                mint_live_recall_transport_capability,
+            )
+
+            token, _report = (
+                mint_live_recall_transport_capability(
+                    conversation_id=CID,
+                    cognitive_request_id=RID,
+                )
+            )
+
+            app, fake = self._capability_app()
+
+            listing = _run(
+                _drive(
+                    app,
+                    _tools_list(),
+                    auth_header=token,
+                )
+            )
+
+            call = _run(
+                _drive(
+                    app,
+                    _tools_call(
+                        "UseMemory",
+                        {"userefs": [_USAGEREF]},
+                    ),
+                    auth_header=token,
+                )
+            )
+
+        _s, _h, payload, raw = _parse(listing)
+
+        tools = payload["result"]["tools"]
+
+        self.assertEqual(len(tools), 1)
+        self.assertEqual(tools[0]["name"], "Recall")
+        self.assertNotIn(
+            "UseMemory", raw.decode("utf-8")
+        )
+
+        _s2, _h2, error, _r2 = _parse(call)
+
+        self.assertEqual(error["error"]["code"], -32601)
+        self.assertEqual(fake.handler_calls, [])
+        self.assertEqual(fake.requests, 1)
+
+        # The recalled memref still works through the v1 view.
+        self.assertEqual(
+            len(memrefs), 2
+        )
+
+
+class MemoryCapabilityViewTests(unittest.TestCase):
+    """The v2 obmtcap view sees exactly Recall + UseMemory."""
+
+    def _app(self, recall_handler=None, usage_handler=None):
+        return _build(
+            token_validator=(
+                lambda token, resource="": False
+            ),
+            resolver=(
+                resolve_live_recall_transport_capability
+            ),
+            probe=(
+                live_recall_transport_capability_expired
+            ),
+            memory_resolver=(
+                resolve_live_memory_transport_capability
+            ),
+            memory_probe=(
+                live_memory_transport_capability_expired
+            ),
+            recall_handler=recall_handler,
+            usage_handler=usage_handler,
+        )
+
+    def _state_env(self, root, **extra):
+        values = {
+            "OMBRE_CONTEXT_STATE_DIR": str(root),
+            "OMBRE_GATEWAY_CONTEXT_USAGE_ATTRIBUTION": "1",
+            BRIDGE_ENV: "1",
+            RECALL_ENABLED_ENV: "1",
+            LIVE_EXPOSURE_ENV: "1",
+        }
+
+        values.update(extra)
+
+        return patch.dict(
+            os.environ, values, clear=False
+        )
+
+    def _seed(self, memory_ids=("mem-1", "mem-2")):
+        tmp = tempfile.TemporaryDirectory()
+
+        self.addCleanup(tmp.cleanup)
+
+        memories = [
+            memory(memory_id, "text " + memory_id)
+            for memory_id in memory_ids
+        ]
+
+        memrefs = seed_live_exposure(
+            tmp.name, memories
+        )
+
+        return tmp.name, memrefs
+
+    def _mint(self):
+        from ombrebrain.context.live_memory_transport_capability import (
+            mint_live_memory_transport_capability,
+        )
+
+        token, _report = (
+            mint_live_memory_transport_capability(
+                conversation_id=CID,
+                cognitive_request_id=RID,
+            )
+        )
+
+        return token
+
+    def test_v2_view_lists_exactly_the_two_transport_tools(self):
+        root, _memrefs = self._seed()
+
+        with self._state_env(root):
+            token = self._mint()
+
+            self.assertIsInstance(token, str)
+
+            app, _fake = self._app()
+
+            sent = _run(
+                _drive(
+                    app,
+                    _tools_list(),
+                    auth_header=token,
+                )
+            )
+
+        status, headers, payload, raw = _parse(sent)
+
+        self.assertEqual(status, 200)
+
+        names = {
+            tool["name"]
+            for tool in payload["result"]["tools"]
+        }
+
+        self.assertEqual(
+            names, {"Recall", "UseMemory"}
+        )
+
+        self.assertEqual(
+            int(headers["content-length"]), len(raw)
+        )
+
+        for forbidden in (
+            "hold",
+            "grow",
+            "trace",
+            "breath",
+            "plan",
+            "letter",
+            "You",
+            "Them",
+        ):
+            self.assertNotIn(
+                forbidden, raw.decode("utf-8")
+            )
+
+    def test_v2_view_refuses_every_other_tool(self):
+        root, _memrefs = self._seed()
+
+        with self._state_env(root):
+            token = self._mint()
+
+            for name in (
+                "hold",
+                "grow",
+                "trace",
+                "breath",
+                "breath_search",
+                "breath_advanced",
+                "plan",
+                "dream",
+                "anchor",
+                "release",
+                "pulse",
+                "letter_write",
+                "letter_read",
+                "feel",
+                "I",
+                "You",
+                "Them",
+            ):
+                app, fake = self._app()
+
+                sent = _run(
+                    _drive(
+                        app,
+                        _tools_call(name),
+                        auth_header=token,
+                    )
+                )
+
+                _s, _h, payload, _raw = _parse(sent)
+
+                self.assertEqual(
+                    payload["error"]["code"],
+                    -32601,
+                    name,
+                )
+                self.assertEqual(
+                    fake.handler_calls, [], name
+                )
+                self.assertEqual(
+                    fake.requests, 0, name
+                )
+
+    def test_v2_view_rejects_other_methods_and_non_post(self):
+        root, _memrefs = self._seed()
+
+        with self._state_env(root):
+            token = self._mint()
+
+            for method in (
+                "resources/list",
+                "prompts/list",
+                "logging/setLevel",
+                "completion/complete",
+                "resources/read",
+            ):
+                app, fake = self._app()
+
+                sent = _run(
+                    _drive(
+                        app,
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 9,
+                            "method": method,
+                        },
+                        auth_header=token,
+                    )
+                )
+
+                _s, _h, payload, _raw = _parse(sent)
+
+                self.assertEqual(
+                    payload["error"]["code"],
+                    -32601,
+                    method,
+                )
+                self.assertEqual(
+                    fake.requests, 0, method
+                )
+
+            app, fake = self._app()
+
+            sent = _run(
+                _drive(
+                    app,
+                    b"",
+                    method="GET",
+                    auth_header=token,
+                )
+            )
+
+        _s2, _h2, payload2, _r2 = _parse(sent)
+
+        self.assertIn("error", payload2)
+        self.assertEqual(fake.requests, 0)
+
+    def test_use_memory_receives_only_userefs_with_trusted_binding(self):
+        root, _memrefs = self._seed()
+
+        seen = {}
+
+        async def usage_handler(userefs):
+            seen["userefs"] = userefs
+            seen["binding"] = dict(
+                current_live_recall_transport_binding()
+                or {}
+            )
+
+            return "ack"
+
+        with self._state_env(root):
+            token = self._mint()
+
+            app, fake = self._app(
+                usage_handler=usage_handler
+            )
+
+            sent = _run(
+                _drive(
+                    app,
+                    _tools_call(
+                        "UseMemory",
+                        {"userefs": [_USAGEREF]},
+                    ),
+                    auth_header=token,
+                )
+            )
+
+        _s, _h, payload, _raw = _parse(sent)
+
+        self.assertEqual(fake.handler_calls, ["UseMemory"])
+        self.assertEqual(
+            fake.handler_arguments,
+            [{"userefs": [_USAGEREF]}],
+        )
+        self.assertEqual(seen["userefs"], [_USAGEREF])
+        self.assertEqual(
+            seen["binding"],
+            {
+                "conversation_id": CID,
+                "cognitive_request_id": RID,
+            },
+        )
+
+        self.assertEqual(
+            payload["result"]["content"][0]["text"],
+            "ack",
+        )
+
+    def test_end_to_end_attribution_through_the_v2_view(self):
+        root, memrefs = self._seed()
+
+        seed_recall_control_plane(
+            root, ["mem-1", "mem-2"]
+        )
+
+        with self._state_env(root):
+            token = self._mint()
+
+            surface_report = (
+                build_live_recall_usage_surface(
+                    conversation_id=CID,
+                    cognitive_request_id=RID,
+                    anchor_ref=memrefs[0],
+                    model_result=projected_model_result(
+                        ["mem-1", "mem-2"]
+                    ),
+                )
+            )
+
+            self.assertTrue(surface_report["stored"])
+
+            useref = surface_report["usage_refs"][0][
+                "useref"
+            ]
+
+            async def usage_handler(userefs):
+                binding = (
+                    current_live_recall_transport_binding()
+                )
+
+                report = attribute_live_recall_usage(
+                    conversation_id=binding[
+                        "conversation_id"
+                    ],
+                    cognitive_request_id=binding[
+                        "cognitive_request_id"
+                    ],
+                    userefs=userefs,
+                )
+
+                return render_live_recall_usage_ack(
+                    report
+                )
+
+            app, fake = self._app(
+                usage_handler=usage_handler
+            )
+
+            sent = _run(
+                _drive(
+                    app,
+                    _tools_call(
+                        "UseMemory",
+                        {"userefs": [useref]},
+                    ),
+                    auth_header=token,
+                )
+            )
+
+            usage = read_usage(root)
+
+        _s, _h, payload, _raw = _parse(sent)
+
+        self.assertEqual(fake.handler_calls, ["UseMemory"])
+
+        text = payload["result"]["content"][0]["text"]
+
+        self.assertTrue(
+            text.startswith(
+                "OMBRE MEMORY USAGE ACK DATA\n"
+            )
+        )
+
+        ack = json.loads(text.split("\n", 1)[1])
+
+        self.assertEqual(ack["status"], "recorded")
+        self.assertEqual(ack["used_count"], 1)
+        self.assertEqual(ack["newly_used_count"], 1)
+
+        for forbidden in (
+            "useref_",
+            "mem-1",
+            "recall_",
+            CID,
+            RID,
+            "memref_",
+        ):
+            self.assertNotIn(forbidden, text)
+
+        self.assertEqual(usage["used_count"], 1)
+        self.assertEqual(
+            usage["used_memory_ids"], ["mem-1"]
+        )
+        self.assertEqual(
+            [
+                event
+                for event in usage["events"]
+                if event["stage"] == "used"
+            ][0]["memory_id"],
+            "mem-1",
+        )
+
+    def test_recall_alone_never_records_used(self):
+        """Recall succeeds; without UseMemory, ``used`` stays zero."""
+
+        root, memrefs = self._seed()
+
+        buckets = FakeBucketManager(
+            {
+                "mem-1": bucket(
+                    "mem-1", "text mem-1"
+                )
+            }
+        )
+
+        retrieval = FakeRetrievalAdapter(
+            [memory("mem-2", "text mem-2")]
+        )
+
+        async def recall_handler(memref):
+            binding = (
+                current_live_recall_transport_binding()
+            )
+
+            report = await request_live_recall(
+                conversation_id=binding[
+                    "conversation_id"
+                ],
+                cognitive_request_id=binding[
+                    "cognitive_request_id"
+                ],
+                memref=memref,
+                bucket_manager=buckets,
+                retrieval_adapter=retrieval,
+            )
+
+            self.assertTrue(report["authorized"])
+
+            if not (
+                live_recall_usage_attribution_enabled()
+            ):
+                return report["rendered"]
+
+            return (
+                compose_live_recall_result_with_usage_refs(
+                    rendered=report["rendered"],
+                    conversation_id=binding[
+                        "conversation_id"
+                    ],
+                    cognitive_request_id=binding[
+                        "cognitive_request_id"
+                    ],
+                    anchor_ref=memref,
+                    model_result=report.get(
+                        "model_result"
+                    ),
+                )
+            )
+
+        with self._state_env(root):
+            token = self._mint()
+
+            app, fake = self._app(
+                recall_handler=recall_handler
+            )
+
+            sent = _run(
+                _drive(
+                    app,
+                    _tools_call(
+                        "Recall",
+                        {"memref": memrefs[0]},
+                    ),
+                    auth_header=token,
+                )
+            )
+
+            # The real bridge mints the recall id, so the persisted
+            # usage artifact is located by directory, not by a guess.
+            usage_dir = (
+                Path(root)
+                / "memory_usage"
+                / CID
+                / RID
+            )
+
+            usage_files = sorted(
+                usage_dir.glob("*.json")
+            )
+
+            self.assertEqual(len(usage_files), 1)
+
+            usage = json.loads(
+                usage_files[0].read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        _s, _h, payload, _raw = _parse(sent)
+
+        self.assertEqual(fake.handler_calls, ["Recall"])
+
+        text = payload["result"]["content"][0]["text"]
+
+        self.assertIn("OMBRE RECALL DATA", text)
+        self.assertIn(
+            "OMBRE MEMORY USAGE REFS DATA", text
+        )
+
+        # The refs cover the exact model projection, nothing else.
+        envelope = text.split(
+            "OMBRE MEMORY USAGE REFS DATA\n", 1
+        )[1]
+
+        refs_payload = json.loads(
+            envelope.split("\n", 1)[1]
+        )
+
+        self.assertEqual(
+            [
+                item["rank"]
+                for item in refs_payload["usage_refs"]
+            ],
+            [1, 2],
+        )
+
+        # Recall alone is NOT usage.
+        self.assertEqual(usage["used_count"], 0)
+        self.assertEqual(usage["used_memory_ids"], [])
+
+        stages = [
+            event["stage"] for event in usage["events"]
+        ]
+
+        self.assertGreaterEqual(
+            stages.count("recall_requested"), 1
+        )
+        self.assertGreaterEqual(
+            stages.count("memory_loaded"), 1
+        )
+        self.assertEqual(stages.count("used"), 0)
+
+        for directory in (
+            "memory_lifecycle_events",
+            "memory_lifecycle_state",
+            "memory_reinforcement",
+        ):
+            self.assertFalse(
+                (Path(root) / directory).exists(),
+                directory,
+            )
+
+    def test_forged_v2_token_is_unauthorized(self):
+        root, _memrefs = self._seed()
+
+        with self._state_env(root):
+            app, fake = self._app()
+
+            sent = _run(
+                _drive(
+                    app,
+                    _tools_list(),
+                    auth_header="obmtcap_" + "a" * 64,
+                )
+            )
+
+        status, _headers, _payload, _raw = _parse(sent)
+
+        self.assertEqual(status, 401)
+        self.assertEqual(fake.requests, 0)
+
+    def test_v2_token_is_never_accepted_from_the_alt_header(self):
+        root, _memrefs = self._seed()
+
+        with self._state_env(root):
+            token = self._mint()
+
+            app, fake = self._app()
+
+            sent = _run(
+                _drive(
+                    app,
+                    _tools_list(),
+                    alt_token=token,
+                )
+            )
+
+        status, _headers, _payload, _raw = _parse(sent)
+
+        self.assertEqual(status, 401)
+        self.assertEqual(fake.requests, 0)
+
+    def test_scope_tool_set_mismatch_fails_closed(self):
+        fake = FakeMCP()
+
+        app = view_module.LiveRecallMCPView(fake)
+
+        base_scope = {
+            view_module.AUTH_KIND_SCOPE_KEY:
+                view_module.MEMORY_CAPABILITY_AUTH_KIND,
+            view_module.BINDING_SCOPE_KEY: {
+                "conversation_id": CID,
+                "cognitive_request_id": RID,
+            },
+        }
+
+        for declared in (
+            ["Recall"],
+            ["UseMemory"],
+            ["Recall", "UseMemory", "hold"],
+            "Recall",
+        ):
+            listing = _run(
+                _drive(
+                    app,
+                    _tools_list(),
+                    scope_extra={
+                        **base_scope,
+                        view_module.ALLOWED_TOOLS_SCOPE_KEY:
+                            declared,
+                    },
+                )
+            )
+
+            _s, _h, payload, raw = _parse(listing)
+
+            self.assertIn(
+                "error", payload, str(declared)
+            )
+            self.assertNotIn(
+                "Recall", raw.decode("utf-8")
+            )
+            self.assertNotIn(
+                "UseMemory", raw.decode("utf-8")
+            )
+
+            call = _run(
+                _drive(
+                    app,
+                    _tools_call(
+                        "Recall", {"memref": _MEMREF}
+                    ),
+                    scope_extra={
+                        **base_scope,
+                        view_module.ALLOWED_TOOLS_SCOPE_KEY:
+                            declared,
+                    },
+                )
+            )
+
+            _s2, _h2, error, _r2 = _parse(call)
+
+            self.assertEqual(
+                error["error"]["code"],
+                -32601,
+                str(declared),
+            )
+
+        self.assertEqual(fake.handler_calls, [])
+
+    def test_consistent_scope_is_accepted(self):
+        fake = FakeMCP()
+
+        app = view_module.LiveRecallMCPView(fake)
+
+        sent = _run(
+            _drive(
+                app,
+                _tools_list(),
+                scope_extra={
+                    view_module.AUTH_KIND_SCOPE_KEY:
+                        view_module.MEMORY_CAPABILITY_AUTH_KIND,
+                    view_module.BINDING_SCOPE_KEY: {
+                        "conversation_id": CID,
+                        "cognitive_request_id": RID,
+                    },
+                    view_module.ALLOWED_TOOLS_SCOPE_KEY: (
+                        "Recall",
+                        "UseMemory",
+                    ),
+                },
+            )
+        )
+
+        _s, _h, payload, _raw = _parse(sent)
+
+        names = {
+            tool["name"]
+            for tool in payload["result"]["tools"]
+        }
+
+        self.assertEqual(
+            names, {"Recall", "UseMemory"}
+        )
+
+
+class FullStackMemoryCapabilityTests(
+    _HttpAppHarness, unittest.TestCase
+):
+    """The real middleware stack drives the v2 capability view."""
+
+    def test_v2_view_through_full_stack(self):
+        tmp = tempfile.TemporaryDirectory()
+
+        self.addCleanup(tmp.cleanup)
+
+        memrefs = seed_live_exposure(
+            tmp.name,
+            [
+                memory("m-1", "alpha text", name="alpha"),
+                memory("m-2", "beta text", name="beta"),
+            ],
+        )
+
+        fake = FakeMCP()
+
+        with patch.dict(
+            os.environ,
+            {
+                "OMBRE_CONTEXT_STATE_DIR": tmp.name,
+                "OMBRE_GATEWAY_CONTEXT_USAGE_ATTRIBUTION": "1",
+            },
+            clear=False,
+        ):
+            from ombrebrain.context.live_memory_transport_capability import (
+                mint_live_memory_transport_capability,
+            )
+
+            token, _report = (
+                mint_live_memory_transport_capability(
+                    conversation_id=CID,
+                    cognitive_request_id=RID,
+                )
+            )
+
+            app = self._build(
+                fake,
+                settings=server_app.HTTPRuntimeSettings(
+                    auth_required=True,
+                    max_request_bytes=4 * 1024 * 1024,
+                    auth_mode="oauth",
+                    public_origin="https://example.com",
+                ),
+            )
+
+            listing = _run(
+                _drive(
+                    app,
+                    _tools_list(),
+                    auth_header=token,
+                )
+            )
+
+            denied = _run(
+                _drive(
+                    app,
+                    _tools_call("hold"),
+                    auth_header=token,
+                )
+            )
+
+        _s, _h, payload, raw = _parse(listing)
+
+        names = {
+            tool["name"]
+            for tool in payload["result"]["tools"]
+        }
+
+        self.assertEqual(
+            names, {"Recall", "UseMemory"}
+        )
+        self.assertNotIn("hold", raw.decode("utf-8"))
+
+        _s2, _h2, error, _r2 = _parse(denied)
+
+        self.assertEqual(error["error"]["code"], -32601)
+        self.assertEqual(fake.handler_calls, [])
+
+        self.assertEqual(len(memrefs), 2)
+
+    def test_normal_view_through_full_stack_hides_both_tools(self):
+        fake = FakeMCP()
+
+        app = self._build(fake)
+
+        sent = _run(_drive(app, _tools_list()))
+
+        _s, _h, payload, raw = _parse(sent)
+
+        names = [
+            tool["name"]
+            for tool in payload["result"]["tools"]
+        ]
+
+        self.assertEqual(
+            names, ["hold", "grow", "trace"]
+        )
+
+        for hidden in ("Recall", "UseMemory"):
+            self.assertNotIn(
+                hidden, raw.decode("utf-8")
+            )
 
 
 if __name__ == "__main__":

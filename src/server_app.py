@@ -19,8 +19,15 @@ from typing import Any, Awaitable, Callable, Mapping
 import httpx
 from starlette.middleware.cors import CORSMiddleware
 
+from ombrebrain.context.live_memory_transport_capability import (
+    is_live_memory_transport_capability_token,
+)
 from ombrebrain.context.live_recall_transport_capability import (
     is_live_recall_transport_capability_token,
+)
+from ombrebrain.context.recall_types import (
+    is_valid_cognitive_request_id,
+    is_valid_conversation_id,
 )
 from ombrebrain.security.public_origin import (
     configured_public_origin,
@@ -28,6 +35,10 @@ from ombrebrain.security.public_origin import (
 )
 from utils import parse_bool
 from web.live_recall_mcp_view import (
+    CAPABILITY_AUTH_KIND,
+    LIVE_MEMORY_USAGE_TOOL_NAME,
+    LIVE_RECALL_TOOL_NAME,
+    MEMORY_CAPABILITY_AUTH_KIND,
     LiveRecallMCPView,
 )
 from web.request_limits import (
@@ -183,6 +194,19 @@ def _extract_bearer_token(value: str) -> str:
 class MCPAuthMiddleware:
     """Require a bearer token for every endpoint of the selected MCP transport."""
 
+    # Trusted allowed tool set per capability kind. v1 is Recall-only
+    # and stays Recall-only: an old ``obrcap_`` token can never be
+    # widened to UseMemory.
+    _CAPABILITY_TOOLS = {
+        CAPABILITY_AUTH_KIND: (
+            LIVE_RECALL_TOOL_NAME,
+        ),
+        MEMORY_CAPABILITY_AUTH_KIND: (
+            LIVE_RECALL_TOOL_NAME,
+            LIVE_MEMORY_USAGE_TOOL_NAME,
+        ),
+    }
+
     def __init__(
         self,
         app: Any,
@@ -200,6 +224,12 @@ class MCPAuthMiddleware:
         live_recall_capability_expiry_probe: (
             Callable[[str], bool] | None
         ) = None,
+        live_memory_capability_resolver: (
+            Callable[[str], dict | None] | None
+        ) = None,
+        live_memory_capability_expiry_probe: (
+            Callable[[str], bool] | None
+        ) = None,
     ) -> None:
         self.app = app
         self.auth_required = bool(auth_required)
@@ -211,44 +241,104 @@ class MCPAuthMiddleware:
         self.path_matcher = path_matcher
         self.resource_path = "/" + str(resource_path or "mcp").strip("/")
         self.public_origin = normalize_public_origin(public_origin)
-        # Optional, additive: a short-lived live recall transport
-        # capability is resolved ONLY from ``Authorization: Bearer``.
-        # The existing OAuth / static token semantics are untouched.
+        # Optional, additive: a short-lived live transport capability
+        # is resolved ONLY from ``Authorization: Bearer``. The existing
+        # OAuth / static token semantics are untouched. v1 is the
+        # Recall-only capability; v2 additionally grants UseMemory.
         self.live_recall_capability_resolver = (
             live_recall_capability_resolver
         )
         self.live_recall_capability_expiry_probe = (
             live_recall_capability_expiry_probe
         )
+        self.live_memory_capability_resolver = (
+            live_memory_capability_resolver
+        )
+        self.live_memory_capability_expiry_probe = (
+            live_memory_capability_expiry_probe
+        )
 
-    def _resolve_live_recall_capability(
+    def _resolve_capability(
         self,
         token: str,
     ) -> dict | None:
-        """Resolve a capability, logging only privacy-safe enums.
+        """Resolve a capability token into a trusted scope binding.
 
-        The raw token, its prefix content, the CID, the RID and any
-        memref are never logged.
+        The credential KIND decides the allowed tool set -- never
+        anything a client sends. Returns ``{"auth_kind",
+        "allowed_tools", "binding"}`` or None. Only privacy-safe enums
+        are ever logged: the raw token, its prefix content, the CID,
+        the RID and any memref are never logged.
         """
 
-        if not is_live_recall_transport_capability_token(token):
+        if not isinstance(token, str) or not token:
             return None
 
+        if is_live_recall_transport_capability_token(token):
+            return self._resolve_capability_kind(
+                token,
+                auth_kind=CAPABILITY_AUTH_KIND,
+                resolver=self.live_recall_capability_resolver,
+                expiry_probe=(
+                    self.live_recall_capability_expiry_probe
+                ),
+            )
+
+        if is_live_memory_transport_capability_token(token):
+            return self._resolve_capability_kind(
+                token,
+                auth_kind=MEMORY_CAPABILITY_AUTH_KIND,
+                resolver=self.live_memory_capability_resolver,
+                expiry_probe=(
+                    self.live_memory_capability_expiry_probe
+                ),
+            )
+
+        return None
+
+    def _resolve_capability_kind(
+        self,
+        token: str,
+        *,
+        auth_kind: str,
+        resolver: Callable[[str], dict | None] | None,
+        expiry_probe: Callable[[str], bool] | None,
+    ) -> dict | None:
         binding = None
 
-        if self.live_recall_capability_resolver is not None:
+        if resolver is not None:
             try:
-                binding = self.live_recall_capability_resolver(token)
+                binding = resolver(token)
             except Exception:
                 binding = None
 
-        if isinstance(binding, dict) and binding:
+        conversation_id = (
+            binding.get("conversation_id")
+            if isinstance(binding, dict)
+            else None
+        )
+
+        cognitive_request_id = (
+            binding.get("cognitive_request_id")
+            if isinstance(binding, dict)
+            else None
+        )
+
+        # A resolver answer only counts when it carries the exact
+        # trusted request identity; anything else fails closed.
+        if (
+            isinstance(binding, dict)
+            and binding
+            and is_valid_conversation_id(conversation_id)
+            and is_valid_cognitive_request_id(
+                cognitive_request_id
+            )
+        ):
             logger.info(
                 "[mcp.auth] %s",
                 json.dumps(
                     {
-                        "auth_kind":
-                            "live_recall_capability",
+                        "auth_kind": auth_kind,
                         "resolved": True,
                         "expired": False,
                     },
@@ -257,20 +347,26 @@ class MCPAuthMiddleware:
                 ),
             )
 
-            return binding
+            return {
+                "auth_kind": auth_kind,
+                "allowed_tools": list(
+                    self._CAPABILITY_TOOLS.get(
+                        auth_kind, ()
+                    )
+                ),
+                "binding": {
+                    "conversation_id": conversation_id,
+                    "cognitive_request_id": (
+                        cognitive_request_id
+                    ),
+                },
+            }
 
         expired = False
 
-        if (
-            self.live_recall_capability_expiry_probe
-            is not None
-        ):
+        if expiry_probe is not None:
             try:
-                expired = bool(
-                    self.live_recall_capability_expiry_probe(
-                        token
-                    )
-                )
+                expired = bool(expiry_probe(token))
             except Exception:
                 expired = False
 
@@ -278,7 +374,7 @@ class MCPAuthMiddleware:
             "[mcp.auth] %s",
             json.dumps(
                 {
-                    "auth_kind": "live_recall_capability",
+                    "auth_kind": auth_kind,
                     "resolved": False,
                     "expired": bool(expired),
                 },
@@ -299,7 +395,7 @@ class MCPAuthMiddleware:
             headers = {key.lower(): value for key, value in scope.get("headers", [])}
             auth = headers.get(b"authorization", b"").decode("latin-1")
             bearer_token = _extract_bearer_token(auth)
-            capability_binding = None
+            capability = None
             if self.auth_required:
                 base = _canonical_mcp_base(scope, headers, self.public_origin)
                 # OAuth discovery currently exposes one canonical MCP resource.
@@ -340,14 +436,13 @@ class MCPAuthMiddleware:
                         )
                 if not valid:
                     # Normal auth failed: only now fall back to a
-                    # short-lived live recall capability, and only for
-                    # an ``Authorization: Bearer obrcap_...`` token.
-                    capability_binding = (
-                        self._resolve_live_recall_capability(
-                            bearer_token
-                        )
+                    # short-lived live transport capability, and only
+                    # for an ``Authorization: Bearer`` token whose
+                    # shape is a v1 ``obrcap_`` or a v2 ``obmtcap_``.
+                    capability = self._resolve_capability(
+                        bearer_token
                     )
-                    valid = capability_binding is not None
+                    valid = capability is not None
                 if not valid:
                     endpoint = self.resource_path.strip("/")
                     if self.auth_mode == "token":
@@ -390,25 +485,28 @@ class MCPAuthMiddleware:
                     return
             else:
                 # With auth disabled the anonymous view is the normal
-                # view; Recall still requires a valid capability, so a
-                # bearer capability is resolved here too. A normal
-                # (non-obrcap) token resolves to no binding and can
-                # never become a capability view.
+                # view; Recall / UseMemory still require a valid
+                # capability, so a bearer capability is resolved here
+                # too. A normal (non-capability) token resolves to no
+                # binding and can never become a capability view.
                 if bearer_token:
-                    capability_binding = (
-                        self._resolve_live_recall_capability(
-                            bearer_token
-                        )
+                    capability = self._resolve_capability(
+                        bearer_token
                     )
-            if capability_binding is not None:
+            if capability is not None:
                 # Downstream middleware (the MCP view) reads these scope
-                # keys. The token itself is deliberately never stored.
+                # keys. The token itself is deliberately never stored,
+                # and the allowed tool set comes from the server-side
+                # credential kind -- never from the request.
                 scope = dict(scope)
-                scope["ombre_mcp_auth_kind"] = (
-                    "live_recall_capability"
-                )
-                scope["ombre_live_recall_binding"] = (
-                    capability_binding
+                scope["ombre_mcp_auth_kind"] = capability[
+                    "auth_kind"
+                ]
+                scope["ombre_live_recall_binding"] = capability[
+                    "binding"
+                ]
+                scope["ombre_mcp_allowed_tools"] = tuple(
+                    capability["allowed_tools"]
                 )
         await self.app(scope, receive, send)
 
@@ -831,6 +929,12 @@ def build_http_app(
     live_recall_capability_expiry_probe: (
         Callable[[str], bool] | None
     ) = None,
+    live_memory_capability_resolver: (
+        Callable[[str], dict | None] | None
+    ) = None,
+    live_memory_capability_expiry_probe: (
+        Callable[[str], bool] | None
+    ) = None,
 ) -> Any:
     """Build the HTTP (streamable-http) ASGI app with one consistent middleware stack."""
 
@@ -888,6 +992,12 @@ def build_http_app(
         ),
         live_recall_capability_expiry_probe=(
             live_recall_capability_expiry_probe
+        ),
+        live_memory_capability_resolver=(
+            live_memory_capability_resolver
+        ),
+        live_memory_capability_expiry_probe=(
+            live_memory_capability_expiry_probe
         ),
     )
     # Starlette wraps middleware in reverse registration order.  CORS must be

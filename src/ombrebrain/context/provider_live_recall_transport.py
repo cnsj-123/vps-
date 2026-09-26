@@ -15,6 +15,12 @@ from ombrebrain.context.live_recall_authorization import (
 from ombrebrain.context.live_recall_transport_capability import (
     mint_live_recall_transport_capability,
 )
+from ombrebrain.context.live_recall_usage_attribution import (
+    live_recall_usage_attribution_enabled,
+)
+from ombrebrain.context.live_memory_transport_capability import (
+    mint_live_memory_transport_capability,
+)
 from ombrebrain.context.memory_flash_live_exposure import (
     read_live_memory_exposure,
 )
@@ -61,6 +67,20 @@ from ombrebrain.context.recall_types import (
 # re-read before the mutated body may be returned -- the system never
 # emits a capability it cannot prove it minted.
 #
+# Usage Attribution (``OMBRE_GATEWAY_CONTEXT_USAGE_ATTRIBUTION``) is
+# additive and default OFF. OFF keeps the frozen v1 behavior exactly:
+# an ``obrcap_`` capability and a Recall-only toolset. ON mints the v2
+# ``obmtcap_`` capability and enables the second transport-only tool
+# in the same toolset configuration:
+#
+#     "configs": {
+#       "Recall":    {"enabled": true},
+#       "UseMemory": {"enabled": true}
+#     }
+#
+# Nothing else changes: same server entry, same URL, same beta token,
+# same preserved fields.
+#
 # The raw capability appears in exactly one place: the outbound
 # ``mcp_servers[].authorization_token``. Never in the receipt, the
 # report, a log, the model context or a tool argument.
@@ -72,6 +92,17 @@ _PROVIDER_ANTHROPIC_MCP = "anthropic_mcp_connector"
 
 _SERVER_NAME = "ombre-live-recall"
 _MCP_TOOLSET_TYPE = "mcp_toolset"
+
+# The single Recall tool is the frozen v1 toolset. With the Usage
+# Attribution flag ON the SAME toolset additionally enables
+# ``UseMemory`` -- the explicit usage-attribution tool -- and the
+# capability becomes a v2 ``obmtcap_`` token. Nothing else about the
+# request changes.
+_TOOLSET_CONFIGS_V1 = {"Recall": {"enabled": True}}
+_TOOLSET_CONFIGS_V2 = {
+    "Recall": {"enabled": True},
+    "UseMemory": {"enabled": True},
+}
 
 _BETA_HEADER = "anthropic-beta"
 _BETA_TOKEN = "mcp-client-2025-11-20"
@@ -648,14 +679,31 @@ def prepare_provider_live_recall_transport(
                 "live_exposure_unavailable",
             )
 
-        raw_token, mint_report = (
-            mint_live_recall_transport_capability(
-                conversation_id=conversation_id,
-                cognitive_request_id=(
-                    cognitive_request_id
-                ),
-            )
+        usage_attribution = (
+            live_recall_usage_attribution_enabled()
         )
+
+        if usage_attribution:
+            # Usage Attribution is ON: the SAME transport mints a v2
+            # capability (``obmtcap_``) that also grants UseMemory.
+            # The v1 ``obrcap_`` credential is never widened.
+            raw_token, mint_report = (
+                mint_live_memory_transport_capability(
+                    conversation_id=conversation_id,
+                    cognitive_request_id=(
+                        cognitive_request_id
+                    ),
+                )
+            )
+        else:
+            raw_token, mint_report = (
+                mint_live_recall_transport_capability(
+                    conversation_id=conversation_id,
+                    cognitive_request_id=(
+                        cognitive_request_id
+                    ),
+                )
+            )
 
         report["capability_ttl"] = mint_report.get(
             "ttl_seconds"
@@ -770,9 +818,11 @@ def prepare_provider_live_recall_transport(
                 "type": _MCP_TOOLSET_TYPE,
                 "mcp_server_name": _SERVER_NAME,
                 "default_config": {"enabled": False},
-                "configs": {
-                    "Recall": {"enabled": True}
-                },
+                "configs": dict(
+                    _TOOLSET_CONFIGS_V2
+                    if usage_attribution
+                    else _TOOLSET_CONFIGS_V1
+                ),
             }
         ]
 
