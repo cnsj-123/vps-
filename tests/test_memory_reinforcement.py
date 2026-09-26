@@ -36,8 +36,10 @@ from ombrebrain.context.memory_lifecycle_event import (
     build_lifecycle_event,
     lifecycle_events_dir,
     memory_key,
-    persist_lifecycle_event,
     read_lifecycle_events,
+    # The low-level storage primitive, NOT the authorization boundary:
+    # used here only to exercise threaded atomicity directly.
+    _persist_verified_lifecycle_event,
 )
 from ombrebrain.context.memory_lifecycle_state import (
     lifecycle_state_path,
@@ -1115,7 +1117,7 @@ class ConcurrencyTests(
                     results = list(
                         pool.map(
                             lambda _: (
-                                persist_lifecycle_event(
+                                _persist_verified_lifecycle_event(
                                     event
                                 )
                             ),

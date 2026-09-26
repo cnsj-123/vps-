@@ -24,7 +24,10 @@ from ombrebrain.context.memory_lifecycle_event import (
     build_lifecycle_event,
     lifecycle_events_dir,
     memory_key,
-    persist_lifecycle_event,
+    # The low-level storage primitive, NOT the authorization boundary.
+    # State tests seed arbitrary event histories through it on purpose:
+    # they exercise derivation, not the Usage provenance gate.
+    _persist_verified_lifecycle_event,
 )
 from ombrebrain.context.memory_lifecycle_state import (
     STATE_VERSION,
@@ -53,7 +56,7 @@ def _seed(
     index: int = 2,
 ) -> None:
     for offset, at in enumerate(times):
-        persist_lifecycle_event(
+        _persist_verified_lifecycle_event(
             build_lifecycle_event(
                 conversation_id=CID,
                 cognitive_request_id=RID,

@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import inspect
 import json
 import tempfile
 import unittest
+from concurrent.futures import (
+    ThreadPoolExecutor,
+)
 from datetime import timedelta
+from pathlib import Path
 
 from _lifecycle_fixtures import (
     CID,
@@ -12,8 +17,10 @@ from _lifecycle_fixtures import (
     M3,
     RID,
     T0,
+    guarded_bucket_manager,
     iso,
     lifecycle_env,
+    source_bucket,
     usage_artifact,
     write_usage,
 )
@@ -27,10 +34,15 @@ from ombrebrain.context.memory_lifecycle_event import (
     lifecycle_event_path,
     lifecycle_events_dir,
     memory_key,
-    persist_lifecycle_event,
     read_lifecycle_events,
+    record_lifecycle_event_from_usage,
+    # The low-level storage primitive. It is deliberately NOT the
+    # authorization boundary: tests use it to seed and to exercise
+    # atomicity / idempotency directly.
+    _persist_verified_lifecycle_event,
 )
 from ombrebrain.context.memory_reinforcement import (
+    derive_memory_lifecycle_state,
     observe_memory_usage_lifecycle,
 )
 
@@ -200,7 +212,7 @@ class LifecycleEventPrimitiveTests(
             with lifecycle_env(root):
                 event = _event()
 
-                first = persist_lifecycle_event(
+                first = _persist_verified_lifecycle_event(
                     event
                 )
 
@@ -211,7 +223,7 @@ class LifecycleEventPrimitiveTests(
 
                 payload = path.read_bytes()
 
-                second = persist_lifecycle_event(
+                second = _persist_verified_lifecycle_event(
                     _event()
                 )
 
@@ -256,7 +268,7 @@ class LifecycleEventPrimitiveTests(
                     encoding="utf-8",
                 )
 
-                result = persist_lifecycle_event(
+                result = _persist_verified_lifecycle_event(
                     event
                 )
 
@@ -286,7 +298,7 @@ class LifecycleEventProvenanceTests(
 ):
     def _persist(self, root, event):
         with lifecycle_env(root):
-            result = persist_lifecycle_event(
+            result = _persist_verified_lifecycle_event(
                 event
             )
 
@@ -471,10 +483,10 @@ class LifecycleEventProvenanceTests(
     def test_read_only_scans_own_memory_dir(self):
         with tempfile.TemporaryDirectory() as root:
             with lifecycle_env(root):
-                persist_lifecycle_event(
+                _persist_verified_lifecycle_event(
                     _event(M1)
                 )
-                persist_lifecycle_event(
+                _persist_verified_lifecycle_event(
                     _event(
                         M2, recall_id=RECALL_B
                     )
@@ -817,6 +829,477 @@ class LifecycleEventObserverTests(
         self.assertEqual(
             report["reason"],
             "usage_not_found_or_invalid",
+        )
+
+
+class LifecycleEventProvenanceGateTests(
+    unittest.IsolatedAsyncioTestCase,
+):
+    """Persistence requires a real, persisted Usage.used event.
+
+    ``record_lifecycle_event_from_usage`` is the only authorized write
+    path. A structurally valid artifact is NOT sufficient, so a
+    "phantom" reinforcement receipt cannot be manufactured.
+    """
+
+    def test_api_cannot_be_told_provenance(self):
+        parameters = inspect.signature(
+            record_lifecycle_event_from_usage
+        ).parameters
+
+        self.assertEqual(
+            list(parameters),
+            [
+                "conversation_id",
+                "cognitive_request_id",
+                "recall_id",
+                "source_usage_event_index",
+            ],
+        )
+
+        for forbidden in (
+            "memory_id",
+            "stage",
+            "source_usage_event_at",
+            "at",
+            "usage",
+            "event",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(
+                    forbidden, parameters
+                )
+
+        with self.assertRaises(TypeError):
+            record_lifecycle_event_from_usage(
+                CID,
+                RID,
+                RECALL_A,
+                2,
+                memory_id=M2,
+                source_usage_event_at=iso(T0),
+            )
+
+    async def test_phantom_reinforcement_is_refused(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as root:
+            with lifecycle_env(root):
+                # No Usage artifact exists at all.
+                result = (
+                    record_lifecycle_event_from_usage(
+                        CID,
+                        RID,
+                        RECALL_A,
+                        0,
+                    )
+                )
+
+                self.assertFalse(result["stored"])
+                self.assertEqual(
+                    result["reason"],
+                    "usage_not_found_or_invalid",
+                )
+                self.assertIsNone(result["event_id"])
+
+                self.assertEqual(
+                    read_lifecycle_events(M1),
+                    {
+                        "events": [],
+                        "event_file_count": 0,
+                        "invalid_event_count": 0,
+                    },
+                )
+
+                self.assertFalse(
+                    lifecycle_events_dir(
+                        memory_key(M1)
+                    ).exists()
+                )
+
+                report = (
+                    await derive_memory_lifecycle_state(
+                        M1,
+                        bucket_manager=(
+                            guarded_bucket_manager(
+                                {
+                                    M1:
+                                        source_bucket(
+                                            M1
+                                        )
+                                }
+                            )
+                        ),
+                        as_of=T0,
+                    )
+                )
+
+        self.assertEqual(
+            report["state"]["use_count"], 0
+        )
+        self.assertAlmostEqual(
+            report["state"]["strength"], 0.20
+        )
+
+    def test_corrupt_usage_is_refused(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = (
+                Path(root)
+                / "memory_usage"
+                / CID
+                / RID
+                / (RECALL_A + ".json")
+            )
+
+            path.parent.mkdir(
+                parents=True, exist_ok=True
+            )
+
+            path.write_text(
+                json.dumps(
+                    {
+                        "version": (
+                            "memory-usage-signal.v1"
+                        ),
+                        "mode": "shadow_only",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with lifecycle_env(root):
+                result = (
+                    record_lifecycle_event_from_usage(
+                        CID,
+                        RID,
+                        RECALL_A,
+                        0,
+                    )
+                )
+
+                self.assertFalse(result["stored"])
+                self.assertEqual(
+                    result["reason"],
+                    "usage_not_found_or_invalid",
+                )
+                self.assertFalse(
+                    lifecycle_events_dir(
+                        memory_key(M1)
+                    ).exists()
+                )
+
+    def test_index_must_be_a_strict_int(self):
+        with tempfile.TemporaryDirectory() as root:
+            write_usage(
+                root,
+                usage_artifact(
+                    recall_id=RECALL_A,
+                    loaded_memory_ids=(M1,),
+                    used_memory_ids=(M1,),
+                    at=iso(T0),
+                ),
+            )
+
+            with lifecycle_env(root):
+                for index in (
+                    -1,
+                    99,
+                    "2",
+                    True,
+                    False,
+                    None,
+                    1.5,
+                ):
+                    with self.subTest(index=index):
+                        result = (
+                            record_lifecycle_event_from_usage(
+                                CID,
+                                RID,
+                                RECALL_A,
+                                index,
+                            )
+                        )
+
+                        self.assertFalse(
+                            result["stored"]
+                        )
+                        self.assertEqual(
+                            result["reason"],
+                            "invalid_usage_event_index",
+                        )
+
+                self.assertEqual(
+                    read_lifecycle_events(M1)[
+                        "events"
+                    ],
+                    [],
+                )
+
+    def test_only_used_slots_are_reinforcement(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as root:
+            artifact = usage_artifact(
+                recall_id=RECALL_A,
+                loaded_memory_ids=(M1, M2),
+                used_memory_ids=(M2,),
+                at=iso(T0),
+            )
+
+            # 0 recall_requested, 1 memory_loaded(M1),
+            # 2 memory_loaded(M2), 3 used(M2)
+            stages = [
+                event["stage"]
+                for event in artifact["events"]
+            ]
+
+            self.assertEqual(
+                stages,
+                [
+                    "recall_requested",
+                    "memory_loaded",
+                    "memory_loaded",
+                    "used",
+                ],
+            )
+
+            write_usage(root, artifact)
+
+            with lifecycle_env(root):
+                for index in (0, 1, 2):
+                    with self.subTest(index=index):
+                        result = (
+                            record_lifecycle_event_from_usage(
+                                CID,
+                                RID,
+                                RECALL_A,
+                                index,
+                            )
+                        )
+
+                        self.assertFalse(
+                            result["stored"]
+                        )
+                        self.assertEqual(
+                            result["reason"],
+                            "source_event_not_used",
+                        )
+
+                accepted = (
+                    record_lifecycle_event_from_usage(
+                        CID, RID, RECALL_A, 3
+                    )
+                )
+
+                store = read_lifecycle_events(M2)
+
+                self.assertTrue(accepted["stored"])
+                self.assertFalse(
+                    accepted["duplicate"]
+                )
+                self.assertEqual(
+                    accepted["memory_id"], M2
+                )
+                self.assertEqual(
+                    accepted[
+                        "source_usage_event_index"
+                    ],
+                    3,
+                )
+
+        self.assertEqual(len(store["events"]), 1)
+        self.assertEqual(
+            store["events"][0]["memory_id"], M2
+        )
+        self.assertEqual(
+            store["events"][0]["stage"], "used"
+        )
+        self.assertEqual(
+            store["events"][0][
+                "source_usage_event_at"
+            ],
+            iso(T0),
+        )
+
+    def test_provenance_comes_from_the_artifact(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as root:
+            # The persisted usage says used=M1 at T0. The API cannot be
+            # told a different memory or a different time, so a forged
+            # receipt is not representable.
+            write_usage(
+                root,
+                usage_artifact(
+                    recall_id=RECALL_A,
+                    loaded_memory_ids=(M1, M2),
+                    used_memory_ids=(M1,),
+                    at=iso(T0),
+                ),
+            )
+
+            with lifecycle_env(root):
+                result = (
+                    record_lifecycle_event_from_usage(
+                        CID, RID, RECALL_A, 3
+                    )
+                )
+
+                store = read_lifecycle_events(M1)
+
+        self.assertTrue(result["stored"])
+        self.assertEqual(result["memory_id"], M1)
+        self.assertEqual(
+            result["memory_key"], memory_key(M1)
+        )
+
+        self.assertEqual(len(store["events"]), 1)
+
+        event = store["events"][0]
+
+        self.assertEqual(event["memory_id"], M1)
+        self.assertEqual(event["stage"], "used")
+        self.assertEqual(
+            event["source_usage_event_at"],
+            iso(T0),
+        )
+        self.assertEqual(
+            event["source_usage_event_index"], 3
+        )
+        self.assertEqual(
+            event["conversation_id"], CID
+        )
+        self.assertEqual(
+            event["cognitive_request_id"], RID
+        )
+        self.assertEqual(
+            event["recall_id"], RECALL_A
+        )
+        self.assertEqual(
+            event["source_usage_version"],
+            "memory-usage-signal.v1",
+        )
+
+        # No event was created for the loaded-but-unused M2.
+        self.assertEqual(
+            read_lifecycle_events(M2)["events"],
+            [],
+        )
+
+    def test_hundred_reprocessings_one_receipt(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as root:
+            write_usage(
+                root,
+                usage_artifact(
+                    recall_id=RECALL_A,
+                    loaded_memory_ids=(M1,),
+                    used_memory_ids=(M1,),
+                    at=iso(T0),
+                ),
+            )
+
+            with lifecycle_env(root):
+                results = [
+                    record_lifecycle_event_from_usage(
+                        CID, RID, RECALL_A, 2
+                    )
+                    for _ in range(100)
+                ]
+
+                store = read_lifecycle_events(M1)
+
+        self.assertEqual(len(store["events"]), 1)
+        self.assertEqual(
+            sum(
+                1
+                for result in results
+                if result["stored"]
+                and not result["duplicate"]
+            ),
+            1,
+        )
+        self.assertEqual(
+            sum(
+                1
+                for result in results
+                if result["duplicate"]
+            ),
+            99,
+        )
+
+    def test_concurrent_duplicate_is_one_event(self):
+        with tempfile.TemporaryDirectory() as root:
+            write_usage(
+                root,
+                usage_artifact(
+                    recall_id=RECALL_A,
+                    loaded_memory_ids=(M1,),
+                    used_memory_ids=(M1,),
+                    at=iso(T0),
+                ),
+            )
+
+            with lifecycle_env(root):
+                with ThreadPoolExecutor(
+                    max_workers=8
+                ) as pool:
+                    results = list(
+                        pool.map(
+                            lambda _: (
+                                record_lifecycle_event_from_usage(
+                                    CID,
+                                    RID,
+                                    RECALL_A,
+                                    2,
+                                )
+                            ),
+                            range(16),
+                        )
+                    )
+
+                store = read_lifecycle_events(M1)
+
+        self.assertEqual(len(store["events"]), 1)
+        self.assertEqual(
+            sum(
+                1
+                for result in results
+                if result["stored"]
+                and not result["duplicate"]
+            ),
+            1,
+        )
+
+    def test_reader_does_not_need_the_usage_artifact(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as root:
+            usage_path = write_usage(
+                root,
+                usage_artifact(
+                    recall_id=RECALL_A,
+                    loaded_memory_ids=(M1,),
+                    used_memory_ids=(M1,),
+                    at=iso(T0),
+                ),
+            )
+
+            with lifecycle_env(root):
+                record_lifecycle_event_from_usage(
+                    CID, RID, RECALL_A, 2
+                )
+
+                # Authorization happened at write time; the receipt is
+                # now history's own source of truth.
+                usage_path.unlink()
+
+                store = read_lifecycle_events(M1)
+
+        self.assertEqual(len(store["events"]), 1)
+        self.assertEqual(
+            store["events"][0]["memory_id"], M1
         )
 
 

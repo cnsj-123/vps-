@@ -6,11 +6,11 @@ from typing import Any
 
 from ombrebrain.context.memory_lifecycle_event import (
     MODE,
-    build_lifecycle_event,
+    REASON_INVALID_USAGE_EVENT_TIME,
     memory_key,
     parse_iso_utc,
-    persist_lifecycle_event,
     read_lifecycle_events,
+    record_lifecycle_event_from_usage,
 )
 from ombrebrain.context.memory_lifecycle_state import (
     STATE_VERSION,
@@ -48,7 +48,11 @@ from ombrebrain.context.unified_context_candidate import (
 # / ``recall_requested`` / ``memory_loaded`` as reinforcement.
 #
 # The observer reads the usage artifact itself -- a caller can never
-# hand it a raw ``{"memory_id": ..., "used": True}`` dict.
+# hand it a raw ``{"memory_id": ..., "used": True}`` dict -- and every
+# receipt is written through the provenance gate
+# ``record_lifecycle_event_from_usage``, which re-reads that artifact
+# and derives each provenance field from the persisted event slot. The
+# caller may name a slot, never a memory, a stage or a time.
 #
 # Everything this phase produces lives under ``OMBRE_CONTEXT_STATE_DIR``
 # as lifecycle events and lifecycle state. A canonical memory source is
@@ -352,24 +356,24 @@ def _refused_state(
     }
 
 
-def _used_events(
+def _used_event_indices(
     artifact: dict[str, Any],
-) -> tuple[list[tuple[int, str, str]], int]:
-    """Extract only the explicit ``used`` stage from a Usage artifact.
+) -> list[int]:
+    """The slot indices of the explicit ``used`` stage only.
 
     ``retrieved`` / ``surfaced`` / ``recall_requested`` /
-    ``memory_loaded`` are skipped by construction. An event with an
-    illegal timestamp is rejected -- a bad time would poison decay --
-    and is never replaced by "now".
+    ``memory_loaded`` are skipped by construction. The slot index is
+    the only thing this observer is allowed to name: memory id, stage
+    and timestamp are re-derived from the persisted artifact by
+    ``record_lifecycle_event_from_usage``.
     """
 
-    used: list[tuple[int, str, str]] = []
-    invalid = 0
+    indices: list[int] = []
 
     events = artifact.get("events")
 
     if not isinstance(events, list):
-        return used, invalid
+        return indices
 
     for index, event in enumerate(events):
         if not isinstance(event, dict):
@@ -378,25 +382,9 @@ def _used_events(
         if event.get("stage") != _STAGE_USED:
             continue
 
-        memory_id = event.get("memory_id")
+        indices.append(index)
 
-        if (
-            not isinstance(memory_id, str)
-            or not memory_id
-            or memory_id != memory_id.strip()
-        ):
-            invalid += 1
-            continue
-
-        at = event.get("at")
-
-        if parse_iso_utc(at) is None:
-            invalid += 1
-            continue
-
-        used.append((index, memory_id, at))
-
-    return used, invalid
+    return indices
 
 
 async def observe_memory_usage_lifecycle(
@@ -411,10 +399,11 @@ async def observe_memory_usage_lifecycle(
 
     The usage artifact is read from disk and re-validated here -- the
     caller can never pass raw usage data. For each explicit ``used``
-    event a deterministic, immutable lifecycle event is written (once,
-    ever); then each affected memory's state is recomputed from ALL of
-    its events and cached. A memory that was loaded but never used
-    gets no reinforcement at all.
+    event slot, ``record_lifecycle_event_from_usage`` re-reads the
+    persisted artifact and writes a deterministic, immutable receipt
+    (once, ever); then each affected memory's state is recomputed from
+    ALL of its events and cached. A memory that was loaded but never
+    used gets no reinforcement at all.
     """
 
     if not memory_lifecycle_shadow_enabled():
@@ -458,11 +447,11 @@ async def observe_memory_usage_lifecycle(
             _REASON_USAGE_INVALID
         )
 
-    used, invalid = _used_events(usage)
+    used_indices = _used_event_indices(usage)
 
     report = _empty_report(_REASON_NO_USED)
 
-    report["used_event_count"] = len(used)
+    report["used_event_count"] = len(used_indices)
 
     resolved_bucket = _resolve_bucket_manager(
         bucket_manager
@@ -470,24 +459,27 @@ async def observe_memory_usage_lifecycle(
 
     affected: list[str] = []
 
-    for index, memory_id, at in used:
-        result = persist_lifecycle_event(
-            build_lifecycle_event(
-                conversation_id=(
-                    conversation_id
-                ),
-                cognitive_request_id=(
-                    cognitive_request_id
-                ),
-                recall_id=recall_id,
-                memory_id=memory_id,
-                source_usage_event_at=at,
-                source_usage_event_index=index,
-            )
+    # Every write goes through the provenance gate: it re-reads this
+    # same Usage artifact and derives memory id / stage / timestamp
+    # from the persisted event slot.
+    bad_time = 0
+    conflict = 0
+
+    for index in used_indices:
+        result = record_lifecycle_event_from_usage(
+            conversation_id,
+            cognitive_request_id,
+            recall_id,
+            index,
         )
 
         if not result.get("stored"):
-            invalid += 1
+            if result.get("reason") == (
+                REASON_INVALID_USAGE_EVENT_TIME
+            ):
+                bad_time += 1
+            else:
+                conflict += 1
             continue
 
         if result.get("duplicate"):
@@ -499,15 +491,23 @@ async def observe_memory_usage_lifecycle(
                 "new_event_count"
             ] += 1
 
-        if memory_id not in affected:
+        memory_id = result.get("memory_id")
+
+        if (
+            isinstance(memory_id, str)
+            and memory_id
+            and memory_id not in affected
+        ):
             affected.append(memory_id)
 
-    report["invalid_event_count"] = invalid
+    report["invalid_event_count"] = (
+        bad_time + conflict
+    )
 
     _update_decision(
         report,
-        used_count=len(used),
-        invalid=invalid,
+        bad_time=bad_time,
+        conflict=conflict,
     )
 
     if not affected:
@@ -541,8 +541,8 @@ async def observe_memory_usage_lifecycle(
 def _update_decision(
     report: dict[str, Any],
     *,
-    used_count: int,
-    invalid: int,
+    bad_time: int,
+    conflict: int,
 ) -> None:
     recorded = (
         report["new_event_count"]
@@ -555,12 +555,12 @@ def _update_decision(
         report["reason"] = _REASON_OBSERVED
         return
 
-    if invalid > 0:
-        report["reason"] = (
-            _REASON_INVALID_EVENT_TIME
-            if used_count == 0
-            else _REASON_EVENT_CONFLICT
-        )
+    if bad_time > 0 and conflict == 0:
+        report["reason"] = _REASON_INVALID_EVENT_TIME
+        return
+
+    if conflict > 0:
+        report["reason"] = _REASON_EVENT_CONFLICT
 
 
 async def process_completed_usage_for_lifecycle(

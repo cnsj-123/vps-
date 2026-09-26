@@ -7,6 +7,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from ombrebrain.context.memory_usage_signal import (
+    read_memory_usage,
+)
 from ombrebrain.context.recall_types import (
     LOCK,
     atomic_write,
@@ -16,6 +19,8 @@ from ombrebrain.context.recall_types import (
     now_iso,
     read_json,
     state_root,
+    validate_cognitive_request_id,
+    validate_conversation_id,
 )
 
 
@@ -39,6 +44,25 @@ from ombrebrain.context.recall_types import (
 # reinforcement evidence, and none of those three stages is
 # reinforcement.
 #
+# There is exactly ONE authorized write path:
+#
+#     record_lifecycle_event_from_usage(
+#         conversation_id, cognitive_request_id, recall_id, index
+#     )
+#
+# It re-reads the real, persisted ``memory-usage-signal.v1`` artifact
+# itself and derives EVERY provenance field -- memory id, timestamp,
+# stage, request binding -- from ``usage["events"][index]``. A caller
+# can never name a memory, a time or a stage, so a "phantom"
+# reinforcement receipt is not representable:
+#
+#     artifact structurally valid  !=  authorized to persist
+#
+# ``build_lifecycle_event`` stays available as a pure builder for unit
+# tests, and ``_persist_verified_lifecycle_event`` stays available as
+# the low-level, content-addressed storage primitive, but neither is
+# an authorization boundary.
+#
 # Events are append-only and content-addressed:
 #
 #   - ``event_id`` is a deterministic digest of the usage provenance,
@@ -48,6 +72,11 @@ from ombrebrain.context.recall_types import (
 #     deleted, so the history stays recomputable forever;
 #   - a reader re-derives the identity from the artifact itself, so a
 #     correct path never implies a correct content.
+#
+# Authorization happens at the moment a receipt is written; once
+# written, the event store is the history's own source of truth, so a
+# later cleanup of an old Usage artifact never erases reinforcement
+# provenance.
 
 LIFECYCLE_EVENT_VERSION = (
     "memory-lifecycle-event.v1"
@@ -70,14 +99,19 @@ _REASON_CONFLICT = (
     "existing_lifecycle_event_invalid"
 )
 
+# Provenance-gate reasons. Each one is a distinct, structural fact.
+_REASON_INVALID_BINDING = "invalid_request_binding"
+_REASON_INVALID_INDEX = "invalid_usage_event_index"
+_REASON_USAGE_INVALID = (
+    "usage_not_found_or_invalid"
+)
+_REASON_NOT_USED = "source_event_not_used"
 
-def _truthy(value: Any) -> bool:
-    return str(value or "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
+# Public: the observer classifies this reason separately so a bad
+# timestamp is never reported as a storage conflict.
+REASON_INVALID_USAGE_EVENT_TIME = (
+    "invalid_usage_event_time"
+)
 
 
 def parse_iso_utc(
@@ -403,16 +437,22 @@ def is_valid_lifecycle_event(
     return True
 
 
-def persist_lifecycle_event(
+def _persist_verified_lifecycle_event(
     artifact: Any,
 ) -> dict[str, Any]:
-    """Persist one lifecycle event. Immutable and idempotent.
+    """Low-level, content-addressed storage primitive.
 
-    A valid event already on disk is never overwritten and never
-    re-counted -- the same usage event can only ever produce one
-    reinforcement receipt. An invalid file that already occupies the
-    deterministic path is never deleted and never overwritten: the
-    observation fails closed instead.
+    This is NOT an authorization boundary: it only checks that the
+    artifact is internally valid and then writes it once. Only
+    ``record_lifecycle_event_from_usage`` -- which derives every
+    provenance field from a real, persisted Usage artifact -- may
+    treat its output as authorized reinforcement.
+
+    Immutable and idempotent: a valid event already on disk is never
+    overwritten and never re-counted, so the same usage event can only
+    ever produce one reinforcement receipt. An invalid file that
+    already occupies the deterministic path is never deleted and never
+    overwritten; the observation fails closed instead.
     """
 
     if not is_valid_lifecycle_event(artifact):
@@ -463,6 +503,187 @@ def persist_lifecycle_event(
         "stored": True,
         "duplicate": False,
         "reason": "lifecycle_event_recorded",
+    }
+
+
+def _no_record(
+    reason: str,
+    *,
+    index: Any = None,
+) -> dict[str, Any]:
+    return {
+        "version": LIFECYCLE_EVENT_VERSION,
+        "mode": MODE,
+        "stored": False,
+        "duplicate": False,
+        "decision": "no_record",
+        "reason": reason,
+        "event_id": None,
+        "memory_id": None,
+        "memory_key": None,
+        "source_usage_event_index": index,
+    }
+
+
+def _valid_event_binding(
+    conversation_id: Any,
+    cognitive_request_id: Any,
+    recall_id: Any,
+) -> bool:
+    try:
+        validate_conversation_id(conversation_id)
+
+        validate_cognitive_request_id(
+            cognitive_request_id
+        )
+    except ValueError:
+        return False
+
+    return is_valid_recall_id(recall_id)
+
+
+def record_lifecycle_event_from_usage(
+    conversation_id: Any,
+    cognitive_request_id: Any,
+    recall_id: Any,
+    source_usage_event_index: Any,
+) -> dict[str, Any]:
+    """The ONLY authorized way to create a reinforcement receipt.
+
+    It reads the real, persisted ``memory-usage-signal.v1`` artifact
+    through ``read_memory_usage`` and locates the exact event slot
+    ``usage["events"][source_usage_event_index]``. Every provenance
+    field -- conversation, request, recall, memory id, stage and
+    timestamp -- is taken from THAT persisted event, so the caller can
+    name nothing but the slot:
+
+      - no Usage artifact           -> ``usage_not_found_or_invalid``
+      - invalid / corrupt Usage     -> ``usage_not_found_or_invalid``
+      - bad slot                    -> ``invalid_usage_event_index``
+      - slot is not ``used``        -> ``source_event_not_used``
+      - illegal event timestamp     -> ``invalid_usage_event_time``
+      - structurally valid artifact -> the ONLY write path
+
+    Reinforcing a memory that was never explicitly used, at a time the
+    Usage artifact never recorded, is therefore not representable.
+    """
+
+    if not _valid_event_binding(
+        conversation_id,
+        cognitive_request_id,
+        recall_id,
+    ):
+        return _no_record(_REASON_INVALID_BINDING)
+
+    index = source_usage_event_index
+
+    if (
+        not isinstance(index, int)
+        or isinstance(index, bool)
+        or index < 0
+    ):
+        return _no_record(
+            _REASON_INVALID_INDEX
+        )
+
+    usage = read_memory_usage(
+        conversation_id=conversation_id,
+        cognitive_request_id=(
+            cognitive_request_id
+        ),
+        recall_id=recall_id,
+    )
+
+    if (
+        not isinstance(usage, dict)
+        or usage.get("version")
+        != SOURCE_USAGE_VERSION
+    ):
+        return _no_record(
+            _REASON_USAGE_INVALID, index=index
+        )
+
+    events = usage.get("events")
+
+    if (
+        not isinstance(events, list)
+        or index >= len(events)
+    ):
+        return _no_record(
+            _REASON_INVALID_INDEX, index=index
+        )
+
+    source = events[index]
+
+    if not isinstance(source, dict):
+        return _no_record(
+            _REASON_INVALID_INDEX, index=index
+        )
+
+    # Only an explicit ``used`` stage is reinforcement. A
+    # ``recall_requested`` / ``memory_loaded`` slot is refused.
+    if source.get("stage") != STAGE_USED:
+        return _no_record(
+            _REASON_NOT_USED, index=index
+        )
+
+    memory_id = source.get("memory_id")
+
+    if (
+        not isinstance(memory_id, str)
+        or not memory_id
+        or memory_id != memory_id.strip()
+    ):
+        # Unreachable for a validated Usage artifact; fail closed.
+        return _no_record(
+            _REASON_INVALID_INDEX, index=index
+        )
+
+    at = source.get("at")
+
+    if parse_iso_utc(at) is None:
+        return _no_record(
+            REASON_INVALID_USAGE_EVENT_TIME,
+            index=index,
+        )
+
+    # Fully derived from the persisted artifact, never from the caller.
+    artifact = build_lifecycle_event(
+        conversation_id=usage.get(
+            "conversation_id"
+        ),
+        cognitive_request_id=usage.get(
+            "cognitive_request_id"
+        ),
+        recall_id=usage.get("recall_id"),
+        memory_id=memory_id,
+        source_usage_event_at=at,
+        source_usage_event_index=index,
+    )
+
+    outcome = _persist_verified_lifecycle_event(
+        artifact
+    )
+
+    return {
+        "version": LIFECYCLE_EVENT_VERSION,
+        "mode": MODE,
+        "stored": bool(outcome.get("stored")),
+        "duplicate": bool(
+            outcome.get("duplicate")
+        ),
+        "decision": (
+            "recorded"
+            if outcome.get("stored")
+            else "no_record"
+        ),
+        "reason": outcome.get("reason"),
+        "event_id": artifact.get("event_id"),
+        "memory_id": memory_id,
+        "memory_key": artifact.get(
+            "memory_key"
+        ),
+        "source_usage_event_index": index,
     }
 
 
