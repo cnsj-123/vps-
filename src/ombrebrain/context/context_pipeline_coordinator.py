@@ -17,6 +17,9 @@ from ombrebrain.context.exposure_ledger import (
 from ombrebrain.context.memory_flash import (
     update_memory_flash,
 )
+from ombrebrain.context.memory_recall_surface import (
+    update_recall_surface,
+)
 from ombrebrain.context.memory_surfacing_policy import (
     evaluate_surfacing_policy,
 )
@@ -319,7 +322,21 @@ def observe_memory_exposure_shadow(
         )
     )
 
-    if not (flash_enabled or ledger_enabled):
+    # Shadow-only Recall Surface. It is a model-facing safety boundary
+    # built strictly from THIS request's real Flash: it never changes
+    # the live body and never triggers a Recall. It needs the Flash,
+    # so it only runs when the Flash stage ran.
+    surface_enabled = _truthy(
+        os.environ.get(
+            "OMBRE_GATEWAY_CONTEXT_MEMORY_RECALL_SURFACE_SHADOW"
+        )
+    )
+
+    if not (
+        flash_enabled
+        or ledger_enabled
+        or surface_enabled
+    ):
         return
 
     if (
@@ -505,6 +522,63 @@ def observe_memory_exposure_shadow(
             )
 
     # --------------------------------------------------
+    # 1b. Recall Surface (shadow only, derived from the Flash)
+    #
+    # It turns the real Flash cues into opaque, request-scoped
+    # memrefs. It is a model-facing safety boundary for a FUTURE live
+    # exposure -- it does NOT put anything into the live body, does
+    # not expose a raw memory id and does not trigger any recall.
+    # --------------------------------------------------
+
+    if (
+        surface_enabled
+        and isinstance(flash_output, dict)
+    ):
+        try:
+            surface = update_recall_surface(
+                conversation_id=conversation_id,
+                cognitive_request_id=(
+                    cognitive_request_id
+                ),
+                flash_report=flash_output,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[gateway.context_recall_surface] "
+                "store_failed=%s fail_open=true",
+                type(exc).__name__,
+            )
+            surface = None
+
+        if isinstance(surface, dict):
+            logger.info(
+                "[gateway.context_recall_surface] %s",
+                json.dumps(
+                    {
+                        "mode": surface.get("mode"),
+                        "stored": surface.get(
+                            "stored"
+                        ),
+                        "decision": surface.get(
+                            "decision"
+                        ),
+                        "reason": surface.get(
+                            "reason"
+                        ),
+                        "memory_count": surface.get(
+                            "memory_count"
+                        ),
+                        "source_flash_unified_revision":
+                            surface.get(
+                                "source_flash_unified_revision"
+                            ),
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            )
+
+    # --------------------------------------------------
     # 2. Exposure Ledger (independent of Surfacing / Flash)
     #
     # retrieved != surfaced: this stage records that retrieval
@@ -660,9 +734,16 @@ async def observe_unified_preview_gate(
         )
     )
 
+    recall_surface_enabled = _truthy(
+        os.environ.get(
+            "OMBRE_GATEWAY_CONTEXT_MEMORY_RECALL_SURFACE_SHADOW"
+        )
+    )
+
     memory_observer_enabled = (
         memory_flash_enabled
         or exposure_ledger_enabled
+        or recall_surface_enabled
     )
 
     if not (

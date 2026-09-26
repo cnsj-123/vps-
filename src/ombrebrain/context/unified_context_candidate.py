@@ -54,6 +54,16 @@ def bind_context_service(
     _CONTEXT_SERVICE = service
 
 
+def bound_context_service() -> Any:
+    """Read-only accessor for the bound ContextService (or None).
+
+    The Recall control plane uses it only to reach the canonical
+    retrieval adapter and the canonical bucket repository. It never
+    creates, replaces or mutates a memory/state engine.
+    """
+    return _CONTEXT_SERVICE
+
+
 def _current_user_query(
     conversation_id: str,
     conversation_candidate: dict[str, Any],
