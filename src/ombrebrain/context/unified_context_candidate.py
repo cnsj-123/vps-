@@ -9,12 +9,22 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from ombrebrain.context.retrieval_decision_shadow import (
+    build_candidate_evidence,
+)
 from ombrebrain.context.retrieval_shadow_metrics import (
     record_retrieval_shadow_metrics,
+)
+from ombrebrain.context.validators.freshness import (
+    is_valid_revision,
 )
 
 
 _VERSION = "unified-context-candidate.v1"
+
+_CANDIDATE_VERSION = (
+    "conversation-context-candidate.v1"
+)
 
 _DEFAULT_ROOT = "/app/buckets/.context"
 _DEFAULT_TOKEN_BUDGET = 1200
@@ -180,6 +190,8 @@ async def update_unified_context_candidate_from_runtime(
         query=query
     )
 
+    shadow_observation: dict[str, Any] = {}
+
     result = update_unified_context_candidate(
         conversation_id=
             conversation_id,
@@ -190,11 +202,53 @@ async def update_unified_context_candidate_from_runtime(
             if query
             else ()
         ),
+        shadow_observation=
+            shadow_observation,
+        # The candidate captured BEFORE the retrieval await above is
+        # THE candidate for this request.
+        conversation_candidate_snapshot=(
+            conversation_candidate
+        ),
     )
 
     result["retrieval_query_used"] = bool(
         query
     )
+
+    # Request-local, shadow-only Memory observation snapshot.
+    #
+    # It is returned only to the in-process shadow Memory observers so
+    # they consume THIS request's own Unified artifact and retrieval
+    # evidence instead of re-reading the shared conversation-level
+    # file (which a concurrent request may already have overwritten).
+    # It is never persisted, never logged and never part of Unified
+    # sections, Preview, Real Injection or a cache key.
+    try:
+        result["memory_shadow_snapshot"] = (
+            build_memory_shadow_snapshot(
+                conversation_id=
+                    conversation_id,
+                unified=(
+                    shadow_observation.get(
+                        "unified_artifact"
+                    )
+                ),
+                retrieval_memories=(
+                    context_candidates.get(
+                        "memories"
+                    )
+                    if isinstance(
+                        context_candidates,
+                        dict,
+                    )
+                    else []
+                ),
+            )
+        )
+
+    except Exception:
+        # Observation must remain fail-open.
+        result["memory_shadow_snapshot"] = None
 
     # Privacy-safe rolling metrics only.
     # This is observation-only and must never affect retrieval,
@@ -1219,12 +1273,77 @@ def build_unified_context_candidate(
     }
 
 
+def _validated_candidate_snapshot(
+    snapshot: Any,
+    conversation_id: str,
+) -> dict[str, Any] | None:
+    """Validate a request-captured Conversation Candidate snapshot.
+
+    Returns the snapshot when it is a well-formed
+    ``conversation-context-candidate.v1`` for this conversation with a
+    valid ``revision`` and ``source_revision``; None otherwise. Pure
+    and read-only: it reads no file.
+    """
+
+    if not isinstance(
+        snapshot,
+        dict,
+    ):
+        return None
+
+    if (
+        snapshot.get("version")
+        != _CANDIDATE_VERSION
+    ):
+        return None
+
+    if (
+        snapshot.get("conversation_id")
+        != conversation_id
+    ):
+        return None
+
+    if not is_valid_revision(
+        snapshot.get("revision")
+    ):
+        return None
+
+    if not is_valid_revision(
+        snapshot.get("source_revision")
+    ):
+        return None
+
+    return snapshot
+
+
 def update_unified_context_candidate(
     *,
     conversation_id: str,
     context_candidates: dict[str, Any],
     excluded_texts: tuple[str, ...] | list[str] = (),
+    shadow_observation: dict[str, Any] | None = None,
+    conversation_candidate_snapshot: (
+        dict[str, Any] | None
+    ) = None,
 ) -> dict[str, Any]:
+    """Persist the Unified candidate and return its privacy-safe summary.
+
+    ``conversation_candidate_snapshot`` is the Conversation Candidate
+    captured BEFORE this request awaited retrieval. When it is given
+    it is validated and used as THE request's candidate, so a
+    concurrent request that rewrote the conversation-level candidate
+    file during the retrieval await can never mix its context into
+    this request's Unified. When it is omitted the candidate is read
+    from disk, exactly as before.
+
+    ``shadow_observation`` is an optional out-parameter for the
+    in-process shadow Memory observers: when a dict is passed, the
+    full artifact built for THIS request is stored under
+    ``"unified_artifact"`` so no observer ever has to re-read the
+    shared conversation-level file. It is never persisted, never
+    logged and never part of the live rendered Context. The default
+    (None) keeps every existing caller byte-for-byte unchanged.
+    """
 
     candidate_path = _path(
         "context_candidate",
@@ -1237,20 +1356,40 @@ def update_unified_context_candidate(
     )
 
     with _LOCK:
-        conversation_candidate = (
-            _read_json(
-                candidate_path
-            )
-        )
-
-        if conversation_candidate is None:
-            return {
-                "stored": False,
-                "reason":
-                    "conversation_candidate_not_found",
-                "conversation_id":
+        if conversation_candidate_snapshot is not None:
+            # THIS request already captured its candidate before it
+            # awaited retrieval: never re-read the shared file here.
+            conversation_candidate = (
+                _validated_candidate_snapshot(
+                    conversation_candidate_snapshot,
                     conversation_id,
-            }
+                )
+            )
+
+            if conversation_candidate is None:
+                return {
+                    "stored": False,
+                    "reason":
+                        "invalid_conversation_candidate_snapshot",
+                    "conversation_id":
+                        conversation_id,
+                }
+
+        else:
+            conversation_candidate = (
+                _read_json(
+                    candidate_path
+                )
+            )
+
+            if conversation_candidate is None:
+                return {
+                    "stored": False,
+                    "reason":
+                        "conversation_candidate_not_found",
+                    "conversation_id":
+                        conversation_id,
+                }
 
         result = (
             build_unified_context_candidate(
@@ -1300,6 +1439,14 @@ def update_unified_context_candidate(
                 )
                 or {}
             )
+
+            if isinstance(
+                shadow_observation,
+                dict,
+            ):
+                shadow_observation[
+                    "unified_artifact"
+                ] = previous
 
             return {
                 "stored": True,
@@ -1440,6 +1587,14 @@ def update_unified_context_candidate(
             result,
         )
 
+        if isinstance(
+            shadow_observation,
+            dict,
+        ):
+            shadow_observation[
+                "unified_artifact"
+            ] = result
+
     telemetry = (
         result.get(
             "telemetry"
@@ -1548,6 +1703,63 @@ def update_unified_context_candidate(
                     "retrieval_dedup"
                 )
                 or {}
+            ),
+    }
+
+
+def build_memory_shadow_snapshot(
+    *,
+    conversation_id: str,
+    unified: Any,
+    retrieval_memories: Any,
+) -> dict[str, Any] | None:
+    """Request-local, shadow-only Memory observation snapshot.
+
+    It carries the Unified artifact THIS request just built plus the
+    per-candidate conservative.v1 evidence derived from the same
+    request's retrieval candidate set. It exists only so the shadow
+    Memory Surfacing / Flash / Exposure Ledger observers can consume
+    this request's own evidence instead of re-reading the shared,
+    conversation-level Unified file (which a concurrent request may
+    already have overwritten).
+
+    It is never persisted, never logged, never added to Unified
+    sections, Preview, Real Injection, a header or a cache key, and
+    it never changes retrieval candidate selection. Returns None when
+    no valid Unified artifact was produced for this request.
+    """
+
+    if (
+        not isinstance(unified, dict)
+        or unified.get("version") != _VERSION
+        or unified.get("conversation_id")
+        != conversation_id
+    ):
+        return None
+
+    memories = (
+        retrieval_memories
+        if isinstance(
+            retrieval_memories,
+            list,
+        )
+        else []
+    )
+
+    return {
+        "version":
+            "memory-shadow-snapshot.v1",
+        "mode":
+            "shadow_only",
+        "conversation_id":
+            conversation_id,
+        "revision":
+            unified.get("revision"),
+        "unified":
+            unified,
+        "evidence":
+            build_candidate_evidence(
+                memories
             ),
     }
 
