@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -18,16 +19,25 @@ from typing import Any, Awaitable, Callable, Mapping
 import httpx
 from starlette.middleware.cors import CORSMiddleware
 
+from ombrebrain.context.live_recall_transport_capability import (
+    is_live_recall_transport_capability_token,
+)
 from ombrebrain.security.public_origin import (
     configured_public_origin,
     normalize_public_origin,
 )
 from utils import parse_bool
+from web.live_recall_mcp_view import (
+    LiveRecallMCPView,
+)
 from web.request_limits import (
     MCPRequestBodyLimitMiddleware,
     ManagementRequestBodyLimitMiddleware,
     is_mcp_endpoint_path,
 )
+
+
+logger = logging.getLogger("ombre_brain.mcp_auth")
 
 
 DEFAULT_MAX_MCP_REQUEST_BYTES = 4 * 1024 * 1024
@@ -184,6 +194,12 @@ class MCPAuthMiddleware:
         path_matcher: Callable[[object], bool] = is_mcp_endpoint_path,
         resource_path: str = "/mcp",
         public_origin: str = "",
+        live_recall_capability_resolver: (
+            Callable[[str], dict | None] | None
+        ) = None,
+        live_recall_capability_expiry_probe: (
+            Callable[[str], bool] | None
+        ) = None,
     ) -> None:
         self.app = app
         self.auth_required = bool(auth_required)
@@ -195,86 +211,190 @@ class MCPAuthMiddleware:
         self.path_matcher = path_matcher
         self.resource_path = "/" + str(resource_path or "mcp").strip("/")
         self.public_origin = normalize_public_origin(public_origin)
+        # Optional, additive: a short-lived live recall transport
+        # capability is resolved ONLY from ``Authorization: Bearer``.
+        # The existing OAuth / static token semantics are untouched.
+        self.live_recall_capability_resolver = (
+            live_recall_capability_resolver
+        )
+        self.live_recall_capability_expiry_probe = (
+            live_recall_capability_expiry_probe
+        )
+
+    def _resolve_live_recall_capability(
+        self,
+        token: str,
+    ) -> dict | None:
+        """Resolve a capability, logging only privacy-safe enums.
+
+        The raw token, its prefix content, the CID, the RID and any
+        memref are never logged.
+        """
+
+        if not is_live_recall_transport_capability_token(token):
+            return None
+
+        binding = None
+
+        if self.live_recall_capability_resolver is not None:
+            try:
+                binding = self.live_recall_capability_resolver(token)
+            except Exception:
+                binding = None
+
+        if isinstance(binding, dict) and binding:
+            logger.info(
+                "[mcp.auth] %s",
+                json.dumps(
+                    {
+                        "auth_kind":
+                            "live_recall_capability",
+                        "resolved": True,
+                        "expired": False,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            )
+
+            return binding
+
+        expired = False
+
+        if (
+            self.live_recall_capability_expiry_probe
+            is not None
+        ):
+            try:
+                expired = bool(
+                    self.live_recall_capability_expiry_probe(
+                        token
+                    )
+                )
+            except Exception:
+                expired = False
+
+        logger.info(
+            "[mcp.auth] %s",
+            json.dumps(
+                {
+                    "auth_kind": "live_recall_capability",
+                    "resolved": False,
+                    "expired": bool(expired),
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        )
+
+        return None
 
     async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
         path = str(scope.get("path", ""))
         if (
             scope.get("type") == "http"
             and str(scope.get("method", "")).upper() != "OPTIONS"
-            and self.auth_required
             and self.path_matcher(path)
         ):
             headers = {key.lower(): value for key, value in scope.get("headers", [])}
             auth = headers.get(b"authorization", b"").decode("latin-1")
-            base = _canonical_mcp_base(scope, headers, self.public_origin)
-            # OAuth discovery currently exposes one canonical MCP resource.
-            resource = f"{base}{self.resource_path}"
             bearer_token = _extract_bearer_token(auth)
-            valid = False
-            if bearer_token:
-                primary_valid = bool(
-                    self.token_validator(bearer_token, resource=resource)
+            # Capability resolution is independent of
+            # ``mcp_require_auth``: even with auth disabled, Recall
+            # still requires a valid capability. A normal token (or an
+            # anonymous request) simply resolves to no binding.
+            capability_binding = (
+                self._resolve_live_recall_capability(
+                    bearer_token
                 )
-                static_valid = False
-                if self.auth_mode == "hybrid" and self.static_token_validator:
-                    # 两个校验器都执行后再合并结果，避免凭响应时延泄露 Token 类型。
-                    static_valid = bool(
-                        self.static_token_validator(bearer_token, resource=resource)
+                if bearer_token
+                else None
+            )
+            if self.auth_required:
+                base = _canonical_mcp_base(scope, headers, self.public_origin)
+                # OAuth discovery currently exposes one canonical MCP resource.
+                resource = f"{base}{self.resource_path}"
+                valid = capability_binding is not None
+                if bearer_token and capability_binding is None:
+                    primary_valid = bool(
+                        self.token_validator(bearer_token, resource=resource)
                     )
-                valid = primary_valid | static_valid
-            if not valid and self.auth_mode in ("token", "hybrid"):
-                # Fallback header for MCP clients that can't customize Authorization.
-                alt_token = headers.get(b"ombre-mcp-token", b"").decode(
-                    "latin-1"
-                ).strip()
-                if alt_token:
-                    static_validator = self.static_token_validator
-                    if static_validator is None and self.auth_mode == "token":
-                        # 保留旧调用方只注入一个 validator 的兼容行为。
-                        static_validator = self.token_validator
-                    valid = bool(static_validator) and static_validator(
-                        alt_token, resource=resource
-                    )
-            if not valid:
-                endpoint = self.resource_path.strip("/")
-                if self.auth_mode == "token":
-                    # No OAuth server exists in token mode — a resource_metadata
-                    # challenge pointing at a 404'd discovery endpoint would mislead.
-                    challenge = 'Bearer realm="Ombre Brain"'
-                    body = json.dumps({"error": "Unauthorized"}).encode()
-                else:
-                    metadata_url = (
-                        f"{base}/.well-known/oauth-protected-resource/{endpoint}"
-                    )
-                    challenge = (
-                        'Bearer realm="Ombre Brain",'
-                        f' resource_metadata="{metadata_url}", scope="mcp"'
-                    )
-                    body = json.dumps(
+                    static_valid = False
+                    if self.auth_mode == "hybrid" and self.static_token_validator:
+                        # 两个校验器都执行后再合并结果，避免凭响应时延泄露 Token 类型。
+                        static_valid = bool(
+                            self.static_token_validator(bearer_token, resource=resource)
+                        )
+                    valid = primary_valid | static_valid
+                if (
+                    not valid
+                    and capability_binding is None
+                    and self.auth_mode in ("token", "hybrid")
+                ):
+                    # Fallback header for MCP clients that can't customize
+                    # Authorization. A live recall capability is NEVER
+                    # accepted from here.
+                    alt_token = headers.get(b"ombre-mcp-token", b"").decode(
+                        "latin-1"
+                    ).strip()
+                    if alt_token:
+                        static_validator = self.static_token_validator
+                        if static_validator is None and self.auth_mode == "token":
+                            # 保留旧调用方只注入一个 validator 的兼容行为。
+                            static_validator = self.token_validator
+                        valid = bool(static_validator) and static_validator(
+                            alt_token, resource=resource
+                        )
+                if not valid:
+                    endpoint = self.resource_path.strip("/")
+                    if self.auth_mode == "token":
+                        # No OAuth server exists in token mode — a resource_metadata
+                        # challenge pointing at a 404'd discovery endpoint would mislead.
+                        challenge = 'Bearer realm="Ombre Brain"'
+                        body = json.dumps({"error": "Unauthorized"}).encode()
+                    else:
+                        metadata_url = (
+                            f"{base}/.well-known/oauth-protected-resource/{endpoint}"
+                        )
+                        challenge = (
+                            'Bearer realm="Ombre Brain",'
+                            f' resource_metadata="{metadata_url}", scope="mcp"'
+                        )
+                        body = json.dumps(
+                            {
+                                "error": "Unauthorized",
+                                "resource_metadata": metadata_url,
+                            }
+                        ).encode()
+                    await send(
                         {
-                            "error": "Unauthorized",
-                            "resource_metadata": metadata_url,
+                            "type": "http.response.start",
+                            "status": 401,
+                            "headers": [
+                                [b"content-type", b"application/json"],
+                                [b"www-authenticate", challenge.encode()],
+                                [b"content-length", str(len(body)).encode()],
+                            ],
                         }
-                    ).encode()
-                await send(
-                    {
-                        "type": "http.response.start",
-                        "status": 401,
-                        "headers": [
-                            [b"content-type", b"application/json"],
-                            [b"www-authenticate", challenge.encode()],
-                            [b"content-length", str(len(body)).encode()],
-                        ],
-                    }
+                    )
+                    await send(
+                        {
+                            "type": "http.response.body",
+                            "body": body,
+                            "more_body": False,
+                        }
+                    )
+                    return
+            if capability_binding is not None:
+                # Downstream middleware (the MCP view) reads these scope
+                # keys. The token itself is deliberately never stored.
+                scope = dict(scope)
+                scope["ombre_mcp_auth_kind"] = (
+                    "live_recall_capability"
                 )
-                await send(
-                    {
-                        "type": "http.response.body",
-                        "body": body,
-                        "more_body": False,
-                    }
+                scope["ombre_live_recall_binding"] = (
+                    capability_binding
                 )
-                return
         await self.app(scope, receive, send)
 
 
@@ -690,6 +810,12 @@ def build_http_app(
     token_validator: TokenValidator,
     lifecycle: RuntimeLifecycle,
     static_token_validator: TokenValidator | None = None,
+    live_recall_capability_resolver: (
+        Callable[[str], dict | None] | None
+    ) = None,
+    live_recall_capability_expiry_probe: (
+        Callable[[str], bool] | None
+    ) = None,
 ) -> Any:
     """Build the HTTP (streamable-http) ASGI app with one consistent middleware stack."""
 
@@ -707,6 +833,16 @@ def build_http_app(
         OriginCSRFGuardMiddleware,
         mcp_path_matcher=mcp_path_matcher,
         public_origin=settings.public_origin,
+    )
+    # Live Recall MCP view: it must execute AFTER MCPAuthMiddleware (so a
+    # capability binding is on the scope) and AFTER
+    # MCPRequestBodyLimitMiddleware (so the MCP body limit is enforced
+    # before any JSON-RPC parsing). Because Starlette wraps middleware in
+    # reverse registration order, it is registered here -- innermost of
+    # the MCP middlewares.
+    app.add_middleware(
+        LiveRecallMCPView,
+        path_matcher=mcp_path_matcher,
     )
     app.add_middleware(
         MCPRequestBodyLimitMiddleware,
@@ -732,6 +868,12 @@ def build_http_app(
         path_matcher=mcp_path_matcher,
         resource_path="/mcp",
         public_origin=settings.public_origin,
+        live_recall_capability_resolver=(
+            live_recall_capability_resolver
+        ),
+        live_recall_capability_expiry_probe=(
+            live_recall_capability_expiry_probe
+        ),
     )
     # Starlette wraps middleware in reverse registration order.  CORS must be
     # outside MCP auth so browser preflights never receive a bare 401 and auth

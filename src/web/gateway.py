@@ -27,6 +27,11 @@ from ombrebrain.gateway.response_usage import ResponseUsageObserver
 # an individual Context stage itself.
 from ombrebrain.context.context_pipeline_coordinator import (
     run_context_pipeline,
+    run_context_pipeline_with_binding,
+)
+from ombrebrain.context.provider_live_recall_transport import (
+    live_recall_transport_enabled,
+    prepare_provider_live_recall_transport,
 )
 from ombrebrain.gateway.gateway_runtime import (
     record_cache_usage,
@@ -425,9 +430,82 @@ def register(mcp) -> None:
         # unchanged. The gateway forwards one body in and one body
         # out; it never decides stage ordering, freshness or
         # injection eligibility itself.
-        selected_body = await run_context_pipeline(
-            forward_body
-        )
+        #
+        # Provider-bound Live Recall transport is a thin, default-OFF
+        # post-pipeline step: it runs the SAME single pipeline pass but
+        # keeps the trusted request binding, then lets the transport
+        # attach the Anthropic MCP Connector. It never parses the
+        # upstream response, never buffers the model stream and never
+        # sends a second provider request.
+        if live_recall_transport_enabled():
+            selection = (
+                await run_context_pipeline_with_binding(
+                    forward_body
+                )
+            )
+
+            selected_body = selection.body
+
+            (
+                selected_body,
+                headers,
+                transport_report,
+            ) = prepare_provider_live_recall_transport(
+                selected_body,
+                headers,
+                conversation_id=(
+                    selection.conversation_id
+                ),
+                cognitive_request_id=(
+                    selection.cognitive_request_id
+                ),
+            )
+
+            # Privacy-safe allowlist only: no selected body, no
+            # mcp_servers, no authorization_token and no MCP URL.
+            logger.info(
+                "[gateway.provider_live_recall_transport] %s",
+                json.dumps(
+                    {
+                        "enabled": transport_report.get(
+                            "enabled"
+                        ),
+                        "applied": transport_report.get(
+                            "applied"
+                        ),
+                        "reason": transport_report.get(
+                            "reason"
+                        ),
+                        "provider": transport_report.get(
+                            "provider"
+                        ),
+                        "tools_delta": transport_report.get(
+                            "tools_delta"
+                        ),
+                        "mcp_servers_delta":
+                            transport_report.get(
+                                "mcp_servers_delta"
+                            ),
+                        "beta_added": transport_report.get(
+                            "beta_added"
+                        ),
+                        "capability_ttl":
+                            transport_report.get(
+                                "capability_ttl"
+                            ),
+                        "receipt_valid":
+                            transport_report.get(
+                                "receipt_valid"
+                            ),
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            )
+        else:
+            selected_body = await run_context_pipeline(
+                forward_body
+            )
 
         if _truthy(
             os.environ.get(

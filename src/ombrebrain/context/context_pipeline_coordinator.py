@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import secrets
+from dataclasses import dataclass
 from typing import Any
 
 from ombrebrain.context.context_confidence_gate import (
@@ -1673,6 +1674,22 @@ def select_live_memory_flash_exposure(
         return body
 
 
+@dataclass(frozen=True)
+class ContextPipelineSelection:
+    """The body to forward plus the trusted internal request binding.
+
+    ``conversation_id`` / ``cognitive_request_id`` stay internal to
+    the Context chain. They are handed ONLY to a trusted transport
+    (the Provider-bound Live Recall transport) and are never
+    serialized into the model-facing request, a header, a cache key
+    or a log.
+    """
+
+    body: bytes
+    conversation_id: str | None
+    cognitive_request_id: str | None
+
+
 async def run_context_pipeline(
     forward_body: bytes,
 ) -> bytes:
@@ -1722,8 +1739,45 @@ async def run_context_pipeline(
     There is also a top-level guard: a Context pipeline failure must
     never break live forwarding, so any unexpected error here returns
     ``forward_body`` unchanged and logs only the exception *type*.
+
+    The trusted request binding is intentionally NOT returned here:
+    the frozen default-OFF gateway path only needs bytes. A trusted
+    provider-bound transport calls
+    ``run_context_pipeline_with_binding()`` instead.
     """
 
+    return (
+        await _run_context_pipeline_selection(
+            forward_body
+        )
+    ).body
+
+
+async def run_context_pipeline_with_binding(
+    forward_body: bytes,
+) -> ContextPipelineSelection:
+    """Run the pipeline ONCE and also return the trusted binding.
+
+    Internal entry point for the Provider-bound Live Recall transport.
+    It runs exactly the same single pipeline pass as
+    ``run_context_pipeline()`` -- the observation stages are never
+    re-run -- and additionally reports the trusted
+    ``conversation_id`` / ``cognitive_request_id`` this request was
+    bound to.
+
+    On a top-level pipeline failure both binding fields are None and
+    the body is the exact ``forward_body``, so the transport can never
+    mint a capability for a request the pipeline could not bind.
+    """
+
+    return await _run_context_pipeline_selection(
+        forward_body
+    )
+
+
+async def _run_context_pipeline_selection(
+    forward_body: bytes,
+) -> ContextPipelineSelection:
     try:
         # Internal, per-request identity for the shadow Memory
         # observers and for the request-scoped Recall Surface / Live
@@ -1764,20 +1818,33 @@ async def run_context_pipeline(
         # Strictly post-Real-Injection, fail-open relative to its own
         # input: a Live Exposure failure returns ``selected_body`` and
         # never reverts an already applied Context injection.
-        return select_live_memory_flash_exposure(
+        final_body = select_live_memory_flash_exposure(
             conversation_id,
             cognitive_request_id,
             selected_body,
         )
 
+        return ContextPipelineSelection(
+            body=final_body,
+            conversation_id=conversation_id,
+            cognitive_request_id=(
+                cognitive_request_id
+            ),
+        )
+
     except Exception as exc:
         # Fail-open: never break live forwarding. Only the exception
         # type is logged — never the message, query, memory, prompt
-        # or rendered Context.
+        # or rendered Context. The binding is dropped with the body so
+        # no transport can mint a capability for an unbound request.
         logger.warning(
             "[gateway.context_pipeline] "
             "pipeline_failed=%s fail_open=true",
             type(exc).__name__,
         )
 
-        return forward_body
+        return ContextPipelineSelection(
+            body=forward_body,
+            conversation_id=None,
+            cognitive_request_id=None,
+        )
