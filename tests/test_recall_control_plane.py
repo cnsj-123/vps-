@@ -1538,6 +1538,92 @@ class RecallRequestLifecycleTests(
         )
         self.assertEqual(len(retrieval.calls), 2)
 
+    async def test_empty_recall_is_not_reused(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as root:
+            write_flash(
+                root,
+                flash_artifact([memory("mem-1")]),
+            )
+
+            buckets = FakeBucketManager(
+                {"mem-1": bucket("mem-1")}
+            )
+
+            retrieval = FakeRetrievalAdapter(
+                [memory("mem-2")]
+            )
+
+            with recall_env(root):
+                first = (
+                    await request_related_recall(
+                        conversation_id=CID,
+                        cognitive_request_id=RID,
+                        anchor_memory_id="mem-1",
+                        bucket_manager=buckets,
+                        retrieval_adapter=(
+                            retrieval
+                        ),
+                    )
+                )
+
+                path = (
+                    _recall_dir(root)
+                    / (
+                        first["recall_id"]
+                        + ".json"
+                    )
+                )
+
+                artifact = json.loads(
+                    path.read_text(encoding="utf-8")
+                )
+
+                # A "successful" recall with zero memories is corrupt.
+                artifact["memories"] = []
+                artifact["included_count"] = 0
+
+                path.write_text(
+                    json.dumps(artifact),
+                    encoding="utf-8",
+                )
+
+                second = (
+                    await request_related_recall(
+                        conversation_id=CID,
+                        cognitive_request_id=RID,
+                        anchor_memory_id="mem-1",
+                        bucket_manager=buckets,
+                        retrieval_adapter=(
+                            retrieval
+                        ),
+                    )
+                )
+
+                rebuilt = read_related_recall(
+                    conversation_id=CID,
+                    cognitive_request_id=RID,
+                    recall_id=first["recall_id"],
+                )
+
+        self.assertEqual(
+            second["recall_id"],
+            first["recall_id"],
+        )
+        self.assertTrue(second["stored"])
+
+        # The empty artifact was never reused as the duplicate answer;
+        # the real anchor result was rebuilt.
+        self.assertEqual(
+            [
+                item["memory_id"]
+                for item in rebuilt["memories"]
+            ],
+            ["mem-1", "mem-2"],
+        )
+        self.assertEqual(len(retrieval.calls), 2)
+
     async def test_concurrent_duplicate_counts_one_requested(
         self,
     ):

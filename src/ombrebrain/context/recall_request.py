@@ -556,6 +556,11 @@ def find_recall_request_by_fingerprint(
         ):
             continue
 
+        # The file name must agree with the artifact's own recall id:
+        # a misnamed artifact is ignored, never treated as a duplicate.
+        if path.stem != artifact.get("recall_id"):
+            continue
+
         if (
             artifact.get("request_fingerprint")
             == fingerprint

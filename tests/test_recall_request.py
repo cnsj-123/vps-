@@ -657,6 +657,64 @@ class RecallRequestPersistenceTests(
                 self.assertIsNone(read_back)
                 self.assertIsNone(found)
 
+    def test_misnamed_request_is_not_a_duplicate(
+        self,
+    ):
+        request = recall_request("mem-1")
+
+        internal_id = "recall_" + "b" * 32
+        file_id = "recall_" + "a" * 32
+
+        fingerprint = recall_request_fingerprint(
+            conversation_id=CID,
+            cognitive_request_id=RID,
+            anchor_memory_id="mem-1",
+            requested_scope="related",
+        )
+
+        with tempfile.TemporaryDirectory() as root:
+            with recall_env(root):
+                record_recall_request(
+                    recall_request=request,
+                    recall_id=internal_id,
+                )
+
+            # The artifact's internal recall_id and its file name now
+            # disagree: recall_A.json contains recall_id=recall_B.
+            self._path(root, internal_id).replace(
+                self._path(root, file_id)
+            )
+
+            with recall_env(root):
+                found = (
+                    find_recall_request_by_fingerprint(
+                        conversation_id=CID,
+                        cognitive_request_id=RID,
+                        fingerprint=fingerprint,
+                    )
+                )
+
+                read_by_file_name = (
+                    read_recall_request(
+                        conversation_id=CID,
+                        cognitive_request_id=RID,
+                        recall_id=file_id,
+                    )
+                )
+
+                read_by_internal_id = (
+                    read_recall_request(
+                        conversation_id=CID,
+                        cognitive_request_id=RID,
+                        recall_id=internal_id,
+                    )
+                )
+
+        # A misnamed artifact is never returned as a duplicate.
+        self.assertIsNone(found)
+        self.assertIsNone(read_by_file_name)
+        self.assertIsNone(read_by_internal_id)
+
     def test_stale_fingerprint_after_anchor_tamper(
         self,
     ):

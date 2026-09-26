@@ -730,6 +730,24 @@ class RelatedRecallValidatorTests(
             self._valid(wrong_rank)
         )
 
+    def test_validator_rejects_empty_memories(
+        self,
+    ):
+        artifact = recall_artifact(
+            [], recall_id=RECALL_ID
+        )
+
+        # Every other field is legitimate: only ``memories`` is empty.
+        self.assertEqual(artifact["memories"], [])
+        self.assertEqual(
+            artifact["included_count"], 0
+        )
+        self.assertEqual(
+            artifact["anchor_memory_id"], "mem-1"
+        )
+
+        self.assertFalse(self._valid(artifact))
+
     def test_validator_rejects_duplicate_memories(
         self,
     ):
@@ -818,6 +836,19 @@ class RelatedRecallCorruptionTests(
         self.assertEqual(
             artifact["anchor_memory_id"], "mem-1"
         )
+
+    def test_empty_recall_is_unusable(self):
+        with tempfile.TemporaryDirectory() as root:
+            write_recall(
+                root,
+                recall_artifact(
+                    [], recall_id=RECALL_ID
+                ),
+            )
+
+            artifact = self._read(root)
+
+        self.assertIsNone(artifact)
 
     def test_tampered_anchor_with_stale_fingerprint(
         self,

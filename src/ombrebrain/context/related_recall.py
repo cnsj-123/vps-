@@ -805,6 +805,11 @@ def is_valid_related_recall_artifact(
     if not isinstance(memories, list):
         return False
 
+    # A successful recall always includes at least the anchor memory;
+    # an empty recall is not a recall result.
+    if not memories:
+        return False
+
     if artifact.get("included_count") != len(
         memories
     ):
