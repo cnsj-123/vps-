@@ -8,6 +8,10 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+from ombrebrain.context.recall_request import (
+    recall_request_fingerprint,
+)
+
 
 # Shared, minimal fixtures for the Recall Control Plane tests.
 #
@@ -262,6 +266,13 @@ def recall_artifact(
         else (memory_ids[0] if memory_ids else "mem-1")
     )
 
+    fingerprint = recall_request_fingerprint(
+        conversation_id=conversation_id,
+        cognitive_request_id=cognitive_request_id,
+        anchor_memory_id=anchor,
+        requested_scope="related",
+    )
+
     return {
         "version": "related-memory-recall.v1",
         "mode": "shadow_only",
@@ -275,7 +286,7 @@ def recall_artifact(
         "source_flash_unified_revision":
             revision,
         "requested_scope": "related",
-        "request_fingerprint": "f" * 64,
+        "request_fingerprint": fingerprint,
         "created_at": old_ts(0),
         "retrieved_count": len(memory_ids),
         "included_count": len(memory_ids),

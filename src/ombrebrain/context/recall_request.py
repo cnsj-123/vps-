@@ -13,6 +13,7 @@ from ombrebrain.context.recall_types import (
     atomic_write,
     is_valid_cognitive_request_id,
     is_valid_conversation_id,
+    is_valid_fingerprint,
     is_valid_recall_id,
     now_iso,
     read_json,
@@ -367,9 +368,17 @@ def is_valid_recall_request_artifact(
     """Structural identity of one persisted Recall Request event.
 
     A path being correct never implies its content is correct, so
-    every reader re-validates the contract, the mode, the request
-    identity and the Flash revision binding instead of trusting
-    ``isinstance(dict)`` or the artifact version alone.
+    every reader re-validates:
+
+      - the contract, the mode, the request identity, the anchor, the
+        scope and the Flash revision binding (``_valid_recall_request_core``);
+      - ``source_flash_request_id``, which must bind to this request
+        (the v1 Flash is request scoped);
+      - ``status``, which may only be ``requested`` -- a Recall Request
+        records a request, never a load state;
+      - ``request_fingerprint``, which is RECOMPUTED from the
+        artifact's own identity and compared. The fingerprint an
+        artifact carries about itself is never trusted.
     """
 
     if not _valid_recall_request_core(
@@ -386,9 +395,35 @@ def is_valid_recall_request_artifact(
     ):
         return False
 
-    return bool(
-        artifact.get("request_fingerprint")
+    if (
+        artifact.get("status")
+        != _STATUS_REQUESTED
+    ):
+        return False
+
+    fingerprint = artifact.get(
+        "request_fingerprint"
     )
+
+    if not is_valid_fingerprint(fingerprint):
+        return False
+
+    expected = recall_request_fingerprint(
+        conversation_id=artifact[
+            "conversation_id"
+        ],
+        cognitive_request_id=artifact[
+            "cognitive_request_id"
+        ],
+        anchor_memory_id=artifact[
+            "anchor_memory_id"
+        ],
+        requested_scope=artifact[
+            "requested_scope"
+        ],
+    )
+
+    return fingerprint == expected
 
 
 def _valid_recall_request_core(
@@ -452,6 +487,14 @@ def _valid_recall_request_core(
     if (
         artifact.get("requested_scope")
         != _ALLOWED_SCOPE
+    ):
+        return False
+
+    # The v1 Flash is request scoped, so the Flash a Recall Request was
+    # authorized against must be THIS request's Flash.
+    if (
+        artifact.get("source_flash_request_id")
+        != artifact_request
     ):
         return False
 

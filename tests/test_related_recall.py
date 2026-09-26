@@ -1,21 +1,33 @@
 from __future__ import annotations
 
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
 from _recall_fixtures import (
     CID,
+    CID_B,
     RID,
+    RID_B,
     FakeBucketManager,
     FakeRetrievalAdapter,
     bucket,
     memory,
+    recall_artifact,
+    recall_env,
     recall_request,
+    write_recall,
 )
 
+from ombrebrain.context.recall_request import (
+    recall_request_fingerprint,
+)
 from ombrebrain.context.related_recall import (
     build_recall_query,
     build_related_recall,
     is_valid_related_recall_artifact,
+    read_related_recall,
     resolve_related_recall_budget,
 )
 
@@ -586,27 +598,57 @@ class RelatedRecallValidatorTests(
     unittest.TestCase,
 ):
     def _artifact(self):
-        return {
-            "version": "related-memory-recall.v1",
-            "mode": "shadow_only",
-            "conversation_id": CID,
-            "cognitive_request_id": RID,
-            "recall_id": RECALL_ID,
-            "anchor_memory_id": "mem-1",
-            "request_fingerprint": "a" * 64,
-            "memories": [],
-        }
+        return recall_artifact(
+            ["mem-1", "mem-2"],
+            recall_id=RECALL_ID,
+        )
+
+    def _expected_fingerprint(self):
+        return recall_request_fingerprint(
+            conversation_id=CID,
+            cognitive_request_id=RID,
+            anchor_memory_id="mem-1",
+            requested_scope="related",
+        )
+
+    def _valid(self, artifact):
+        return is_valid_related_recall_artifact(
+            artifact,
+            conversation_id=CID,
+            cognitive_request_id=RID,
+            recall_id=RECALL_ID,
+            request_fingerprint=(
+                self._expected_fingerprint()
+            ),
+        )
 
     def test_validator_accepts_valid_identity(self):
         self.assertTrue(
-            is_valid_related_recall_artifact(
-                self._artifact(),
-                conversation_id=CID,
-                cognitive_request_id=RID,
-                recall_id=RECALL_ID,
-                request_fingerprint="a" * 64,
-            )
+            self._valid(self._artifact())
         )
+
+    def test_validator_recomputes_fingerprint(self):
+        artifact = self._artifact()
+
+        # The artifact must carry the fingerprint recomputed from its
+        # own identity -- not one it merely asserts about itself.
+        self.assertEqual(
+            artifact["request_fingerprint"],
+            self._expected_fingerprint(),
+        )
+        self.assertTrue(self._valid(artifact))
+
+        # Any other valid 64-hex fingerprint is refused.
+        tampered = self._artifact()
+        tampered["request_fingerprint"] = "b" * 64
+
+        self.assertFalse(self._valid(tampered))
+
+        # A non-hex fingerprint is refused too.
+        malformed = self._artifact()
+        malformed["request_fingerprint"] = "z" * 64
+
+        self.assertFalse(self._valid(malformed))
 
     def test_validator_rejects_tampered_identity(self):
         cases = (
@@ -618,6 +660,10 @@ class RelatedRecallValidatorTests(
             {"anchor_memory_id": ""},
             {"request_fingerprint": "b" * 64},
             {"memories": "nope"},
+            {"source_flash_request_id": RID_B},
+            {"source_flash_unified_revision": None},
+            {"requested_scope": "full"},
+            {"included_count": 99},
         )
 
         for changes in cases:
@@ -626,14 +672,254 @@ class RelatedRecallValidatorTests(
                 artifact.update(changes)
 
                 self.assertFalse(
-                    is_valid_related_recall_artifact(
-                        artifact,
-                        conversation_id=CID,
-                        cognitive_request_id=RID,
-                        recall_id=RECALL_ID,
-                        request_fingerprint="a" * 64,
-                    )
+                    self._valid(artifact)
                 )
+
+    def test_validator_rejects_bad_memory_structure(
+        self,
+    ):
+        cases = (
+            {"memory_id": ""},
+            {"memory_id": 17},
+            {"content": ""},
+            {"content": 17},
+            {"content": "x" * 5000},
+            {"reason": "guessed"},
+            {"reason": None},
+            {"rank": 0},
+            {"rank": True},
+            {"rank": 5},
+        )
+
+        for changes in cases:
+            with self.subTest(changes=changes):
+                artifact = self._artifact()
+                artifact["memories"][1].update(
+                    changes
+                )
+
+                self.assertFalse(
+                    self._valid(artifact)
+                )
+
+    def test_validator_requires_anchor_first(self):
+        # The first memory must be the anchor.
+        wrong_id = self._artifact()
+        wrong_id["memories"][0][
+            "memory_id"
+        ] = "mem-3"
+
+        self.assertFalse(self._valid(wrong_id))
+
+        # ...with reason anchor_memory...
+        wrong_reason = self._artifact()
+        wrong_reason["memories"][0][
+            "reason"
+        ] = "related_memory"
+
+        self.assertFalse(
+            self._valid(wrong_reason)
+        )
+
+        # ...and rank 1.
+        wrong_rank = self._artifact()
+        wrong_rank["memories"][0]["rank"] = 2
+        wrong_rank["memories"][1]["rank"] = 1
+
+        self.assertFalse(
+            self._valid(wrong_rank)
+        )
+
+    def test_validator_rejects_duplicate_memories(
+        self,
+    ):
+        # A duplicate memory id.
+        duplicate_id = self._artifact()
+        duplicate_id["memories"][1][
+            "memory_id"
+        ] = "mem-1"
+        duplicate_id["memories"][1][
+            "content"
+        ] = "other body"
+
+        self.assertFalse(
+            self._valid(duplicate_id)
+        )
+
+        # Normalized-equal content.
+        duplicate_text = self._artifact()
+        duplicate_text["memories"][1][
+            "content"
+        ] = (
+            "  "
+            + duplicate_text["memories"][0][
+                "content"
+            ].upper()
+            + "  "
+        )
+
+        self.assertFalse(
+            self._valid(duplicate_text)
+        )
+
+
+class RelatedRecallCorruptionTests(
+    unittest.TestCase,
+):
+    """A tampered persisted recall must read as missing."""
+
+    def _path(self, root):
+        return (
+            Path(root)
+            / "related_recall"
+            / CID
+            / RID
+            / (RECALL_ID + ".json")
+        )
+
+    def _seed(self, root):
+        write_recall(
+            root,
+            recall_artifact(
+                ["mem-1", "mem-2", "mem-3"],
+                recall_id=RECALL_ID,
+            ),
+        )
+
+    def _read(self, root):
+        with recall_env(root):
+            return read_related_recall(
+                conversation_id=CID,
+                cognitive_request_id=RID,
+                recall_id=RECALL_ID,
+            )
+
+    def _tamper(self, root, **changes):
+        path = self._path(root)
+
+        artifact = json.loads(
+            path.read_text(encoding="utf-8")
+        )
+
+        artifact.update(changes)
+
+        path.write_text(
+            json.dumps(artifact),
+            encoding="utf-8",
+        )
+
+    def test_valid_artifact_reads(self):
+        with tempfile.TemporaryDirectory() as root:
+            self._seed(root)
+
+            artifact = self._read(root)
+
+        self.assertIsInstance(artifact, dict)
+        self.assertEqual(
+            artifact["anchor_memory_id"], "mem-1"
+        )
+
+    def test_tampered_anchor_with_stale_fingerprint(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as root:
+            self._seed(root)
+
+            # Move the anchor but keep the original fingerprint: the
+            # recomputed fingerprint no longer matches.
+            self._tamper(
+                root, anchor_memory_id="mem-2"
+            )
+
+            artifact = self._read(root)
+
+        self.assertIsNone(artifact)
+
+    def test_tampered_source_identity(self):
+        cases = (
+            {"source_flash_request_id": RID_B},
+            {"source_flash_unified_revision": None},
+            {"source_flash_unified_revision": 0},
+            {"requested_scope": "full"},
+            {"request_fingerprint": "b" * 64},
+            {"included_count": 99},
+            {"conversation_id": CID_B},
+            {"cognitive_request_id": RID_B},
+            {"recall_id": "recall_" + "8" * 32},
+            {"mode": "live"},
+        )
+
+        for changes in cases:
+            with self.subTest(changes=changes):
+                with tempfile.TemporaryDirectory() as (
+                    root
+                ):
+                    self._seed(root)
+
+                    self._tamper(root, **changes)
+
+                    artifact = self._read(root)
+
+                self.assertIsNone(artifact)
+
+    def test_tampered_memory_list_is_unusable(
+        self,
+    ):
+        for changes in (
+            {"memory_id": "mem-1"},
+            {"content": ""},
+            {"reason": "guessed"},
+            {"rank": 7},
+        ):
+            with self.subTest(changes=changes):
+                with tempfile.TemporaryDirectory() as (
+                    root
+                ):
+                    self._seed(root)
+
+                    path = self._path(root)
+
+                    artifact = json.loads(
+                        path.read_text(
+                            encoding="utf-8"
+                        )
+                    )
+
+                    artifact["memories"][1].update(
+                        changes
+                    )
+
+                    path.write_text(
+                        json.dumps(artifact),
+                        encoding="utf-8",
+                    )
+
+                    result = self._read(root)
+
+                self.assertIsNone(result)
+
+    def test_first_memory_must_be_anchor(self):
+        with tempfile.TemporaryDirectory() as root:
+            self._seed(root)
+
+            path = self._path(root)
+
+            artifact = json.loads(
+                path.read_text(encoding="utf-8")
+            )
+
+            artifact["memories"][0][
+                "memory_id"
+            ] = "mem-3"
+
+            path.write_text(
+                json.dumps(artifact),
+                encoding="utf-8",
+            )
+
+            result = self._read(root)
+
+        self.assertIsNone(result)
 
 
 if __name__ == "__main__":

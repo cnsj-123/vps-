@@ -45,6 +45,11 @@ MEMREF_RE = re.compile(
     r"^memref_[0-9a-f]{32}$"
 )
 
+# A request fingerprint is a full sha256 hex digest.
+FINGERPRINT_RE = re.compile(
+    r"^[0-9a-f]{64}$"
+)
+
 _SPACE_RE = re.compile(r"\s+")
 
 # Serializes the artifact writes of the Recall control plane. It is
@@ -131,6 +136,15 @@ def is_valid_memref(value: Any) -> bool:
     return (
         isinstance(value, str)
         and bool(MEMREF_RE.fullmatch(value))
+    )
+
+
+def is_valid_fingerprint(value: Any) -> bool:
+    """A full, lowercase sha256 hex digest."""
+
+    return (
+        isinstance(value, str)
+        and bool(FINGERPRINT_RE.fullmatch(value))
     )
 
 

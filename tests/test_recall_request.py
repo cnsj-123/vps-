@@ -601,6 +601,8 @@ class RecallRequestPersistenceTests(
             {"anchor_memory_id": ""},
             {"recall_id": "nope"},
             {"request_fingerprint": ""},
+            {"request_fingerprint": "z" * 64},
+            {"request_fingerprint": "A" * 64},
         ):
             with self.subTest(changes=changes):
                 with tempfile.TemporaryDirectory() as (
@@ -654,6 +656,253 @@ class RecallRequestPersistenceTests(
 
                 self.assertIsNone(read_back)
                 self.assertIsNone(found)
+
+    def test_stale_fingerprint_after_anchor_tamper(
+        self,
+    ):
+        request = recall_request("mem-1")
+        recall_id = new_recall_id()
+
+        fingerprint_m1 = recall_request_fingerprint(
+            conversation_id=CID,
+            cognitive_request_id=RID,
+            anchor_memory_id="mem-1",
+            requested_scope="related",
+        )
+
+        fingerprint_m2 = recall_request_fingerprint(
+            conversation_id=CID,
+            cognitive_request_id=RID,
+            anchor_memory_id="mem-2",
+            requested_scope="related",
+        )
+
+        with tempfile.TemporaryDirectory() as root:
+            with recall_env(root):
+                record_recall_request(
+                    recall_request=request,
+                    recall_id=recall_id,
+                )
+
+            path = self._path(root, recall_id)
+
+            artifact = json.loads(
+                path.read_text(encoding="utf-8")
+            )
+
+            # Move the anchor but keep the original fingerprint: the
+            # recomputed fingerprint no longer matches.
+            artifact["anchor_memory_id"] = "mem-2"
+
+            path.write_text(
+                json.dumps(artifact),
+                encoding="utf-8",
+            )
+
+            with recall_env(root):
+                self.assertFalse(
+                    is_valid_recall_request_artifact(
+                        artifact,
+                        conversation_id=CID,
+                        cognitive_request_id=RID,
+                    )
+                )
+
+                read_back = read_recall_request(
+                    conversation_id=CID,
+                    cognitive_request_id=RID,
+                    recall_id=recall_id,
+                )
+
+                found_stale = (
+                    find_recall_request_by_fingerprint(
+                        conversation_id=CID,
+                        cognitive_request_id=RID,
+                        fingerprint=fingerprint_m1,
+                    )
+                )
+
+                found_current = (
+                    find_recall_request_by_fingerprint(
+                        conversation_id=CID,
+                        cognitive_request_id=RID,
+                        fingerprint=fingerprint_m2,
+                    )
+                )
+
+        self.assertIsNone(read_back)
+        self.assertIsNone(found_stale)
+        self.assertIsNone(found_current)
+
+    def test_foreign_valid_fingerprint_is_rejected(
+        self,
+    ):
+        request = recall_request("mem-1")
+        recall_id = new_recall_id()
+
+        correct = recall_request_fingerprint(
+            conversation_id=CID,
+            cognitive_request_id=RID,
+            anchor_memory_id="mem-1",
+            requested_scope="related",
+        )
+
+        foreign = "b" * 64
+
+        with tempfile.TemporaryDirectory() as root:
+            with recall_env(root):
+                record_recall_request(
+                    recall_request=request,
+                    recall_id=recall_id,
+                )
+
+            path = self._path(root, recall_id)
+
+            artifact = json.loads(
+                path.read_text(encoding="utf-8")
+            )
+
+            artifact["request_fingerprint"] = foreign
+
+            path.write_text(
+                json.dumps(artifact),
+                encoding="utf-8",
+            )
+
+            with recall_env(root):
+                self.assertFalse(
+                    is_valid_recall_request_artifact(
+                        artifact,
+                        conversation_id=CID,
+                        cognitive_request_id=RID,
+                    )
+                )
+
+                read_back = read_recall_request(
+                    conversation_id=CID,
+                    cognitive_request_id=RID,
+                    recall_id=recall_id,
+                )
+
+                found_foreign = (
+                    find_recall_request_by_fingerprint(
+                        conversation_id=CID,
+                        cognitive_request_id=RID,
+                        fingerprint=foreign,
+                    )
+                )
+
+                found_correct = (
+                    find_recall_request_by_fingerprint(
+                        conversation_id=CID,
+                        cognitive_request_id=RID,
+                        fingerprint=correct,
+                    )
+                )
+
+        self.assertIsNone(read_back)
+        self.assertIsNone(found_foreign)
+        self.assertIsNone(found_correct)
+
+    def test_source_flash_request_id_is_bound(self):
+        request = recall_request("mem-1")
+        recall_id = new_recall_id()
+
+        with tempfile.TemporaryDirectory() as root:
+            with recall_env(root):
+                record_recall_request(
+                    recall_request=request,
+                    recall_id=recall_id,
+                )
+
+            path = self._path(root, recall_id)
+
+            artifact = json.loads(
+                path.read_text(encoding="utf-8")
+            )
+
+            # The v1 Flash is request scoped: a Recall Request bound
+            # to another request's Flash is not trusted.
+            artifact["source_flash_request_id"] = RID_B
+
+            path.write_text(
+                json.dumps(artifact),
+                encoding="utf-8",
+            )
+
+            with recall_env(root):
+                self.assertFalse(
+                    is_valid_recall_request_artifact(
+                        artifact,
+                        conversation_id=CID,
+                        cognitive_request_id=RID,
+                    )
+                )
+
+                read_back = read_recall_request(
+                    conversation_id=CID,
+                    cognitive_request_id=RID,
+                    recall_id=recall_id,
+                )
+
+        self.assertIsNone(read_back)
+
+    def test_status_must_be_requested(self):
+        request = recall_request("mem-1")
+        recall_id = new_recall_id()
+
+        for value in (
+            "loaded",
+            "used",
+            "complete",
+            None,
+            "",
+        ):
+            with self.subTest(status=value):
+                with tempfile.TemporaryDirectory() as (
+                    root
+                ):
+                    with recall_env(root):
+                        record_recall_request(
+                            recall_request=request,
+                            recall_id=recall_id,
+                        )
+
+                    path = self._path(
+                        root, recall_id
+                    )
+
+                    artifact = json.loads(
+                        path.read_text(
+                            encoding="utf-8"
+                        )
+                    )
+
+                    artifact["status"] = value
+
+                    path.write_text(
+                        json.dumps(artifact),
+                        encoding="utf-8",
+                    )
+
+                    with recall_env(root):
+                        self.assertFalse(
+                            is_valid_recall_request_artifact(
+                                artifact,
+                                conversation_id=CID,
+                                cognitive_request_id=RID,
+                            )
+                        )
+
+                        read_back = (
+                            read_recall_request(
+                                conversation_id=CID,
+                                cognitive_request_id=RID,
+                                recall_id=recall_id,
+                            )
+                        )
+
+                self.assertIsNone(read_back)
 
 
 if __name__ == "__main__":

@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from typing import Any
 
+from ombrebrain.context.recall_request import (
+    read_recall_request,
+)
 from ombrebrain.context.recall_types import (
     LOCK,
     atomic_write,
@@ -9,7 +12,6 @@ from ombrebrain.context.recall_types import (
     memory_usage_path,
     now_iso,
     read_json,
-    related_recall_path,
     validate_cognitive_request_id,
     validate_conversation_id,
 )
@@ -55,9 +57,6 @@ from ombrebrain.context.recall_types import (
 
 _VERSION = "memory-usage-signal.v1"
 _MODE = "shadow_only"
-
-_RECALL_VERSION = "related-memory-recall.v1"
-_RECALL_MODE = "shadow_only"
 
 _STAGE_RECALL_REQUESTED = "recall_requested"
 _STAGE_MEMORY_LOADED = "memory_loaded"
@@ -115,8 +114,16 @@ def is_valid_usage_artifact(
 
     A correct path proves nothing, so a persisted artifact is only
     trusted after re-validating the contract, the mode, the full
-    request binding, the id-list shapes and the invariant
-    ``used ⊆ loaded``. A malformed artifact is never merged into.
+    request binding, the id-list shapes, the anchor binding and the
+    invariant ``used ⊆ loaded``.
+
+    The event log and the state arrays must agree EXACTLY:
+
+      - exactly one ``recall_requested`` event, naming the anchor;
+      - ``memory_loaded`` events' unique ids == ``loaded_memory_ids``;
+      - ``used`` events' unique ids == ``used_memory_ids``.
+
+    A malformed or inconsistent artifact is never merged into.
     """
 
     if not isinstance(artifact, dict):
@@ -172,6 +179,16 @@ def is_valid_usage_artifact(
     if not is_valid_recall_id(artifact_recall):
         return False
 
+    anchor = artifact.get("anchor_memory_id")
+
+    if (
+        not isinstance(anchor, str)
+        or not anchor.strip()
+    ):
+        return False
+
+    anchor = anchor.strip()
+
     loaded = artifact.get("loaded_memory_ids")
 
     used = artifact.get("used_memory_ids")
@@ -185,66 +202,76 @@ def is_valid_usage_artifact(
     if not set(used).issubset(set(loaded)):
         return False
 
-    if not isinstance(artifact.get("events"), list):
-        return False
-
     if artifact.get("loaded_count") != len(loaded):
         return False
 
     if artifact.get("used_count") != len(used):
         return False
 
-    return True
+    events = artifact.get("events")
 
+    if not isinstance(events, list) or not events:
+        return False
 
-def _recall_binding(
-    recall_artifact: Any,
-) -> dict[str, Any] | None:
-    """Validate a related-recall artifact's structural identity."""
+    requested_ids: list[str] = []
+    loaded_event_ids: list[str] = []
+    used_event_ids: list[str] = []
 
-    if (
-        not isinstance(recall_artifact, dict)
-        or recall_artifact.get("version")
-        != _RECALL_VERSION
-        or recall_artifact.get("mode")
-        != _RECALL_MODE
+    for event in events:
+        if not isinstance(event, dict):
+            return False
+
+        stage = event.get("stage")
+
+        memory_id = event.get("memory_id")
+
+        if stage not in (
+            _STAGE_RECALL_REQUESTED,
+            _STAGE_MEMORY_LOADED,
+            _STAGE_USED,
+        ):
+            return False
+
+        if (
+            not isinstance(memory_id, str)
+            or not memory_id.strip()
+        ):
+            return False
+
+        memory_id = memory_id.strip()
+
+        if stage == _STAGE_RECALL_REQUESTED:
+            requested_ids.append(memory_id)
+        elif stage == _STAGE_MEMORY_LOADED:
+            loaded_event_ids.append(memory_id)
+        else:
+            used_event_ids.append(memory_id)
+
+    # Exactly one recall_requested event, and it must name the anchor.
+    # Two requested events, or a requested event bound to another
+    # memory, mean the artifact cannot be trusted.
+    if len(requested_ids) != 1:
+        return False
+
+    if requested_ids[0] != anchor:
+        return False
+
+    # The event log must agree with the state arrays exactly -- and
+    # neither side may contain a duplicate.
+    if len(set(loaded_event_ids)) != len(
+        loaded_event_ids
     ):
-        return None
+        return False
 
-    conversation_id = recall_artifact.get(
-        "conversation_id"
-    )
+    if set(loaded_event_ids) != set(loaded):
+        return False
 
-    cognitive_request_id = (
-        recall_artifact.get(
-            "cognitive_request_id"
-        )
-    )
+    if len(set(used_event_ids)) != len(
+        used_event_ids
+    ):
+        return False
 
-    recall_id = recall_artifact.get(
-        "recall_id"
-    )
-
-    try:
-        validate_conversation_id(
-            conversation_id
-        )
-
-        validate_cognitive_request_id(
-            cognitive_request_id
-        )
-    except ValueError:
-        return None
-
-    if not is_valid_recall_id(recall_id):
-        return None
-
-    return {
-        "conversation_id": conversation_id,
-        "cognitive_request_id":
-            cognitive_request_id,
-        "recall_id": recall_id,
-    }
+    return set(used_event_ids) == set(used)
 
 
 def _loaded_ids(
@@ -358,9 +385,16 @@ def record_recall_requested(
     conversation_id: Any,
     cognitive_request_id: Any,
     recall_id: Any,
-    anchor_memory_id: Any,
 ) -> dict[str, Any]:
     """Record that the AI explicitly requested this recall.
+
+    The event is derived from a REAL, persisted Recall Request:
+    ``read_recall_request`` must return a validated
+    ``memory-recall-request.v1`` artifact for exactly this
+    ``conversation_id`` + ``cognitive_request_id`` + ``recall_id``.
+    The anchor is read from that artifact, never from the caller. A
+    request that was never persisted therefore cannot manufacture a
+    phantom ``recall_requested`` event.
 
     This is written BEFORE any anchor load is attempted, so
 
@@ -370,9 +404,9 @@ def record_recall_requested(
 
     is a real, representable state for a recall that could not be
     satisfied. Idempotent per recall id: an existing, valid artifact
-    is returned as ``duplicate`` and its events are never
-    double-counted. A malformed existing artifact fails closed and is
-    never merged into.
+    bound to the same anchor is returned as ``duplicate`` and its
+    events are never double-counted. A malformed existing artifact
+    fails closed and is never merged into.
     """
 
     try:
@@ -389,6 +423,27 @@ def record_recall_requested(
     if not is_valid_recall_id(recall_id):
         return _no_record("invalid_recall_id")
 
+    recall_request_artifact = read_recall_request(
+        conversation_id=conversation_id,
+        cognitive_request_id=(
+            cognitive_request_id
+        ),
+        recall_id=recall_id,
+    )
+
+    if not isinstance(
+        recall_request_artifact, dict
+    ):
+        return _no_record(
+            "recall_request_not_found"
+        )
+
+    anchor_memory_id = (
+        recall_request_artifact.get(
+            "anchor_memory_id"
+        )
+    )
+
     if (
         not isinstance(anchor_memory_id, str)
         or not anchor_memory_id.strip()
@@ -396,6 +451,8 @@ def record_recall_requested(
         return _no_record(
             "invalid_anchor_memory_id"
         )
+
+    anchor_memory_id = anchor_memory_id.strip()
 
     path = memory_usage_path(
         conversation_id,
@@ -407,13 +464,21 @@ def record_recall_requested(
         existing = read_json(path)
 
         if existing is not None:
-            if is_valid_usage_artifact(
-                existing,
-                conversation_id=conversation_id,
-                cognitive_request_id=(
-                    cognitive_request_id
-                ),
-                recall_id=recall_id,
+            if (
+                is_valid_usage_artifact(
+                    existing,
+                    conversation_id=(
+                        conversation_id
+                    ),
+                    cognitive_request_id=(
+                        cognitive_request_id
+                    ),
+                    recall_id=recall_id,
+                )
+                and existing.get(
+                    "anchor_memory_id"
+                )
+                == anchor_memory_id
             ):
                 return _summary(
                     existing, duplicate=True
@@ -429,9 +494,7 @@ def record_recall_requested(
                 cognitive_request_id
             ),
             recall_id=recall_id,
-            anchor_memory_id=(
-                anchor_memory_id.strip()
-            ),
+            anchor_memory_id=anchor_memory_id,
         )
 
         atomic_write(path, artifact)
@@ -444,29 +507,55 @@ def record_recall_requested(
 
 def record_memory_loaded(
     *,
-    recall_artifact: Any,
+    conversation_id: Any,
+    cognitive_request_id: Any,
+    recall_id: Any,
 ) -> dict[str, Any]:
-    """Record ``memory_loaded`` for a PERSISTED Recall result.
+    """Record ``memory_loaded`` from a PERSISTED Recall result.
 
-    Only ``recall_artifact["memories"]`` -- the memories that a real
-    related-recall artifact actually returned and stored -- become
-    loaded events. A retrieval candidate that was merely considered is
-    never loaded.
+    The loaded ids are read from the real, on-disk related-recall
+    artifact via ``read_related_recall`` -- which fully re-validates
+    identity, fingerprint, revision and memory shape. A synthetic
+    dict is never accepted, and a persisted artifact whose identity /
+    fingerprint / anchor / scope / source revision has been tampered
+    with reads as missing, so no memory can ever be marked loaded
+    without a real recall result.
 
     Idempotent per recall id; never writes a ``used`` event.
     """
 
-    binding = _recall_binding(recall_artifact)
-
-    if binding is None:
+    if not _valid_binding(
+        conversation_id,
+        cognitive_request_id,
+        recall_id,
+    ):
         return _no_record(
-            "malformed_recall_artifact"
+            "invalid_request_binding"
+        )
+
+    # Imported lazily: ``related_recall`` imports this module, so a
+    # top-level import would be circular.
+    from ombrebrain.context.related_recall import (
+        read_related_recall,
+    )
+
+    recall_artifact = read_related_recall(
+        conversation_id=conversation_id,
+        cognitive_request_id=(
+            cognitive_request_id
+        ),
+        recall_id=recall_id,
+    )
+
+    if not isinstance(recall_artifact, dict):
+        return _no_record(
+            "related_recall_not_found"
         )
 
     path = memory_usage_path(
-        binding["conversation_id"],
-        binding["cognitive_request_id"],
-        binding["recall_id"],
+        conversation_id,
+        cognitive_request_id,
+        recall_id,
     )
 
     with LOCK:
@@ -477,13 +566,11 @@ def record_memory_loaded(
 
         if not is_valid_usage_artifact(
             artifact,
-            conversation_id=binding[
-                "conversation_id"
-            ],
-            cognitive_request_id=binding[
-                "cognitive_request_id"
-            ],
-            recall_id=binding["recall_id"],
+            conversation_id=conversation_id,
+            cognitive_request_id=(
+                cognitive_request_id
+            ),
+            recall_id=recall_id,
         ):
             return _no_record(
                 "usage_artifact_invalid"
@@ -559,32 +646,24 @@ def record_usage(
             "invalid_request_binding"
         )
 
-    # Read the recall artifact this usage must belong to. The binding
-    # is verified field by field, so Request B can never report usage
-    # against Request A's recall.
-    recall_artifact = read_json(
-        related_recall_path(
-            conversation_id,
-            cognitive_request_id,
-            recall_id,
-        )
+    # Read the real, persisted recall artifact this usage must belong
+    # to. ``read_related_recall`` fully re-validates it, so Request B
+    # can never report usage against Request A's recall, and a
+    # tampered recall result cannot authorize a usage report.
+    from ombrebrain.context.related_recall import (
+        read_related_recall,
     )
 
-    binding = _recall_binding(recall_artifact)
+    recall_artifact = read_related_recall(
+        conversation_id=conversation_id,
+        cognitive_request_id=(
+            cognitive_request_id
+        ),
+        recall_id=recall_id,
+    )
 
-    if binding is None:
+    if not isinstance(recall_artifact, dict):
         return _no_record("recall_not_found")
-
-    if (
-        binding["conversation_id"]
-        != conversation_id
-        or binding["cognitive_request_id"]
-        != cognitive_request_id
-        or binding["recall_id"] != recall_id
-    ):
-        return _no_record(
-            "recall_binding_mismatch"
-        )
 
     path = memory_usage_path(
         conversation_id,

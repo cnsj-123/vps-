@@ -354,6 +354,18 @@ def is_valid_recall_surface_artifact(
     ):
         return False
 
+    # mapping and surfaces must be EXACTLY the same set: one opaque
+    # ref per model-facing surface, no hidden extra ref.
+    if len(mapping) != len(surfaces):
+        return False
+
+    if artifact.get("memory_count") != len(
+        surfaces
+    ):
+        return False
+
+    memory_ids: list[str] = []
+
     for memref, memory_id in mapping.items():
         if not is_valid_memref(memref):
             return False
@@ -364,16 +376,22 @@ def is_valid_recall_surface_artifact(
         ):
             return False
 
+        memory_ids.append(memory_id)
+
+    # build_recall_surface() de-duplicates memory ids, so a valid
+    # artifact never maps two different refs to one memory.
+    if len(set(memory_ids)) != len(memory_ids):
+        return False
+
+    surface_memrefs: list[str] = []
+
     for surface in surfaces:
         if not isinstance(surface, dict):
             return False
 
         memref = surface.get("memref")
 
-        if (
-            not is_valid_memref(memref)
-            or memref not in mapping
-        ):
+        if not is_valid_memref(memref):
             return False
 
         cue = surface.get("cue")
@@ -381,9 +399,14 @@ def is_valid_recall_surface_artifact(
         if not isinstance(cue, str) or not cue:
             return False
 
-    if artifact.get("memory_count") != len(
-        surfaces
+        surface_memrefs.append(memref)
+
+    if len(set(surface_memrefs)) != len(
+        surface_memrefs
     ):
+        return False
+
+    if set(surface_memrefs) != set(mapping):
         return False
 
     return True

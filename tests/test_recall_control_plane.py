@@ -1456,6 +1456,88 @@ class RecallRequestLifecycleTests(
             rebuilt["mode"], "shadow_only"
         )
 
+    async def test_tampered_recall_is_not_reused(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as root:
+            write_flash(
+                root,
+                flash_artifact([memory("mem-1")]),
+            )
+
+            buckets = FakeBucketManager(
+                {"mem-1": bucket("mem-1")}
+            )
+
+            retrieval = FakeRetrievalAdapter(
+                [memory("mem-2")]
+            )
+
+            with recall_env(root):
+                first = (
+                    await request_related_recall(
+                        conversation_id=CID,
+                        cognitive_request_id=RID,
+                        anchor_memory_id="mem-1",
+                        bucket_manager=buckets,
+                        retrieval_adapter=(
+                            retrieval
+                        ),
+                    )
+                )
+
+                path = (
+                    _recall_dir(root)
+                    / (
+                        first["recall_id"]
+                        + ".json"
+                    )
+                )
+
+                artifact = json.loads(
+                    path.read_text(encoding="utf-8")
+                )
+
+                # Move the anchor but keep the stale fingerprint. The
+                # persisted result must not be reused as a duplicate.
+                artifact["anchor_memory_id"] = "mem-2"
+
+                path.write_text(
+                    json.dumps(artifact),
+                    encoding="utf-8",
+                )
+
+                second = (
+                    await request_related_recall(
+                        conversation_id=CID,
+                        cognitive_request_id=RID,
+                        anchor_memory_id="mem-1",
+                        bucket_manager=buckets,
+                        retrieval_adapter=(
+                            retrieval
+                        ),
+                    )
+                )
+
+                rebuilt = read_related_recall(
+                    conversation_id=CID,
+                    cognitive_request_id=RID,
+                    recall_id=first["recall_id"],
+                )
+
+        # The intact Recall Request still pins the recall id...
+        self.assertEqual(
+            second["recall_id"],
+            first["recall_id"],
+        )
+        self.assertTrue(second["stored"])
+
+        # ...but the tampered result was re-retrieved and rewritten.
+        self.assertEqual(
+            rebuilt["anchor_memory_id"], "mem-1"
+        )
+        self.assertEqual(len(retrieval.calls), 2)
+
     async def test_concurrent_duplicate_counts_one_requested(
         self,
     ):

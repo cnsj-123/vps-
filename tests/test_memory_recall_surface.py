@@ -18,6 +18,7 @@ from _recall_fixtures import (
 
 from ombrebrain.context.memory_recall_surface import (
     build_recall_surface,
+    is_valid_recall_surface_artifact,
     new_memref,
     recall_surface_for_model,
     recall_surface_status,
@@ -612,6 +613,197 @@ class RecallSurfaceCorruptionTests(
                 for surface in model_view["surfaces"]
             ],
             memrefs,
+        )
+
+
+class RecallSurfaceMappingTests(
+    unittest.TestCase,
+):
+    """surfaces and mapping must be a strict one-to-one set: one
+    opaque ref per model-facing surface, no hidden extra ref and no
+    duplicate ref."""
+
+    def _path(self, root):
+        return (
+            Path(root)
+            / "recall_surface"
+            / CID
+            / (RID + ".json")
+        )
+
+    def _seed(self, root):
+        with recall_env(root, surface=True):
+            update_recall_surface(
+                conversation_id=CID,
+                cognitive_request_id=RID,
+                flash_report=flash_artifact(
+                    [
+                        memory(
+                            "mem-1",
+                            "alpha",
+                            name="merge rules",
+                        ),
+                        memory("mem-2", "beta"),
+                    ]
+                ),
+            )
+
+            model_view = recall_surface_for_model(
+                conversation_id=CID,
+                cognitive_request_id=RID,
+            )
+
+        return [
+            surface["memref"]
+            for surface in model_view["surfaces"]
+        ]
+
+    def _artifact(self, root):
+        return json.loads(
+            self._path(root).read_text(
+                encoding="utf-8"
+            )
+        )
+
+    def _write(self, root, artifact):
+        self._path(root).write_text(
+            json.dumps(artifact),
+            encoding="utf-8",
+        )
+
+    def test_valid_mapping_is_accepted(self):
+        with tempfile.TemporaryDirectory() as root:
+            self._seed(root)
+
+            artifact = self._artifact(root)
+
+            self.assertTrue(
+                is_valid_recall_surface_artifact(
+                    artifact,
+                    conversation_id=CID,
+                    cognitive_request_id=RID,
+                )
+            )
+
+    def test_hidden_extra_memref_cannot_resolve(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as root:
+            self._seed(root)
+
+            artifact = self._artifact(root)
+
+            fake = "memref_" + "f" * 32
+
+            # An extra mapping entry with NO model-facing surface.
+            artifact["mapping"][fake] = "M999"
+
+            self._write(root, artifact)
+
+            with recall_env(root, surface=True):
+                self.assertFalse(
+                    is_valid_recall_surface_artifact(
+                        artifact,
+                        conversation_id=CID,
+                        cognitive_request_id=RID,
+                    )
+                )
+
+                model_view = recall_surface_for_model(
+                    conversation_id=CID,
+                    cognitive_request_id=RID,
+                )
+
+                resolved = resolve_recall_ref(
+                    conversation_id=CID,
+                    cognitive_request_id=RID,
+                    memref=fake,
+                )
+
+        self.assertEqual(
+            model_view["surfaces"], []
+        )
+        self.assertIsNone(resolved)
+
+    def test_duplicate_surface_memref_is_invalid(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as root:
+            memrefs = self._seed(root)
+
+            artifact = self._artifact(root)
+
+            # Two surfaces now share one memref.
+            artifact["surfaces"][1]["memref"] = (
+                artifact["surfaces"][0]["memref"]
+            )
+
+            self._write(root, artifact)
+
+            with recall_env(root, surface=True):
+                self.assertFalse(
+                    is_valid_recall_surface_artifact(
+                        artifact,
+                        conversation_id=CID,
+                        cognitive_request_id=RID,
+                    )
+                )
+
+                model_view = recall_surface_for_model(
+                    conversation_id=CID,
+                    cognitive_request_id=RID,
+                )
+
+                resolved = [
+                    resolve_recall_ref(
+                        conversation_id=CID,
+                        cognitive_request_id=RID,
+                        memref=memref,
+                    )
+                    for memref in memrefs
+                ]
+
+        self.assertEqual(
+            model_view["surfaces"], []
+        )
+        self.assertEqual(
+            resolved, [None, None]
+        )
+
+    def test_mapping_surface_count_mismatch_is_invalid(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as root:
+            self._seed(root)
+
+            artifact = self._artifact(root)
+
+            # A surface with no mapping entry.
+            artifact["surfaces"].append(
+                {
+                    "memref": new_memref(),
+                    "cue": "extra",
+                }
+            )
+
+            self._write(root, artifact)
+
+            with recall_env(root, surface=True):
+                self.assertFalse(
+                    is_valid_recall_surface_artifact(
+                        artifact,
+                        conversation_id=CID,
+                        cognitive_request_id=RID,
+                    )
+                )
+
+                model_view = recall_surface_for_model(
+                    conversation_id=CID,
+                    cognitive_request_id=RID,
+                )
+
+        self.assertEqual(
+            model_view["surfaces"], []
         )
 
 

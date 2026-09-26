@@ -19,6 +19,9 @@ from ombrebrain.context.recall_types import (
     atomic_write,
     bound_text,
     estimate_tokens,
+    is_valid_cognitive_request_id,
+    is_valid_conversation_id,
+    is_valid_fingerprint,
     is_valid_recall_id,
     normalize_key,
     now_iso,
@@ -28,6 +31,9 @@ from ombrebrain.context.recall_types import (
 )
 from ombrebrain.context.unified_context_candidate import (
     bound_context_service,
+)
+from ombrebrain.context.validators.freshness import (
+    is_valid_revision,
 )
 
 
@@ -658,6 +664,14 @@ async def build_related_recall(
     }
 
 
+def _is_positive_rank(value: Any) -> bool:
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and value >= 1
+    )
+
+
 def is_valid_related_recall_artifact(
     artifact: Any,
     *,
@@ -669,9 +683,18 @@ def is_valid_related_recall_artifact(
     """Structural identity of one persisted Related Recall artifact.
 
     A correct path proves nothing. Readers verify the contract, the
-    mode, the full request identity, the request fingerprint and the
-    memory shape, so a corrupt artifact can never be reused as a
-    duplicate success.
+    mode, the complete request identity, the source binding, the
+    scope, the RECOMPUTED request fingerprint and the memory shape,
+    so a corrupt artifact can never be reused as a duplicate success:
+
+      - ``source_flash_request_id`` must bind to this request's id
+        (the v1 Flash is request scoped);
+      - ``request_fingerprint`` is recomputed from the artifact's own
+        identity and compared -- the fingerprint an artifact carries
+        about itself is never trusted;
+      - ``memories`` must be a self-consistent list: unique ids,
+        unique normalized content, sequential ranks starting at 1,
+        and the anchor first.
     """
 
     if not isinstance(artifact, dict):
@@ -683,32 +706,47 @@ def is_valid_related_recall_artifact(
     ):
         return False
 
+    artifact_conversation = artifact.get(
+        "conversation_id"
+    )
+
+    artifact_request = artifact.get(
+        "cognitive_request_id"
+    )
+
+    artifact_recall = artifact.get("recall_id")
+
     if (
         conversation_id is not None
-        and artifact.get("conversation_id")
+        and artifact_conversation
         != conversation_id
     ):
         return False
 
     if (
         cognitive_request_id is not None
-        and artifact.get(
-            "cognitive_request_id"
-        )
+        and artifact_request
         != cognitive_request_id
     ):
         return False
 
     if (
         recall_id is not None
-        and artifact.get("recall_id")
-        != recall_id
+        and artifact_recall != recall_id
     ):
         return False
 
-    if not is_valid_recall_id(
-        artifact.get("recall_id")
+    if (
+        not is_valid_conversation_id(
+            artifact_conversation
+        )
+        or not is_valid_cognitive_request_id(
+            artifact_request
+        )
     ):
+        return False
+
+    if not is_valid_recall_id(artifact_recall):
         return False
 
     anchor = artifact.get("anchor_memory_id")
@@ -719,14 +757,41 @@ def is_valid_related_recall_artifact(
     ):
         return False
 
+    anchor = anchor.strip()
+
+    # The v1 Flash is request scoped: the recall must have been built
+    # from THIS request's Flash.
+    if (
+        artifact.get("source_flash_request_id")
+        != artifact_request
+    ):
+        return False
+
+    if not is_valid_revision(
+        artifact.get(
+            "source_flash_unified_revision"
+        )
+    ):
+        return False
+
+    if artifact.get("requested_scope") != "related":
+        return False
+
     fingerprint = artifact.get(
         "request_fingerprint"
     )
 
-    if (
-        not isinstance(fingerprint, str)
-        or not fingerprint
-    ):
+    if not is_valid_fingerprint(fingerprint):
+        return False
+
+    expected = recall_request_fingerprint(
+        conversation_id=artifact_conversation,
+        cognitive_request_id=artifact_request,
+        anchor_memory_id=anchor,
+        requested_scope="related",
+    )
+
+    if fingerprint != expected:
         return False
 
     if (
@@ -735,9 +800,82 @@ def is_valid_related_recall_artifact(
     ):
         return False
 
-    return isinstance(
-        artifact.get("memories"), list
-    )
+    memories = artifact.get("memories")
+
+    if not isinstance(memories, list):
+        return False
+
+    if artifact.get("included_count") != len(
+        memories
+    ):
+        return False
+
+    seen_ids: set[str] = set()
+    seen_text: set[str] = set()
+
+    for index, item in enumerate(memories):
+        if not isinstance(item, dict):
+            return False
+
+        memory_id = item.get("memory_id")
+
+        if (
+            not isinstance(memory_id, str)
+            or not memory_id.strip()
+        ):
+            return False
+
+        memory_id = memory_id.strip()
+
+        content = item.get("content")
+
+        if (
+            not isinstance(content, str)
+            or not content.strip()
+            or len(content)
+            > _MAX_CHARS_PER_MEMORY_CAP
+        ):
+            return False
+
+        reason = item.get("reason")
+
+        if reason not in (
+            "anchor_memory",
+            "related_memory",
+        ):
+            return False
+
+        rank = item.get("rank")
+
+        # Ranks are 1-based and strictly sequential.
+        if not _is_positive_rank(rank):
+            return False
+
+        if rank != index + 1:
+            return False
+
+        if memory_id in seen_ids:
+            return False
+
+        seen_ids.add(memory_id)
+
+        text_key = normalize_key(content)
+
+        if text_key in seen_text:
+            return False
+
+        seen_text.add(text_key)
+
+        if index == 0:
+            # The anchor memory is always first.
+            if (
+                memory_id != anchor
+                or reason != "anchor_memory"
+                or rank != 1
+            ):
+                return False
+
+    return True
 
 
 def _read_related_recall_checked(
@@ -1023,9 +1161,9 @@ async def request_related_recall(
         if existing_recall is not None:
             try:
                 memory_usage_signal.record_memory_loaded(
-                    recall_artifact=(
-                        existing_recall
-                    )
+                    conversation_id=cid,
+                    cognitive_request_id=rid,
+                    recall_id=recall_id,
                 )
             except Exception:
                 pass
@@ -1042,11 +1180,6 @@ async def request_related_recall(
                 conversation_id=cid,
                 cognitive_request_id=rid,
                 recall_id=recall_id,
-                anchor_memory_id=(
-                    recall_request[
-                        "anchor_memory_id"
-                    ]
-                ),
             )
         except Exception:
             pass
@@ -1117,21 +1250,14 @@ async def request_related_recall(
                 atomic_write(path, artifact)
 
         # Loaded != used, and loaded only from what was really
-        # persisted. This never records ``used`` and never reinforces
-        # a memory.
+        # persisted: ``record_memory_loaded`` re-reads and re-validates
+        # the artifact from disk itself. This never records ``used``
+        # and never reinforces a memory.
         try:
-            persisted = read_related_recall(
+            memory_usage_signal.record_memory_loaded(
                 conversation_id=cid,
                 cognitive_request_id=rid,
                 recall_id=recall_id,
-            )
-
-            memory_usage_signal.record_memory_loaded(
-                recall_artifact=(
-                    persisted
-                    if isinstance(persisted, dict)
-                    else artifact
-                )
             )
         except Exception:
             pass
