@@ -8,8 +8,19 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+from ombrebrain.context.memory_flash_live_exposure import (
+    render_memory_flash,
+    select_live_memory_flash_body,
+)
+from ombrebrain.context.memory_recall_surface import (
+    recall_surface_for_model,
+    update_recall_surface,
+)
 from ombrebrain.context.recall_request import (
     recall_request_fingerprint,
+)
+from ombrebrain.context.recall_types import (
+    estimate_tokens,
 )
 
 
@@ -398,3 +409,209 @@ def recall_env(
         os.environ, env, clear=False
     ):
         yield
+
+
+# ------------------------------------------------------
+# Provider-bound Live Recall transport fixtures
+# ------------------------------------------------------
+
+FLASH_SHADOW_ENV = (
+    "OMBRE_GATEWAY_CONTEXT_MEMORY_FLASH_SHADOW"
+)
+SURFACE_SHADOW_ENV = (
+    "OMBRE_GATEWAY_CONTEXT_MEMORY_RECALL_SURFACE_SHADOW"
+)
+LIVE_EXPOSURE_ENV = (
+    "OMBRE_GATEWAY_CONTEXT_MEMORY_FLASH_LIVE_EXPOSURE"
+)
+LIVE_BUDGET_ENV = (
+    "OMBRE_MEMORY_FLASH_LIVE_TOKEN_BUDGET"
+)
+
+CAPABILITY_TTL_ENV = (
+    "OMBRE_GATEWAY_CONTEXT_LIVE_RECALL_CAPABILITY_TTL_SECONDS"
+)
+
+TRANSPORT_ENV = (
+    "OMBRE_GATEWAY_CONTEXT_LIVE_RECALL_TRANSPORT"
+)
+TRANSPORT_PROVIDER_ENV = (
+    "OMBRE_GATEWAY_CONTEXT_LIVE_RECALL_PROVIDER"
+)
+TRANSPORT_MCP_URL_ENV = (
+    "OMBRE_GATEWAY_CONTEXT_LIVE_RECALL_MCP_URL"
+)
+BRIDGE_ENV = (
+    "OMBRE_GATEWAY_CONTEXT_LIVE_RECALL_BRIDGE"
+)
+
+
+def anthropic_payload() -> dict[str, Any]:
+    """A minimal Messages-shaped body with a cache boundary before the
+    current user message (the shape Live Exposure requires)."""
+
+    return {
+        "model": "test-model",
+        "system": [
+            {
+                "type": "text",
+                "text": "system-secret",
+                "cache_control": {
+                    "type": "ephemeral",
+                    "ttl": "1h",
+                },
+            }
+        ],
+        "tools": [
+            {
+                "name": "test_tool",
+                "description": "tool-secret",
+            }
+        ],
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "old-user",
+                    }
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "old-assistant",
+                        "cache_control": {
+                            "type": "ephemeral",
+                            "ttl": "1h",
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "current-user-secret",
+                    }
+                ],
+            },
+        ],
+        "stream": True,
+    }
+
+
+def anthropic_body() -> bytes:
+    return json.dumps(
+        anthropic_payload(),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def seed_live_exposure(
+    root: str | Path,
+    memories: list[dict[str, Any]],
+    *,
+    conversation_id: str = CID,
+    cognitive_request_id: str = RID,
+    revision: int = 5,
+    exposed_count: int | None = None,
+    body: bytes | None = None,
+) -> list[str]:
+    """Seed Flash + Recall Surface + a valid Live Exposure receipt.
+
+    Returns the ordered surface memrefs. The live token budget is
+    pinned to the exact cost of the exposed items so later items
+    cannot fit.
+    """
+
+    write_flash(
+        root,
+        flash_artifact(
+            memories,
+            conversation_id=conversation_id,
+            cognitive_request_id=(
+                cognitive_request_id
+            ),
+            revision=revision,
+        ),
+    )
+
+    with patch.dict(
+        os.environ,
+        {
+            "OMBRE_CONTEXT_STATE_DIR": str(root),
+            FLASH_SHADOW_ENV: "1",
+            SURFACE_SHADOW_ENV: "1",
+            LIVE_EXPOSURE_ENV: "1",
+        },
+        clear=False,
+    ):
+        update_recall_surface(
+            conversation_id=conversation_id,
+            cognitive_request_id=(
+                cognitive_request_id
+            ),
+            flash_report=flash_artifact(
+                memories,
+                conversation_id=conversation_id,
+                cognitive_request_id=(
+                    cognitive_request_id
+                ),
+                revision=revision,
+            ),
+        )
+
+        surfaces = recall_surface_for_model(
+            conversation_id=conversation_id,
+            cognitive_request_id=(
+                cognitive_request_id
+            ),
+        )["surfaces"]
+
+        memrefs = [
+            surface["memref"]
+            for surface in surfaces
+        ]
+
+        cues = [
+            surface["cue"] for surface in surfaces
+        ]
+
+        count = (
+            len(memrefs)
+            if exposed_count is None
+            else exposed_count
+        )
+
+        items = [
+            {
+                "memref": memrefs[index],
+                "cue": cues[index],
+            }
+            for index in range(count)
+        ]
+
+        budget = estimate_tokens(
+            render_memory_flash(items)
+        )
+
+        with patch.dict(
+            os.environ,
+            {LIVE_BUDGET_ENV: str(budget)},
+            clear=False,
+        ):
+            select_live_memory_flash_body(
+                body if body is not None else anthropic_body(),
+                conversation_id=conversation_id,
+                cognitive_request_id=(
+                    cognitive_request_id
+                ),
+            )
+
+    return memrefs
