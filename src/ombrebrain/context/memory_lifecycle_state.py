@@ -448,6 +448,10 @@ def build_lifecycle_state(
             config["initial_strength"],
         "accessibility_floor":
             config["accessibility_floor"],
+        "low_accessibility_threshold":
+            config[
+                "low_accessibility_threshold"
+            ],
         "source_created_at": (
             iso_utc(created_at)
             if created_at is not None
@@ -494,6 +498,26 @@ def _is_positive(value: Any) -> bool:
     )
 
 
+def _matches(
+    value: Any,
+    expected: float,
+) -> bool:
+    """Loose float equality. Never a strict ``==`` on a formula."""
+
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+        and math.isfinite(float(expected))
+        and math.isclose(
+            float(value),
+            float(expected),
+            rel_tol=1e-9,
+            abs_tol=1e-9,
+        )
+    )
+
+
 def is_valid_lifecycle_state_artifact(
     artifact: Any,
     *,
@@ -502,9 +526,24 @@ def is_valid_lifecycle_state_artifact(
     """Structural identity of one derived state snapshot.
 
     A snapshot is only a cache, so a reader verifies the contract, the
-    memory identity and the numeric ranges before exposing it. A
-    tampered snapshot (``strength=99``, a wrong memory id, a wrong
-    version) is never returned as if it were real.
+    memory identity, the numeric ranges, the reference semantics AND --
+    because the state is DERIVED -- that every derived field still
+    matches the deterministic v1 formula recomputed from the provenance
+    and the config the artifact itself carries:
+
+        strength          <- use_count + initial_strength + gain
+        accessibility     <- strength + reference_at + as_of + half life
+        salience          <- use_count + last_used_at + as_of + half life
+        low_accessibility <- accessibility + threshold
+
+    The artifact's own config snapshot is used, never the current
+    environment, so a later config change never invalidates an old
+    snapshot. A tampered snapshot (``strength=99``, a valid-range but
+    wrong strength, a wrong reference, a broken count relation) is
+    never returned as if it were real.
+
+    This validates consistency with OUR deterministic v1 formula only.
+    It makes no claim about human memory.
     """
 
     if not isinstance(artifact, dict):
@@ -558,9 +597,19 @@ def is_valid_lifecycle_state_artifact(
         if not _is_count(artifact.get(field)):
             return False
 
+    # Every valid v1 event is a ``used`` event, so the derived count is
+    # exactly the use count...
     if artifact["use_count"] != artifact[
         "derived_from_event_count"
     ]:
+        return False
+
+    # ...and the on-disk directory holds only lifecycle event JSON, so
+    # every event file is either derived from or counted invalid.
+    if artifact["event_count"] != (
+        artifact["derived_from_event_count"]
+        + artifact["invalid_event_count"]
+    ):
         return False
 
     for field in (
@@ -575,6 +624,7 @@ def is_valid_lifecycle_state_artifact(
         "strength_gain",
         "initial_strength",
         "accessibility_floor",
+        "low_accessibility_threshold",
     ):
         if not _is_unit(artifact.get(field)):
             return False
@@ -591,35 +641,120 @@ def is_valid_lifecycle_state_artifact(
     ):
         return False
 
-    if artifact.get(
-        "reference_source"
-    ) not in _REFERENCE_SOURCES:
+    source = artifact.get("reference_source")
+
+    if source not in _REFERENCE_SOURCES:
         return False
 
-    for field in (
-        "reference_at",
-        "as_of",
+    as_of = parse_iso_utc(artifact.get("as_of"))
+
+    reference_at = parse_iso_utc(
+        artifact.get("reference_at")
+    )
+
+    if as_of is None or reference_at is None:
+        return False
+
+    raw_last_used = artifact.get("last_used_at")
+
+    last_used = (
+        parse_iso_utc(raw_last_used)
+        if raw_last_used is not None
+        else None
+    )
+
+    if (
+        raw_last_used is not None
+        and last_used is None
     ):
-        if parse_iso_utc(artifact.get(field)) is None:
+        return False
+
+    raw_created = artifact.get("source_created_at")
+
+    created = (
+        parse_iso_utc(raw_created)
+        if raw_created is not None
+        else None
+    )
+
+    if raw_created is not None and created is None:
+        return False
+
+    use_count = artifact["use_count"]
+
+    # An explicit use is the ONLY way to have a last-used time, and it
+    # always owns the decay reference.
+    if use_count > 0:
+        if last_used is None:
             return False
 
-    last_used = artifact.get("last_used_at")
+        if source != _REFERENCE_LAST_USED:
+            return False
 
-    if (
-        last_used is not None
-        and parse_iso_utc(last_used) is None
+        if reference_at != last_used:
+            return False
+    else:
+        if last_used is not None:
+            return False
+
+        if source == _REFERENCE_LAST_USED:
+            return False
+
+    # A non-used reference must be the exact time it claims to be.
+    if source == _REFERENCE_SOURCE_CREATED:
+        if created is None:
+            return False
+
+        if reference_at != created:
+            return False
+    elif source == _REFERENCE_FALLBACK:
+        if reference_at != as_of:
+            return False
+
+    expected_strength = strength_for_use_count(
+        use_count, config=artifact
+    )
+
+    if not _matches(
+        artifact["strength"], expected_strength
     ):
         return False
 
-    created = artifact.get("source_created_at")
+    expected_accessibility = accessibility_for_age(
+        artifact["strength"],
+        event_age_hours(
+            at=reference_at, as_of=as_of
+        ),
+        config=artifact,
+    )
 
-    if (
-        created is not None
-        and parse_iso_utc(created) is None
+    if not _matches(
+        artifact["accessibility"],
+        expected_accessibility,
     ):
         return False
 
-    return True
+    expected_salience = salience_for_age(
+        use_count=use_count,
+        age_since_last_used_hours=(
+            event_age_hours(
+                at=last_used, as_of=as_of
+            )
+        ),
+        config=artifact,
+    )
+
+    if not _matches(
+        artifact["salience"], expected_salience
+    ):
+        return False
+
+    return artifact["low_accessibility"] == (
+        artifact["accessibility"]
+        < artifact[
+            "low_accessibility_threshold"
+        ]
+    )
 
 
 def persist_lifecycle_state(

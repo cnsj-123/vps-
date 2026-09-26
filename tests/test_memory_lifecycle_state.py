@@ -22,6 +22,7 @@ from _lifecycle_fixtures import (
 
 from ombrebrain.context.memory_lifecycle_event import (
     build_lifecycle_event,
+    lifecycle_events_dir,
     memory_key,
     persist_lifecycle_event,
 )
@@ -1016,6 +1017,481 @@ class LifecycleStateDerivationTests(
                 )
 
         self.assertEqual(buckets, pristine)
+
+
+class LifecycleStateValidatorTests(
+    unittest.IsolatedAsyncioTestCase,
+):
+    """The state is a DERIVED cache: its validator recomputes v1."""
+
+    def _path(self, memory_id=M1):
+        return lifecycle_state_path(
+            memory_key(memory_id)
+        )
+
+    def _raw(self, memory_id=M1):
+        return json.loads(
+            self._path(memory_id).read_text(
+                encoding="utf-8"
+            )
+        )
+
+    def _write(self, artifact, memory_id=M1):
+        self._path(memory_id).write_text(
+            json.dumps(artifact),
+            encoding="utf-8",
+        )
+
+    async def _derive(
+        self,
+        memory_id=M1,
+        *,
+        as_of,
+        buckets=None,
+    ):
+        return (
+            await derive_memory_lifecycle_state(
+                memory_id,
+                bucket_manager=(
+                    guarded_bucket_manager(
+                        buckets
+                        if buckets is not None
+                        else {
+                            memory_id:
+                                source_bucket(
+                                    memory_id
+                                )
+                        }
+                    )
+                ),
+                as_of=as_of,
+            )
+        )
+
+    async def test_config_snapshot_is_persisted(self):
+        with tempfile.TemporaryDirectory() as root:
+            with lifecycle_env(root):
+                await self._derive(M1, as_of=T0)
+
+                snapshot = self._raw(M1)
+
+        config = resolve_lifecycle_config()
+
+        for field, value in config.items():
+            with self.subTest(field=field):
+                self.assertIn(field, snapshot)
+                self.assertAlmostEqual(
+                    snapshot[field], value
+                )
+
+    async def test_config_change_does_not_invalidate_snapshot(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as root:
+            with lifecycle_env(root):
+                await self._derive(M1, as_of=T0)
+
+            # A later environment change must not invalidate the
+            # snapshot: the artifact carries its own config.
+            with lifecycle_env(
+                root,
+                **{
+                    "OMBRE_MEMORY_LIFECYCLE_STRENGTH_GAIN":
+                        "0.45",
+                    "OMBRE_MEMORY_LIFECYCLE_STRENGTH_INITIAL":
+                        "0.60",
+                    "OMBRE_MEMORY_LIFECYCLE_ACCESS_HALF_LIFE_HOURS":
+                        "12",
+                },
+            ):
+                self.assertIsNotNone(
+                    read_memory_lifecycle_state(M1)
+                )
+
+    async def test_valid_range_but_wrong_fields_are_invalid(
+        self,
+    ):
+        mutations = (
+            (
+                "strength",
+                lambda s: s.update(
+                    strength=0.70
+                ),
+            ),
+            (
+                "accessibility",
+                lambda s: s.update(
+                    accessibility=0.90
+                ),
+            ),
+            (
+                "salience",
+                lambda s: s.update(
+                    salience=0.33
+                ),
+            ),
+            (
+                "initial_strength",
+                lambda s: s.update(
+                    initial_strength=0.5
+                ),
+            ),
+            (
+                "strength_gain",
+                lambda s: s.update(
+                    strength_gain=0.45
+                ),
+            ),
+            (
+                "accessility_half_life",
+                lambda s: s.update(
+                    accessibility_half_life_hours=(
+                        100.0
+                    )
+                ),
+            ),
+            (
+                "salience_half_life",
+                lambda s: s.update(
+                    salience_half_life_hours=48.0
+                ),
+            ),
+            (
+                "accessibility_floor",
+                lambda s: s.update(
+                    accessibility_floor=0.2
+                ),
+            ),
+            (
+                "low_accessibility",
+                lambda s: s.update(
+                    low_accessibility=True
+                ),
+            ),
+            (
+                "low_accessibility_threshold",
+                lambda s: s.update(
+                    low_accessibility_threshold=(
+                        0.4
+                    )
+                ),
+            ),
+            (
+                "event_count",
+                lambda s: s.update(
+                    event_count=(
+                        s["event_count"] + 1
+                    )
+                ),
+            ),
+            (
+                "derived_from_event_count",
+                lambda s: s.update(
+                    derived_from_event_count=2
+                ),
+            ),
+            (
+                "use_count_zeroed",
+                lambda s: s.update(use_count=0),
+            ),
+            (
+                "last_used_at_none",
+                lambda s: s.update(
+                    last_used_at=None
+                ),
+            ),
+            (
+                "last_used_at_wrong",
+                lambda s: s.update(
+                    last_used_at=iso(
+                        T0 - hours(1)
+                    )
+                ),
+            ),
+            (
+                "reference_at_wrong",
+                lambda s: s.update(
+                    reference_at=iso(
+                        T0 - hours(5)
+                    )
+                ),
+            ),
+            (
+                "reference_source_created",
+                lambda s: s.update(
+                    reference_source=(
+                        "source_created"
+                    )
+                ),
+            ),
+            (
+                "reference_source_fallback",
+                lambda s: s.update(
+                    reference_source=(
+                        "observation_fallback"
+                    )
+                ),
+            ),
+            (
+                "reference_source_last_used",
+                lambda s: s.update(
+                    use_count=0,
+                    derived_from_event_count=0,
+                    last_used_at=None,
+                    reference_source="last_used",
+                ),
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as root:
+            with lifecycle_env(root):
+                _seed(M1, times=(iso(T0),))
+
+                # A non-zero age makes every config knob observable in
+                # the derived fields.
+                derived_at = T0 + hours(1)
+
+                await self._derive(
+                    M1, as_of=derived_at
+                )
+
+                baseline = read_memory_lifecycle_state(
+                    M1
+                )
+
+                self.assertIsNotNone(baseline)
+                self.assertAlmostEqual(
+                    baseline["strength"], 0.32
+                )
+
+                for name, mutate in mutations:
+                    with self.subTest(name=name):
+                        mutated = deepcopy(
+                            self._raw(M1)
+                        )
+
+                        mutate(mutated)
+
+                        self._write(mutated)
+
+                        self.assertIsNone(
+                            read_memory_lifecycle_state(
+                                M1
+                            )
+                        )
+
+                        report = await self._derive(
+                            M1, as_of=derived_at
+                        )
+
+                        healed = (
+                            read_memory_lifecycle_state(
+                                M1
+                            )
+                        )
+
+                        self.assertIsNotNone(healed)
+                        self.assertEqual(
+                            healed["use_count"], 1
+                        )
+                        self.assertAlmostEqual(
+                            healed["strength"], 0.32
+                        )
+                        self.assertTrue(
+                            report["state_stored"]
+                        )
+
+    async def test_zero_use_reference_semantics(self):
+        created = iso(T0 - hours(10))
+
+        with tempfile.TemporaryDirectory() as root:
+            with lifecycle_env(root):
+                await self._derive(
+                    M1,
+                    as_of=T0,
+                    buckets={
+                        M1: source_bucket(
+                            M1, created=created
+                        )
+                    },
+                )
+
+                snapshot = self._raw(M1)
+
+                self.assertEqual(
+                    snapshot["reference_source"],
+                    "source_created",
+                )
+                self.assertEqual(
+                    snapshot["reference_at"], created
+                )
+                self.assertIsNone(
+                    snapshot["last_used_at"]
+                )
+
+                # Wrong (but valid) reference time.
+                mutated = deepcopy(snapshot)
+                mutated["reference_at"] = iso(
+                    T0 - hours(1)
+                )
+                self._write(mutated)
+
+                self.assertIsNone(
+                    read_memory_lifecycle_state(M1)
+                )
+
+                # Fallback enum cannot keep a non-as_of reference.
+                mutated = deepcopy(snapshot)
+                mutated[
+                    "reference_source"
+                ] = "observation_fallback"
+                self._write(mutated)
+
+                self.assertIsNone(
+                    read_memory_lifecycle_state(M1)
+                )
+
+                # No created timestamp -> observation fallback.
+                await self._derive(
+                    M2,
+                    as_of=T0,
+                    buckets={
+                        M2: source_bucket(
+                            M2, created=None
+                        )
+                    },
+                )
+
+                fallback = self._raw(M2)
+
+                self.assertEqual(
+                    fallback["reference_source"],
+                    "observation_fallback",
+                )
+                self.assertEqual(
+                    fallback["reference_at"], iso(T0)
+                )
+                self.assertIsNone(
+                    fallback["source_created_at"]
+                )
+
+                mutated = deepcopy(fallback)
+                mutated["reference_at"] = created
+                self._write(mutated, M2)
+
+                self.assertIsNone(
+                    read_memory_lifecycle_state(M2)
+                )
+
+                # source_created requires a real created time.
+                mutated = deepcopy(fallback)
+                mutated[
+                    "reference_source"
+                ] = "source_created"
+                self._write(mutated, M2)
+
+                self.assertIsNone(
+                    read_memory_lifecycle_state(M2)
+                )
+
+    async def test_future_last_used_stays_valid(self):
+        with tempfile.TemporaryDirectory() as root:
+            with lifecycle_env(root):
+                _seed(
+                    M1,
+                    times=(iso(T0 + hours(5)),),
+                )
+
+                await self._derive(M1, as_of=T0)
+
+                state = read_memory_lifecycle_state(
+                    M1
+                )
+
+        # A small clock drift is legal: age clamps to 0, so decay can
+        # never go negative and the snapshot stays valid.
+        self.assertIsNotNone(state)
+        self.assertEqual(
+            state["future_event_count"], 1
+        )
+        self.assertAlmostEqual(
+            state["salience"], 1.0
+        )
+        self.assertAlmostEqual(
+            state["accessibility"],
+            0.02 + 0.98 * 0.32,
+            places=6,
+        )
+        self.assertFalse(
+            state["low_accessibility"]
+        )
+
+    async def test_event_count_lockstep(self):
+        with tempfile.TemporaryDirectory() as root:
+            with lifecycle_env(root):
+                _seed(M1, times=(iso(T0),))
+
+                await self._derive(M1, as_of=T0)
+
+                first = self._raw(M1)
+
+                self.assertEqual(first["event_count"], 1)
+                self.assertEqual(
+                    first[
+                        "derived_from_event_count"
+                    ],
+                    1,
+                )
+                self.assertEqual(
+                    first["invalid_event_count"], 0
+                )
+
+                # One corrupt event file: every file is either derived
+                # from or counted invalid, never silently ignored.
+                directory = (
+                    lifecycle_events_dir(
+                        memory_key(M1)
+                    )
+                )
+
+                (
+                    directory
+                    / (
+                        "mlcevt_"
+                        + "0" * 64
+                        + ".json"
+                    )
+                ).write_text(
+                    json.dumps({"version": "bogus"}),
+                    encoding="utf-8",
+                )
+
+                await self._derive(M1, as_of=T0)
+
+                second = self._raw(M1)
+
+                self.assertEqual(
+                    read_memory_lifecycle_state(M1)[
+                        "event_count"
+                    ],
+                    2,
+                )
+
+        self.assertEqual(second["event_count"], 2)
+        self.assertEqual(
+            second["derived_from_event_count"], 1
+        )
+        self.assertEqual(
+            second["invalid_event_count"], 1
+        )
+        self.assertEqual(
+            second["event_count"],
+            second["derived_from_event_count"]
+            + second["invalid_event_count"],
+        )
+        self.assertTrue(
+            is_valid_lifecycle_state_artifact(second)
+        )
 
 
 if __name__ == "__main__":

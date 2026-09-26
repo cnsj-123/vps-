@@ -12,7 +12,7 @@ from concurrent.futures import (
 from copy import deepcopy
 from datetime import timedelta
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from _lifecycle_fixtures import (
     CID,
@@ -96,6 +96,20 @@ class GateBucketManager:
 
 
 class RaisingBucketManager:
+    """Canonical read that fails; every mutation entry point is banned."""
+
+    def __init__(self):
+        for name in FORBIDDEN_METHODS:
+            setattr(
+                self,
+                name,
+                Mock(
+                    side_effect=AssertionError(
+                        "lifecycle called " + name
+                    )
+                ),
+            )
+
     async def get(self, bucket_id):
         raise RuntimeError("canonical read failed")
 
@@ -489,6 +503,10 @@ class ObserverApiTests(
         self.assertEqual(len(store["events"]), 1)
         self.assertEqual(state["use_count"], 1)
         self.assertFalse(state["exists"])
+        # getter returned None: a CONFIRMED absence.
+        self.assertTrue(
+            state["source_exists_checked"]
+        )
 
     async def test_raising_canonical_read_is_fail_open(
         self,
@@ -505,14 +523,14 @@ class ObserverApiTests(
             )
 
             with lifecycle_env(root):
+                manager = RaisingBucketManager()
+
                 report = (
                     await observe_memory_usage_lifecycle(
                         CID,
                         RID,
                         RECALL_A,
-                        bucket_manager=(
-                            RaisingBucketManager()
-                        ),
+                        bucket_manager=manager,
                         as_of=T0,
                     )
                 )
@@ -521,12 +539,107 @@ class ObserverApiTests(
                     M1
                 )
 
+                store = read_lifecycle_events(M1)
+
+        # Fail-open: the observation still completes and the state is
+        # still derived.
         self.assertTrue(report["stored"])
         self.assertEqual(report["exists_count"], 0)
+        self.assertEqual(len(store["events"]), 1)
+        self.assertEqual(state["use_count"], 1)
+
+        # read failure != confirmed absence.
         self.assertFalse(state["exists"])
-        self.assertTrue(
+        self.assertFalse(
             state["source_exists_checked"]
         )
+
+        # ...and no legacy mutation was even attempted.
+        for name in FORBIDDEN_METHODS:
+            with self.subTest(name=name):
+                self.assertEqual(
+                    getattr(
+                        manager, name
+                    ).call_count,
+                    0,
+                )
+
+    async def test_canonical_read_semantics(self):
+        with tempfile.TemporaryDirectory() as root:
+            write_usage(
+                root,
+                usage_artifact(
+                    recall_id=RECALL_A,
+                    loaded_memory_ids=(M1,),
+                    used_memory_ids=(M1,),
+                    at=iso(T0),
+                ),
+            )
+
+            cases = (
+                # No getter at all: never claims the source was read.
+                ("no_getter", object(), False, False),
+                # getter -> None: a confirmed absence.
+                (
+                    "none",
+                    guarded_bucket_manager({}),
+                    False,
+                    True,
+                ),
+                # getter -> bucket: a confirmed presence.
+                (
+                    "bucket",
+                    guarded_bucket_manager(
+                        {M1: source_bucket(M1)}
+                    ),
+                    True,
+                    True,
+                ),
+                # getter raises: unconfirmed, not an absence.
+                (
+                    "raises",
+                    RaisingBucketManager(),
+                    False,
+                    False,
+                ),
+            )
+
+            for (
+                name,
+                manager,
+                exists,
+                checked,
+            ) in cases:
+                with self.subTest(name=name):
+                    with lifecycle_env(root):
+                        await observe_memory_usage_lifecycle(
+                            CID,
+                            RID,
+                            RECALL_A,
+                            bucket_manager=manager,
+                            as_of=T0,
+                        )
+
+                        state = (
+                            read_memory_lifecycle_state(
+                                M1
+                            )
+                        )
+
+                        store = (
+                            read_lifecycle_events(M1)
+                        )
+
+                    self.assertEqual(
+                        state["exists"], exists
+                    )
+                    self.assertEqual(
+                        state["source_exists_checked"],
+                        checked,
+                    )
+                    self.assertEqual(
+                        len(store["events"]), 1
+                    )
 
     async def test_no_bucket_manager_still_derives(
         self,

@@ -183,7 +183,20 @@ async def _canonical_source(
     bucket_manager: Any,
     memory_id: str,
 ) -> dict[str, Any]:
-    """Read-only existence / created check of one canonical memory."""
+    """Read-only existence / created check of one canonical memory.
+
+    ``checked`` means "the canonical store answered". It is only true
+    when the getter actually ran and returned:
+
+      - no getter           -> exists=False, checked=False
+      - getter -> None      -> exists=False, checked=True
+      - getter -> bucket    -> exists=True,  checked=True
+      - getter raises       -> exists=False, checked=False
+
+    A read failure is NOT a confirmed absence, so it never claims the
+    source was checked. No exception message is ever recorded and the
+    failure stays fail-open.
+    """
 
     result = {
         "exists": False,
@@ -201,7 +214,7 @@ async def _canonical_source(
     try:
         bucket = await getter(memory_id)
     except Exception:
-        bucket = None
+        return result
 
     result["checked"] = True
 
