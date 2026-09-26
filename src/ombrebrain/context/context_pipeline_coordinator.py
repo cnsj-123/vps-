@@ -20,6 +20,9 @@ from ombrebrain.context.memory_flash import (
 from ombrebrain.context.memory_recall_surface import (
     update_recall_surface,
 )
+from ombrebrain.context.memory_surfacing_lifecycle import (
+    apply_lifecycle_surfacing_gate,
+)
 from ombrebrain.context.memory_surfacing_policy import (
     evaluate_surfacing_policy,
 )
@@ -53,14 +56,15 @@ from ombrebrain.context.unified_context_candidate import (
 #   Unified
 #     -> Confidence Gate (shadow only)
 #       -> Memory Surfacing Policy (shadow only)
-#         -> Memory Flash (shadow only)
-#           -> Exposure Ledger (shadow only)
-#             -> Preview
-#               -> Gate
-#                 -> per-request freshness latch
-#                   -> Mutation Shadow
-#                     -> Real Injection selector
-#                       -> selected_body
+#         -> Lifecycle Surfacing gate (shadow only, default OFF)
+#           -> Memory Flash (shadow only)
+#             -> Exposure Ledger (shadow only)
+#               -> Preview
+#                 -> Gate
+#                   -> per-request freshness latch
+#                     -> Mutation Shadow
+#                       -> Real Injection selector
+#                         -> selected_body
 #
 # The gateway only forwards the bytes returned by
 # ``run_context_pipeline()``. It no longer decides when a stage
@@ -95,9 +99,47 @@ from ombrebrain.context.unified_context_candidate import (
 
 logger = logging.getLogger("ombre_brain.gateway")
 
+# Lifecycle Surfacing integration flag. It is only consulted while the
+# Memory Flash stage is already running, so it never starts the
+# pipeline on its own. Default OFF.
+_MEMORY_SURFACING_LIFECYCLE_ENV = (
+    "OMBRE_GATEWAY_CONTEXT_MEMORY_SURFACING_LIFECYCLE"
+)
+
 
 def _truthy(value) -> bool:
     return str(value or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _apply_lifecycle_surfacing(
+    policy: Any,
+) -> Any:
+    """Optionally constrain the Surfacing Policy with lifecycle.
+
+    Synchronous and read-only. Fail-open: any failure returns the
+    base policy untouched, so a lifecycle fault never removes an
+    otherwise surfaced memory.
+    """
+
+    if not _truthy(
+        os.environ.get(
+            _MEMORY_SURFACING_LIFECYCLE_ENV
+        )
+    ):
+        return policy
+
+    try:
+        return apply_lifecycle_surfacing_gate(
+            policy
+        )
+    except Exception as exc:
+        logger.warning(
+            "[gateway.context_memory_surfacing_lifecycle] "
+            "integration_failed=%s fail_open=true",
+            type(exc).__name__,
+        )
+
+        return policy
 
 
 def observe_context_confidence(
@@ -438,6 +480,15 @@ def observe_memory_exposure_shadow(
                 "[gateway.context_memory_flash] "
                 "policy_failed=%s fail_open=true",
                 type(exc).__name__,
+            )
+
+        if isinstance(policy, dict):
+            # Lifecycle Surfacing integration (default OFF). It only
+            # further constrains an already eligible set, keeps the
+            # canonical order, preserves the primary candidate and is
+            # fail-open, so the base policy is unchanged while OFF.
+            policy = _apply_lifecycle_surfacing(
+                policy
             )
 
         if isinstance(policy, dict):
