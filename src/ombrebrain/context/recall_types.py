@@ -166,6 +166,38 @@ def related_recall_path(
     )
 
 
+def recall_request_dir(
+    conversation_id: str,
+    cognitive_request_id: str,
+) -> Path:
+    validate_conversation_id(conversation_id)
+
+    validate_cognitive_request_id(
+        cognitive_request_id
+    )
+
+    return (
+        state_root()
+        / "recall_request"
+        / conversation_id
+        / cognitive_request_id
+    )
+
+
+def recall_request_path(
+    conversation_id: str,
+    cognitive_request_id: str,
+    recall_id: str,
+) -> Path:
+    return (
+        recall_request_dir(
+            conversation_id,
+            cognitive_request_id,
+        )
+        / (recall_id + ".json")
+    )
+
+
 def memory_usage_path(
     conversation_id: str,
     cognitive_request_id: str,

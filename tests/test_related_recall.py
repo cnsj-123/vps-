@@ -15,8 +15,12 @@ from _recall_fixtures import (
 from ombrebrain.context.related_recall import (
     build_recall_query,
     build_related_recall,
+    is_valid_related_recall_artifact,
     resolve_related_recall_budget,
 )
+
+
+RECALL_ID = "recall_" + "7" * 32
 
 
 class BudgetTests(unittest.TestCase):
@@ -128,6 +132,7 @@ class RelatedRecallTests(
         max_chars=1200,
         raises=None,
         anchor="mem-1",
+        recall_id=None,
     ):
         buckets = FakeBucketManager(
             anchor_buckets
@@ -142,6 +147,7 @@ class RelatedRecallTests(
             recall_request=recall_request(
                 anchor
             ),
+            recall_id=recall_id,
             current_query=current_query,
             bucket_manager=buckets,
             retrieval_adapter=retrieval,
@@ -537,6 +543,97 @@ class RelatedRecallTests(
             artifact["reason"],
             "invalid_recall_request",
         )
+
+    async def test_pre_minted_recall_id_is_used(self):
+        artifact, _buckets, _retrieval = (
+            await self._build(
+                anchor_buckets={
+                    "mem-1": bucket("mem-1")
+                },
+                retrieval_results=[
+                    memory("mem-2")
+                ],
+                recall_id=RECALL_ID,
+            )
+        )
+
+        self.assertEqual(
+            artifact["recall_id"], RECALL_ID
+        )
+
+    async def test_invalid_recall_id_is_refused(self):
+        artifact, _buckets, retrieval = (
+            await self._build(
+                anchor_buckets={
+                    "mem-1": bucket("mem-1")
+                },
+                retrieval_results=[],
+                recall_id="not-a-recall-id",
+            )
+        )
+
+        self.assertFalse(artifact["stored"])
+        self.assertEqual(
+            artifact["reason"],
+            "invalid_recall_id",
+        )
+
+        # Nothing is even loaded for a malformed id.
+        self.assertEqual(retrieval.calls, [])
+
+
+class RelatedRecallValidatorTests(
+    unittest.TestCase,
+):
+    def _artifact(self):
+        return {
+            "version": "related-memory-recall.v1",
+            "mode": "shadow_only",
+            "conversation_id": CID,
+            "cognitive_request_id": RID,
+            "recall_id": RECALL_ID,
+            "anchor_memory_id": "mem-1",
+            "request_fingerprint": "a" * 64,
+            "memories": [],
+        }
+
+    def test_validator_accepts_valid_identity(self):
+        self.assertTrue(
+            is_valid_related_recall_artifact(
+                self._artifact(),
+                conversation_id=CID,
+                cognitive_request_id=RID,
+                recall_id=RECALL_ID,
+                request_fingerprint="a" * 64,
+            )
+        )
+
+    def test_validator_rejects_tampered_identity(self):
+        cases = (
+            {"conversation_id": "ctx_" + "9" * 16},
+            {"cognitive_request_id": "ctxreq_" + "9" * 32},
+            {"recall_id": "recall_" + "8" * 32},
+            {"mode": "live"},
+            {"version": "related-memory-recall.v2"},
+            {"anchor_memory_id": ""},
+            {"request_fingerprint": "b" * 64},
+            {"memories": "nope"},
+        )
+
+        for changes in cases:
+            with self.subTest(changes=changes):
+                artifact = self._artifact()
+                artifact.update(changes)
+
+                self.assertFalse(
+                    is_valid_related_recall_artifact(
+                        artifact,
+                        conversation_id=CID,
+                        cognitive_request_id=RID,
+                        recall_id=RECALL_ID,
+                        request_fingerprint="a" * 64,
+                    )
+                )
 
 
 if __name__ == "__main__":

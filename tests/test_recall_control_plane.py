@@ -51,6 +51,24 @@ def _usage_dir(root):
     )
 
 
+def _request_dir(root, rid=RID):
+    return (
+        Path(root)
+        / "recall_request"
+        / CID
+        / rid
+    )
+
+
+def _recall_dir_for(root, rid=RID):
+    return (
+        Path(root)
+        / "related_recall"
+        / CID
+        / rid
+    )
+
+
 class GateRetrieval:
     """Canonical retrieval surface that forces concurrent interleaving.
 
@@ -917,6 +935,611 @@ class RecallControlPlaneTests(
         self.assertEqual(
             report["reason"],
             "invalid_requested_scope",
+        )
+
+
+class RecallRequestLifecycleTests(
+    unittest.IsolatedAsyncioTestCase,
+):
+    """recall_requested is independent of memory_loaded."""
+
+    async def _unavailable_anchor(
+        self,
+        root,
+        *,
+        buckets=None,
+        retrieval=None,
+    ):
+        """Flash surfaced mem-1 but the anchor cannot be loaded."""
+
+        write_flash(
+            root,
+            flash_artifact([memory("mem-1")]),
+        )
+
+        if buckets is None:
+            buckets = FakeBucketManager()
+
+        if retrieval is None:
+            retrieval = FakeRetrievalAdapter(
+                [memory("mem-2")]
+            )
+
+        with recall_env(root):
+            report = await request_related_recall(
+                conversation_id=CID,
+                cognitive_request_id=RID,
+                anchor_memory_id="mem-1",
+                bucket_manager=buckets,
+                retrieval_adapter=retrieval,
+            )
+
+        return report, buckets, retrieval
+
+    async def test_unloadable_anchor_still_records_requested(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as root:
+            (
+                report,
+                _buckets,
+                retrieval,
+            ) = await self._unavailable_anchor(
+                root
+            )
+
+            request_files = list(
+                _request_dir(root).glob(
+                    "recall_*.json"
+                )
+            )
+
+            recall_files = list(
+                _recall_dir(root).glob(
+                    "recall_*.json"
+                )
+            )
+
+            usage_files = list(
+                _usage_dir(root).glob(
+                    "recall_*.json"
+                )
+            )
+
+            usage = json.loads(
+                usage_files[0].read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertFalse(report["stored"])
+        self.assertEqual(
+            report["decision"], "refused"
+        )
+        self.assertEqual(
+            report["reason"],
+            "anchor_memory_unavailable",
+        )
+
+        # The AI's Recall action survives the failed load.
+        self.assertRegex(
+            report["recall_id"],
+            r"^recall_[0-9a-f]{32}$",
+        )
+        self.assertEqual(len(request_files), 1)
+
+        # No memories were loaded, so there is no recall result...
+        self.assertEqual(recall_files, [])
+
+        # ...and the usage state proves it.
+        self.assertEqual(
+            [
+                event["stage"]
+                for event in usage["events"]
+            ],
+            ["recall_requested"],
+        )
+        self.assertEqual(
+            usage["loaded_count"], 0
+        )
+        self.assertEqual(usage["used_count"], 0)
+
+        # Nothing was even retrieved for an unloadable anchor.
+        self.assertEqual(retrieval.calls, [])
+
+    async def test_failed_retry_reuses_recall_id(self):
+        with tempfile.TemporaryDirectory() as root:
+            write_flash(
+                root,
+                flash_artifact([memory("mem-1")]),
+            )
+
+            buckets = FakeBucketManager()
+
+            retrieval = FakeRetrievalAdapter(
+                [memory("mem-2")]
+            )
+
+            with recall_env(root):
+                first = (
+                    await request_related_recall(
+                        conversation_id=CID,
+                        cognitive_request_id=RID,
+                        anchor_memory_id="mem-1",
+                        bucket_manager=buckets,
+                        retrieval_adapter=(
+                            retrieval
+                        ),
+                    )
+                )
+
+                second = (
+                    await request_related_recall(
+                        conversation_id=CID,
+                        cognitive_request_id=RID,
+                        anchor_memory_id="mem-1",
+                        bucket_manager=buckets,
+                        retrieval_adapter=(
+                            retrieval
+                        ),
+                    )
+                )
+
+                request_files = list(
+                    _request_dir(root).glob(
+                        "recall_*.json"
+                    )
+                )
+
+                usage_files = list(
+                    _usage_dir(root).glob(
+                        "recall_*.json"
+                    )
+                )
+
+                usage = json.loads(
+                    usage_files[0].read_text(
+                        encoding="utf-8"
+                    )
+                )
+
+        self.assertEqual(
+            first["recall_id"],
+            second["recall_id"],
+        )
+        self.assertTrue(second["duplicate"])
+        self.assertEqual(len(request_files), 1)
+        self.assertEqual(
+            [
+                event["stage"]
+                for event in usage["events"]
+            ].count("recall_requested"),
+            1,
+        )
+
+    async def test_two_anchors_same_request_are_independent(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as root:
+            write_flash(
+                root,
+                flash_artifact(
+                    [
+                        memory("mem-1"),
+                        memory("mem-2"),
+                    ]
+                ),
+            )
+
+            buckets = FakeBucketManager(
+                {
+                    "mem-1": bucket("mem-1"),
+                    "mem-2": bucket("mem-2"),
+                }
+            )
+
+            retrieval = FakeRetrievalAdapter(
+                [memory("mem-3")]
+            )
+
+            with recall_env(root):
+                first = (
+                    await request_related_recall(
+                        conversation_id=CID,
+                        cognitive_request_id=RID,
+                        anchor_memory_id="mem-1",
+                        bucket_manager=buckets,
+                        retrieval_adapter=(
+                            retrieval
+                        ),
+                    )
+                )
+
+                second = (
+                    await request_related_recall(
+                        conversation_id=CID,
+                        cognitive_request_id=RID,
+                        anchor_memory_id="mem-2",
+                        bucket_manager=buckets,
+                        retrieval_adapter=(
+                            retrieval
+                        ),
+                    )
+                )
+
+                request_files = list(
+                    _request_dir(root).glob(
+                        "recall_*.json"
+                    )
+                )
+
+        self.assertNotEqual(
+            first["recall_id"],
+            second["recall_id"],
+        )
+        self.assertEqual(len(request_files), 2)
+
+    async def test_two_requests_same_anchor_are_independent(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as root:
+            write_flash(
+                root,
+                flash_artifact([memory("mem-1")]),
+            )
+
+            write_flash(
+                root,
+                flash_artifact(
+                    [memory("mem-1")],
+                    cognitive_request_id=RID_B,
+                ),
+            )
+
+            buckets = FakeBucketManager(
+                {"mem-1": bucket("mem-1")}
+            )
+
+            retrieval = FakeRetrievalAdapter(
+                [memory("mem-3")]
+            )
+
+            with recall_env(root):
+                first = (
+                    await request_related_recall(
+                        conversation_id=CID,
+                        cognitive_request_id=RID,
+                        anchor_memory_id="mem-1",
+                        bucket_manager=buckets,
+                        retrieval_adapter=(
+                            retrieval
+                        ),
+                    )
+                )
+
+                second = (
+                    await request_related_recall(
+                        conversation_id=CID,
+                        cognitive_request_id=RID_B,
+                        anchor_memory_id="mem-1",
+                        bucket_manager=buckets,
+                        retrieval_adapter=(
+                            retrieval
+                        ),
+                    )
+                )
+
+                first_requests = list(
+                    _request_dir(root, RID).glob(
+                        "recall_*.json"
+                    )
+                )
+
+                second_requests = list(
+                    _request_dir(
+                        root, RID_B
+                    ).glob("recall_*.json")
+                )
+
+        self.assertNotEqual(
+            first["recall_id"],
+            second["recall_id"],
+        )
+        self.assertEqual(len(first_requests), 1)
+        self.assertEqual(len(second_requests), 1)
+
+    async def test_successful_recall_is_not_re_retrieved(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as root:
+            write_flash(
+                root,
+                flash_artifact([memory("mem-1")]),
+            )
+
+            buckets = FakeBucketManager(
+                {"mem-1": bucket("mem-1")}
+            )
+
+            retrieval = FakeRetrievalAdapter(
+                [memory("mem-2")]
+            )
+
+            with recall_env(root):
+                first = (
+                    await request_related_recall(
+                        conversation_id=CID,
+                        cognitive_request_id=RID,
+                        anchor_memory_id="mem-1",
+                        bucket_manager=buckets,
+                        retrieval_adapter=(
+                            retrieval
+                        ),
+                    )
+                )
+
+                second = (
+                    await request_related_recall(
+                        conversation_id=CID,
+                        cognitive_request_id=RID,
+                        anchor_memory_id="mem-1",
+                        bucket_manager=buckets,
+                        retrieval_adapter=(
+                            retrieval
+                        ),
+                    )
+                )
+
+                recall_files = list(
+                    _recall_dir(root).glob(
+                        "recall_*.json"
+                    )
+                )
+
+        self.assertTrue(first["stored"])
+        self.assertTrue(second["stored"])
+        self.assertTrue(second["duplicate"])
+        self.assertEqual(
+            first["recall_id"],
+            second["recall_id"],
+        )
+
+        # One canonical retrieval, one persisted result.
+        self.assertEqual(len(retrieval.calls), 1)
+        self.assertEqual(len(recall_files), 1)
+
+    async def test_corrupt_recall_request_is_ignored(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as root:
+            write_flash(
+                root,
+                flash_artifact([memory("mem-1")]),
+            )
+
+            buckets = FakeBucketManager(
+                {"mem-1": bucket("mem-1")}
+            )
+
+            retrieval = FakeRetrievalAdapter(
+                [memory("mem-2")]
+            )
+
+            with recall_env(root):
+                first = (
+                    await request_related_recall(
+                        conversation_id=CID,
+                        cognitive_request_id=RID,
+                        anchor_memory_id="mem-1",
+                        bucket_manager=buckets,
+                        retrieval_adapter=(
+                            retrieval
+                        ),
+                    )
+                )
+
+                # Corrupt the persisted request event. It must not be
+                # honoured as this request's duplicate.
+                path = (
+                    _request_dir(root)
+                    / (
+                        first["recall_id"]
+                        + ".json"
+                    )
+                )
+
+                artifact = json.loads(
+                    path.read_text(encoding="utf-8")
+                )
+
+                artifact["mode"] = "live"
+
+                path.write_text(
+                    json.dumps(artifact),
+                    encoding="utf-8",
+                )
+
+                second = (
+                    await request_related_recall(
+                        conversation_id=CID,
+                        cognitive_request_id=RID,
+                        anchor_memory_id="mem-1",
+                        bucket_manager=buckets,
+                        retrieval_adapter=(
+                            retrieval
+                        ),
+                    )
+                )
+
+        self.assertNotEqual(
+            first["recall_id"],
+            second["recall_id"],
+        )
+        self.assertFalse(second["duplicate"])
+
+    async def test_corrupt_recall_result_is_not_reused(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as root:
+            write_flash(
+                root,
+                flash_artifact([memory("mem-1")]),
+            )
+
+            buckets = FakeBucketManager(
+                {"mem-1": bucket("mem-1")}
+            )
+
+            retrieval = FakeRetrievalAdapter(
+                [memory("mem-2")]
+            )
+
+            with recall_env(root):
+                first = (
+                    await request_related_recall(
+                        conversation_id=CID,
+                        cognitive_request_id=RID,
+                        anchor_memory_id="mem-1",
+                        bucket_manager=buckets,
+                        retrieval_adapter=(
+                            retrieval
+                        ),
+                    )
+                )
+
+                path = (
+                    _recall_dir(root)
+                    / (
+                        first["recall_id"]
+                        + ".json"
+                    )
+                )
+
+                artifact = json.loads(
+                    path.read_text(encoding="utf-8")
+                )
+
+                artifact["mode"] = "live"
+
+                path.write_text(
+                    json.dumps(artifact),
+                    encoding="utf-8",
+                )
+
+                second = (
+                    await request_related_recall(
+                        conversation_id=CID,
+                        cognitive_request_id=RID,
+                        anchor_memory_id="mem-1",
+                        bucket_manager=buckets,
+                        retrieval_adapter=(
+                            retrieval
+                        ),
+                    )
+                )
+
+                rebuilt = read_related_recall(
+                    conversation_id=CID,
+                    cognitive_request_id=RID,
+                    recall_id=first["recall_id"],
+                )
+
+        # Same recall id (the request event is intact), but the
+        # corrupt result was never trusted as the answer.
+        self.assertEqual(
+            second["recall_id"],
+            first["recall_id"],
+        )
+        self.assertTrue(second["stored"])
+        self.assertIsInstance(rebuilt, dict)
+        self.assertEqual(
+            rebuilt["mode"], "shadow_only"
+        )
+
+    async def test_concurrent_duplicate_counts_one_requested(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as root:
+            write_flash(
+                root,
+                flash_artifact([memory("mem-1")]),
+            )
+
+            buckets = FakeBucketManager(
+                {"mem-1": bucket("mem-1")}
+            )
+
+            retrieval = GateRetrieval(
+                [memory("mem-2")], parties=2
+            )
+
+            with recall_env(root):
+                first, second = (
+                    await asyncio.gather(
+                        request_related_recall(
+                            conversation_id=CID,
+                            cognitive_request_id=RID,
+                            anchor_memory_id=(
+                                "mem-1"
+                            ),
+                            bucket_manager=buckets,
+                            retrieval_adapter=(
+                                retrieval
+                            ),
+                        ),
+                        request_related_recall(
+                            conversation_id=CID,
+                            cognitive_request_id=RID,
+                            anchor_memory_id=(
+                                "mem-1"
+                            ),
+                            bucket_manager=buckets,
+                            retrieval_adapter=(
+                                retrieval
+                            ),
+                        ),
+                    )
+                )
+
+                request_files = list(
+                    _request_dir(root).glob(
+                        "recall_*.json"
+                    )
+                )
+
+                recall_files = list(
+                    _recall_dir(root).glob(
+                        "recall_*.json"
+                    )
+                )
+
+                usage_files = list(
+                    _usage_dir(root).glob(
+                        "recall_*.json"
+                    )
+                )
+
+                usage = json.loads(
+                    usage_files[0].read_text(
+                        encoding="utf-8"
+                    )
+                )
+
+        self.assertEqual(
+            first["recall_id"],
+            second["recall_id"],
+        )
+        self.assertEqual(len(request_files), 1)
+        self.assertEqual(len(recall_files), 1)
+        self.assertEqual(len(usage_files), 1)
+
+        stages = [
+            event["stage"]
+            for event in usage["events"]
+        ]
+
+        self.assertEqual(
+            stages.count("recall_requested"), 1
         )
 
 

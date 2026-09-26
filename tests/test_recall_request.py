@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import re
 import tempfile
 import unittest
+from pathlib import Path
 
 from _recall_fixtures import (
     CID,
@@ -12,13 +14,19 @@ from _recall_fixtures import (
     flash_artifact,
     memory,
     recall_env,
+    recall_request,
     write_flash,
 )
 
 from ombrebrain.context.recall_request import (
     authorize_recall_request,
+    find_recall_request_by_fingerprint,
+    is_valid_recall_request_artifact,
     new_recall_id,
+    read_recall_request,
     recall_request_fingerprint,
+    recall_request_status,
+    record_recall_request,
 )
 
 
@@ -416,6 +424,236 @@ class RecallAuthorizationTests(unittest.TestCase):
             bad_anchor["reason"],
             "invalid_request",
         )
+
+
+class RecallRequestPersistenceTests(
+    unittest.TestCase,
+):
+    def _path(self, root, recall_id):
+        return (
+            Path(root)
+            / "recall_request"
+            / CID
+            / RID
+            / (recall_id + ".json")
+        )
+
+    def test_authorized_request_is_persisted(self):
+        request = recall_request("mem-1")
+
+        recall_id = new_recall_id()
+
+        with tempfile.TemporaryDirectory() as root:
+            with recall_env(root):
+                report = record_recall_request(
+                    recall_request=request,
+                    recall_id=recall_id,
+                )
+
+                artifact = read_recall_request(
+                    conversation_id=CID,
+                    cognitive_request_id=RID,
+                    recall_id=recall_id,
+                )
+
+                status = recall_request_status(
+                    conversation_id=CID,
+                    cognitive_request_id=RID,
+                    recall_id=recall_id,
+                )
+
+        self.assertTrue(report["stored"])
+        self.assertFalse(report["duplicate"])
+        self.assertEqual(
+            report["recall_id"], recall_id
+        )
+        self.assertEqual(
+            artifact["status"], "requested"
+        )
+        self.assertEqual(
+            artifact["anchor_memory_id"], "mem-1"
+        )
+        self.assertEqual(
+            artifact["requested_scope"], "related"
+        )
+        self.assertEqual(
+            artifact["source_flash_unified_revision"],
+            5,
+        )
+        self.assertTrue(status["exists"])
+        self.assertEqual(
+            status["status"], "requested"
+        )
+
+    def test_record_is_idempotent_by_fingerprint(
+        self,
+    ):
+        request = recall_request("mem-1")
+
+        with tempfile.TemporaryDirectory() as root:
+            with recall_env(root):
+                first = record_recall_request(
+                    recall_request=request,
+                    recall_id=new_recall_id(),
+                )
+
+                second = record_recall_request(
+                    recall_request=request,
+                    recall_id=new_recall_id(),
+                )
+
+                files = list(
+                    (
+                        Path(root)
+                        / "recall_request"
+                        / CID
+                        / RID
+                    ).glob("recall_*.json")
+                )
+
+        self.assertEqual(
+            first["recall_id"],
+            second["recall_id"],
+        )
+        self.assertFalse(first["duplicate"])
+        self.assertTrue(second["duplicate"])
+        self.assertEqual(len(files), 1)
+
+    def test_find_by_fingerprint(self):
+        request = recall_request("mem-1")
+
+        fingerprint = recall_request_fingerprint(
+            conversation_id=CID,
+            cognitive_request_id=RID,
+            anchor_memory_id="mem-1",
+            requested_scope="related",
+        )
+
+        with tempfile.TemporaryDirectory() as root:
+            with recall_env(root):
+                record_recall_request(
+                    recall_request=request,
+                    recall_id=new_recall_id(),
+                )
+
+                found = (
+                    find_recall_request_by_fingerprint(
+                        conversation_id=CID,
+                        cognitive_request_id=RID,
+                        fingerprint=fingerprint,
+                    )
+                )
+
+                unknown = (
+                    find_recall_request_by_fingerprint(
+                        conversation_id=CID,
+                        cognitive_request_id=RID,
+                        fingerprint="0" * 64,
+                    )
+                )
+
+        self.assertIsInstance(found, dict)
+        self.assertIsNone(unknown)
+
+    def test_invalid_inputs_are_refused(self):
+        request = recall_request("mem-1")
+
+        with tempfile.TemporaryDirectory() as root:
+            with recall_env(root):
+                bad_id = record_recall_request(
+                    recall_request=request,
+                    recall_id="not-a-recall-id",
+                )
+
+                bad_request = record_recall_request(
+                    recall_request={"version": "nope"},
+                    recall_id=new_recall_id(),
+                )
+
+        self.assertEqual(
+            bad_id["reason"], "invalid_recall_id"
+        )
+        self.assertEqual(
+            bad_request["reason"],
+            "invalid_recall_request",
+        )
+
+    def test_corrupt_request_identity_is_rejected(
+        self,
+    ):
+        request = recall_request("mem-1")
+        recall_id = new_recall_id()
+
+        fingerprint = recall_request_fingerprint(
+            conversation_id=CID,
+            cognitive_request_id=RID,
+            anchor_memory_id="mem-1",
+            requested_scope="related",
+        )
+
+        for changes in (
+            {"conversation_id": CID_B},
+            {"cognitive_request_id": RID_B},
+            {"mode": "live"},
+            {"version": "memory-recall-request.v2"},
+            {"source_flash_unified_revision": None},
+            {"requested_scope": "full"},
+            {"anchor_memory_id": ""},
+            {"recall_id": "nope"},
+            {"request_fingerprint": ""},
+        ):
+            with self.subTest(changes=changes):
+                with tempfile.TemporaryDirectory() as (
+                    root
+                ):
+                    with recall_env(root):
+                        record_recall_request(
+                            recall_request=request,
+                            recall_id=recall_id,
+                        )
+
+                    path = self._path(
+                        root, recall_id
+                    )
+
+                    artifact = json.loads(
+                        path.read_text(
+                            encoding="utf-8"
+                        )
+                    )
+
+                    artifact.update(changes)
+
+                    path.write_text(
+                        json.dumps(artifact),
+                        encoding="utf-8",
+                    )
+
+                    with recall_env(root):
+                        read_back = read_recall_request(
+                            conversation_id=CID,
+                            cognitive_request_id=RID,
+                            recall_id=recall_id,
+                        )
+
+                        found = (
+                            find_recall_request_by_fingerprint(
+                                conversation_id=CID,
+                                cognitive_request_id=RID,
+                                fingerprint=fingerprint,
+                            )
+                        )
+
+                        self.assertFalse(
+                            is_valid_recall_request_artifact(
+                                artifact,
+                                conversation_id=CID,
+                                cognitive_request_id=RID,
+                            )
+                        )
+
+                self.assertIsNone(read_back)
+                self.assertIsNone(found)
 
 
 if __name__ == "__main__":

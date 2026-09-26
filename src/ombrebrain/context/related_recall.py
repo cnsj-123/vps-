@@ -8,9 +8,11 @@ from ombrebrain.context import memory_recall_surface
 from ombrebrain.context.recall_request import (
     RECALL_REQUEST_VERSION,
     authorize_recall_request,
+    find_recall_request_by_fingerprint,
     new_recall_id,
     recall_control_plane_enabled,
     recall_request_fingerprint,
+    record_recall_request,
 )
 from ombrebrain.context.recall_types import (
     LOCK,
@@ -22,7 +24,6 @@ from ombrebrain.context.recall_types import (
     now_iso,
     parse_positive_int,
     read_json,
-    related_recall_dir,
     related_recall_path,
 )
 from ombrebrain.context.unified_context_candidate import (
@@ -74,6 +75,7 @@ _ANCHOR_QUERY_CHARS = 400
 _USER_QUERY_CHARS = 300
 
 _REASON_INVALID_REQUEST = "invalid_recall_request"
+_REASON_INVALID_RECALL_ID = "invalid_recall_id"
 _REASON_REF_NOT_FOUND = "recall_ref_not_found"
 _REASON_ANCHOR_UNAVAILABLE = (
     "anchor_memory_unavailable"
@@ -285,15 +287,17 @@ def _refusal(
     reason: str,
     *,
     mode: str = _MODE,
+    recall_id: Any = None,
+    duplicate: bool = False,
 ) -> dict[str, Any]:
     return {
         "version": _VERSION,
         "mode": mode,
         "stored": False,
-        "duplicate": False,
+        "duplicate": duplicate,
         "decision": "refused",
         "reason": reason,
-        "recall_id": None,
+        "recall_id": recall_id,
         "retrieved_count": 0,
         "included_count": 0,
         "estimated_tokens": 0,
@@ -305,12 +309,19 @@ def _refusal(
 async def build_related_recall(
     *,
     recall_request: Any,
+    recall_id: Any = None,
     current_query: Any = "",
     bucket_manager: Any = None,
     retrieval_adapter: Any = None,
     budget: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     """Build (do not persist) one bounded related recall artifact.
+
+    ``recall_id`` is minted by the Recall control plane BEFORE the
+    anchor is loaded, so a trusted caller passes the id this request
+    already owns and the Related Recall artifact reuses it. A
+    malformed id is refused; ``None`` mints one only for standalone
+    use, never for the control plane flow.
 
     Never raises: malformed input, an unavailable anchor or a failing
     retrieval degrades to a structured refusal, never to an exception.
@@ -349,6 +360,13 @@ async def build_related_recall(
         or not anchor_memory_id.strip()
     ):
         return _refusal(_REASON_INVALID_REQUEST)
+
+    if recall_id is None:
+        recall_id = new_recall_id()
+    elif not is_valid_recall_id(recall_id):
+        return _refusal(
+            _REASON_INVALID_RECALL_ID
+        )
 
     anchor_memory_id = anchor_memory_id.strip()
 
@@ -594,7 +612,7 @@ async def build_related_recall(
         "conversation_id": conversation_id,
         "cognitive_request_id":
             cognitive_request_id,
-        "recall_id": new_recall_id(),
+        "recall_id": recall_id,
         "anchor_memory_id": anchor_memory_id,
         "source_flash_request_id":
             recall_request.get(
@@ -640,88 +658,135 @@ async def build_related_recall(
     }
 
 
-def _find_by_fingerprint(
+def is_valid_related_recall_artifact(
+    artifact: Any,
+    *,
+    conversation_id: Any = None,
+    cognitive_request_id: Any = None,
+    recall_id: Any = None,
+    request_fingerprint: Any = None,
+) -> bool:
+    """Structural identity of one persisted Related Recall artifact.
+
+    A correct path proves nothing. Readers verify the contract, the
+    mode, the full request identity, the request fingerprint and the
+    memory shape, so a corrupt artifact can never be reused as a
+    duplicate success.
+    """
+
+    if not isinstance(artifact, dict):
+        return False
+
+    if (
+        artifact.get("version") != _VERSION
+        or artifact.get("mode") != _MODE
+    ):
+        return False
+
+    if (
+        conversation_id is not None
+        and artifact.get("conversation_id")
+        != conversation_id
+    ):
+        return False
+
+    if (
+        cognitive_request_id is not None
+        and artifact.get(
+            "cognitive_request_id"
+        )
+        != cognitive_request_id
+    ):
+        return False
+
+    if (
+        recall_id is not None
+        and artifact.get("recall_id")
+        != recall_id
+    ):
+        return False
+
+    if not is_valid_recall_id(
+        artifact.get("recall_id")
+    ):
+        return False
+
+    anchor = artifact.get("anchor_memory_id")
+
+    if (
+        not isinstance(anchor, str)
+        or not anchor.strip()
+    ):
+        return False
+
+    fingerprint = artifact.get(
+        "request_fingerprint"
+    )
+
+    if (
+        not isinstance(fingerprint, str)
+        or not fingerprint
+    ):
+        return False
+
+    if (
+        request_fingerprint is not None
+        and fingerprint != request_fingerprint
+    ):
+        return False
+
+    return isinstance(
+        artifact.get("memories"), list
+    )
+
+
+def _read_related_recall_checked(
     *,
     conversation_id: str,
     cognitive_request_id: str,
+    recall_id: str,
     fingerprint: str,
 ) -> dict[str, Any] | None:
-    """Existing recall with the same request fingerprint, if any.
+    """Read one recall artifact for THIS request, fully validated."""
 
-    Called under ``LOCK`` only, so two concurrent retries of the same
-    Recall Request cannot both create an artifact.
-    """
+    artifact = read_related_recall(
+        conversation_id=conversation_id,
+        cognitive_request_id=(
+            cognitive_request_id
+        ),
+        recall_id=recall_id,
+    )
 
-    try:
-        directory = related_recall_dir(
-            conversation_id,
-            cognitive_request_id,
-        )
-    except ValueError:
-        return None
-
-    if not directory.is_dir():
-        return None
-
-    for path in sorted(
-        directory.glob("recall_*.json")
+    if not is_valid_related_recall_artifact(
+        artifact,
+        conversation_id=conversation_id,
+        cognitive_request_id=(
+            cognitive_request_id
+        ),
+        recall_id=recall_id,
+        request_fingerprint=fingerprint,
     ):
-        artifact = read_json(path)
+        return None
 
-        if not isinstance(artifact, dict):
-            continue
-
-        if (
-            artifact.get("version") == _VERSION
-            and artifact.get(
-                "request_fingerprint"
-            )
-            == fingerprint
-        ):
-            return artifact
-
-    return None
-
-
-def _duplicate_report(
-    artifact: dict[str, Any],
-) -> dict[str, Any]:
-    return {
-        "version": _VERSION,
-        "mode": _MODE,
-        "stored": True,
-        "duplicate": True,
-        "decision": "recalled",
-        "reason": "duplicate_recall_request",
-        "recall_id": artifact.get(
-            "recall_id"
-        ),
-        "retrieved_count": artifact.get(
-            "retrieved_count"
-        ),
-        "included_count": artifact.get(
-            "included_count"
-        ),
-        "estimated_tokens": artifact.get(
-            "estimated_tokens"
-        ),
-        "token_budget": artifact.get(
-            "token_budget"
-        ),
-        "recall": artifact,
-    }
+    return artifact
 
 
 def _recall_report(
     artifact: dict[str, Any],
+    *,
+    duplicate: bool = False,
 ) -> dict[str, Any]:
     return {
         "version": _VERSION,
         "mode": _MODE,
         "stored": True,
-        "duplicate": False,
+        "duplicate": duplicate,
         "decision": "recalled",
-        "reason": "recall_completed",
+        "reason": (
+            "duplicate_recall_request"
+            if duplicate
+            else "recall_completed"
+        ),
         "recall_id": artifact.get(
             "recall_id"
         ),
@@ -793,10 +858,27 @@ async def request_related_recall(
     calls this automatically, and a Memory Flash never triggers it.
 
     The trusted caller binds ``conversation_id`` and
-    ``cognitive_request_id`` (the model may never pass them), and
-    supplies the current user query from the real request. The model
-    may only ever name an anchor, and only through an opaque
+    ``cognitive_request_id`` (the model may never pass them). The
+    model may only ever name an anchor, and only through an opaque
     ``memref`` (``anchor_ref``) or the already-surfaced memory id.
+
+    ``current_query`` MUST come from trusted request context (the
+    Gateway / Coordinator that owns the live request) and MUST NOT be
+    accepted from model tool arguments. It is deliberately not part of
+    any model-facing schema.
+
+    Ordering (this is the whole point of the control plane):
+
+        authorize against the real Flash
+          -> fingerprint / reuse-or-persist the Recall Request
+            -> mint recall_id (if new)
+              -> persist recall_requested
+                -> load anchor + one canonical related retrieval
+                  -> persist Related Recall (if loaded)
+                    -> record memory_loaded
+
+    So ``recall_requested`` exists even when nothing can be loaded,
+    and the recall id is stable before any load is attempted.
 
     Fail-open: any failure returns a structured refusal and never
     raises, never blocks a request and never changes a model
@@ -848,6 +930,8 @@ async def request_related_recall(
             )
         )
 
+        # An invalid authorization is not a Recall Request: nothing is
+        # persisted and no recall_requested event exists.
         if not authorization.get("valid"):
             return _refusal(
                 authorization.get("reason")
@@ -858,18 +942,16 @@ async def request_related_recall(
             "recall_request"
         ]
 
+        cid = recall_request["conversation_id"]
+
+        rid = recall_request[
+            "cognitive_request_id"
+        ]
+
         fingerprint = (
             recall_request_fingerprint(
-                conversation_id=(
-                    recall_request[
-                        "conversation_id"
-                    ]
-                ),
-                cognitive_request_id=(
-                    recall_request[
-                        "cognitive_request_id"
-                    ]
-                ),
+                conversation_id=cid,
+                cognitive_request_id=rid,
                 anchor_memory_id=(
                     recall_request[
                         "anchor_memory_id"
@@ -883,28 +965,91 @@ async def request_related_recall(
             )
         )
 
-        # Idempotency: a provider retry of the SAME recall request
-        # folds onto the existing artifact and never double-counts
-        # ``recall_requested``.
+        # Idempotency is anchored to the persisted Recall Request, not
+        # to the Related Recall artifact: a recall that failed to load
+        # has no recall artifact and must still be deduplicated.
         with LOCK:
-            existing = _find_by_fingerprint(
-                conversation_id=(
-                    recall_request[
-                        "conversation_id"
-                    ]
-                ),
-                cognitive_request_id=(
-                    recall_request[
-                        "cognitive_request_id"
-                    ]
-                ),
-                fingerprint=fingerprint,
+            existing_request = (
+                find_recall_request_by_fingerprint(
+                    conversation_id=cid,
+                    cognitive_request_id=rid,
+                    fingerprint=fingerprint,
+                )
             )
 
-        if isinstance(existing, dict):
-            return _duplicate_report(
-                existing
+        if isinstance(existing_request, dict):
+            recall_id = existing_request.get(
+                "recall_id"
             )
+            request_duplicate = True
+        else:
+            recall_id = new_recall_id()
+
+            recorded = record_recall_request(
+                recall_request=recall_request,
+                recall_id=recall_id,
+            )
+
+            if not recorded.get("stored"):
+                return _refusal(
+                    recorded.get("reason")
+                    or _REASON_INVALID_REQUEST
+                )
+
+            recall_id = (
+                recorded.get("recall_id")
+                or recall_id
+            )
+            request_duplicate = bool(
+                recorded.get("duplicate")
+            )
+
+        if not is_valid_recall_id(recall_id):
+            return _refusal(
+                _REASON_INVALID_RECALL_ID
+            )
+
+        # This exact recall already completed: reuse the persisted
+        # result. No second retrieval and no overwrite.
+        existing_recall = (
+            _read_related_recall_checked(
+                conversation_id=cid,
+                cognitive_request_id=rid,
+                recall_id=recall_id,
+                fingerprint=fingerprint,
+            )
+        )
+
+        if existing_recall is not None:
+            try:
+                memory_usage_signal.record_memory_loaded(
+                    recall_artifact=(
+                        existing_recall
+                    )
+                )
+            except Exception:
+                pass
+
+            return _recall_report(
+                existing_recall,
+                duplicate=True,
+            )
+
+        # The AI's request is now a recorded fact, independent of
+        # whether anything can be loaded. Idempotent per recall id.
+        try:
+            memory_usage_signal.record_recall_requested(
+                conversation_id=cid,
+                cognitive_request_id=rid,
+                recall_id=recall_id,
+                anchor_memory_id=(
+                    recall_request[
+                        "anchor_memory_id"
+                    ]
+                ),
+            )
+        except Exception:
+            pass
 
         resolved_bucket, resolved_retrieval = (
             _resolve_dependencies(
@@ -917,11 +1062,14 @@ async def request_related_recall(
 
         if resolved_bucket is None:
             return _refusal(
-                _REASON_CONTEXT_UNAVAILABLE
+                _REASON_CONTEXT_UNAVAILABLE,
+                recall_id=recall_id,
+                duplicate=request_duplicate,
             )
 
         artifact = await build_related_recall(
             recall_request=recall_request,
+            recall_id=recall_id,
             current_query=current_query,
             bucket_manager=resolved_bucket,
             retrieval_adapter=(
@@ -931,11 +1079,13 @@ async def request_related_recall(
         )
 
         if artifact.get("stored") is not True:
-            # build_related_recall() returns a refusal report
-            # (no artifact) when the anchor is unavailable.
+            # Anchor unavailable / invalid id: the Recall Request and
+            # its recall id survive, with zero loaded memories.
             return _refusal(
                 artifact.get("reason")
-                or _REASON_INVALID_REQUEST
+                or _REASON_INVALID_REQUEST,
+                recall_id=recall_id,
+                duplicate=request_duplicate,
             )
 
         # ``stored`` is an in-memory readiness marker, not part of the
@@ -945,45 +1095,51 @@ async def request_related_recall(
         artifact.pop("stored", None)
 
         path = related_recall_path(
-            artifact["conversation_id"],
-            artifact["cognitive_request_id"],
-            artifact["recall_id"],
+            cid, rid, artifact["recall_id"]
         )
 
         with LOCK:
             # Re-check under the lock: a concurrent identical recall
             # may have finished while this one awaited retrieval. The
             # earlier artifact wins deterministically.
-            existing = _find_by_fingerprint(
-                conversation_id=(
-                    artifact["conversation_id"]
-                ),
-                cognitive_request_id=(
-                    artifact[
-                        "cognitive_request_id"
-                    ]
-                ),
-                fingerprint=fingerprint,
+            previous = (
+                _read_related_recall_checked(
+                    conversation_id=cid,
+                    cognitive_request_id=rid,
+                    recall_id=recall_id,
+                    fingerprint=fingerprint,
+                )
             )
 
-            if isinstance(existing, dict):
-                return _duplicate_report(
-                    existing
-                )
+            if previous is not None:
+                artifact = previous
+            else:
+                atomic_write(path, artifact)
 
-            atomic_write(path, artifact)
-
-        # Recall result -> Usage Signal. Loaded != used: this records
-        # ``recall_requested`` and ``memory_loaded`` only. It never
-        # records ``used`` and never reinforces a memory.
+        # Loaded != used, and loaded only from what was really
+        # persisted. This never records ``used`` and never reinforces
+        # a memory.
         try:
-            memory_usage_signal.record_recall(
-                recall_artifact=artifact
+            persisted = read_related_recall(
+                conversation_id=cid,
+                cognitive_request_id=rid,
+                recall_id=recall_id,
+            )
+
+            memory_usage_signal.record_memory_loaded(
+                recall_artifact=(
+                    persisted
+                    if isinstance(persisted, dict)
+                    else artifact
+                )
             )
         except Exception:
             pass
 
-        return _recall_report(artifact)
+        return _recall_report(
+            artifact,
+            duplicate=request_duplicate,
+        )
 
     except Exception:
         # Fail-open: never 500, never block, never change a response.
@@ -996,7 +1152,11 @@ def read_related_recall(
     cognitive_request_id: str,
     recall_id: str,
 ) -> dict[str, Any] | None:
-    """Read one raw related-recall artifact (internal memory data)."""
+    """Read one raw related-recall artifact (internal memory data).
+
+    Identity-validated: a corrupt artifact is never returned as if it
+    were a valid recall result.
+    """
 
     if not is_valid_recall_id(recall_id):
         return None
@@ -1010,7 +1170,19 @@ def read_related_recall(
     except ValueError:
         return None
 
-    return read_json(path)
+    artifact = read_json(path)
+
+    if not is_valid_related_recall_artifact(
+        artifact,
+        conversation_id=conversation_id,
+        cognitive_request_id=(
+            cognitive_request_id
+        ),
+        recall_id=recall_id,
+    ):
+        return None
+
+    return artifact
 
 
 def related_recall_status(

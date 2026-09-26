@@ -9,11 +9,18 @@ from ombrebrain.context.memory_flash import (
     read_memory_flash,
 )
 from ombrebrain.context.recall_types import (
+    LOCK,
+    atomic_write,
     is_valid_cognitive_request_id,
     is_valid_conversation_id,
+    is_valid_recall_id,
     now_iso,
+    read_json,
+    recall_request_dir,
+    recall_request_path,
 )
 from ombrebrain.context.validators.freshness import (
+    is_valid_revision,
     validate_context_freshness,
 )
 
@@ -42,9 +49,19 @@ from ombrebrain.context.validators.freshness import (
 # distinguishing reason. An arbitrary memory id can never be turned
 # into a recall target just because it exists in the store.
 #
-# This module performs no retrieval, loads no memory content, calls
-# no model and writes no artifact. It reads exactly one Flash
-# artifact (the request-local one) and never mutates anything.
+# This module performs no retrieval, loads no memory content and calls
+# no model. Authorization reads exactly one Flash artifact (the
+# request-local one) and never mutates anything; the optional
+# persistence below records the AI's own Recall action as an
+# independent request event, so
+#
+#     recall_requested = YES
+#     memory_loaded    = ZERO
+#
+# is a representable state: a Recall Request that was explicitly made
+# and then could not be satisfied is still a real Recall Request.
+# Persisting the event never reinforces a memory and never writes a
+# memory source file.
 
 _VERSION = "memory-recall-request.v1"
 
@@ -60,6 +77,11 @@ _MODE = "shadow_only"
 # The only scope implemented in v1. ``full`` is deliberately NOT
 # implemented: this phase never dumps an unbounded memory set.
 _ALLOWED_SCOPE = "related"
+
+# Initial (and, in this phase, only) Recall Request status: the AI
+# asked for this recall. Whether memories can be loaded afterwards is
+# a separate fact recorded by the Usage Signal.
+_STATUS_REQUESTED = "requested"
 
 _ENV_RECALL_ENABLED = (
     "OMBRE_GATEWAY_CONTEXT_RECALL_ENABLED"
@@ -328,4 +350,385 @@ def authorize_recall_request(
         "reason": None,
         "recall_request": recall_request,
         "flash": flash,
+    }
+
+
+# ------------------------------------------------------
+# Recall Request persistence (request event, not a load)
+# ------------------------------------------------------
+
+
+def is_valid_recall_request_artifact(
+    artifact: Any,
+    *,
+    conversation_id: Any = None,
+    cognitive_request_id: Any = None,
+) -> bool:
+    """Structural identity of one persisted Recall Request event.
+
+    A path being correct never implies its content is correct, so
+    every reader re-validates the contract, the mode, the request
+    identity and the Flash revision binding instead of trusting
+    ``isinstance(dict)`` or the artifact version alone.
+    """
+
+    if not _valid_recall_request_core(
+        artifact,
+        conversation_id=conversation_id,
+        cognitive_request_id=(
+            cognitive_request_id
+        ),
+    ):
+        return False
+
+    if not is_valid_recall_id(
+        artifact.get("recall_id")
+    ):
+        return False
+
+    return bool(
+        artifact.get("request_fingerprint")
+    )
+
+
+def _valid_recall_request_core(
+    artifact: Any,
+    *,
+    conversation_id: Any = None,
+    cognitive_request_id: Any = None,
+) -> bool:
+    """The identity shared by an authorized request and its persisted
+    event: contract, mode, request identity, anchor, scope, revision."""
+
+    if not isinstance(artifact, dict):
+        return False
+
+    if (
+        artifact.get("version") != _VERSION
+        or artifact.get("mode") != _MODE
+    ):
+        return False
+
+    artifact_conversation = artifact.get(
+        "conversation_id"
+    )
+
+    artifact_request = artifact.get(
+        "cognitive_request_id"
+    )
+
+    if (
+        conversation_id is not None
+        and artifact_conversation
+        != conversation_id
+    ):
+        return False
+
+    if (
+        cognitive_request_id is not None
+        and artifact_request
+        != cognitive_request_id
+    ):
+        return False
+
+    if (
+        not is_valid_conversation_id(
+            artifact_conversation
+        )
+        or not is_valid_cognitive_request_id(
+            artifact_request
+        )
+    ):
+        return False
+
+    anchor = artifact.get("anchor_memory_id")
+
+    if (
+        not isinstance(anchor, str)
+        or not anchor.strip()
+    ):
+        return False
+
+    if (
+        artifact.get("requested_scope")
+        != _ALLOWED_SCOPE
+    ):
+        return False
+
+    return is_valid_revision(
+        artifact.get(
+            "source_flash_unified_revision"
+        )
+    )
+
+
+def find_recall_request_by_fingerprint(
+    *,
+    conversation_id: Any,
+    cognitive_request_id: Any,
+    fingerprint: Any,
+) -> dict[str, Any] | None:
+    """The persisted Recall Request for one deterministic fingerprint.
+
+    A corrupt artifact (wrong identity, wrong contract, malformed
+    fingerprint) is ignored, never returned as a duplicate success.
+    """
+
+    if (
+        not is_valid_conversation_id(conversation_id)
+        or not is_valid_cognitive_request_id(
+            cognitive_request_id
+        )
+    ):
+        return None
+
+    if (
+        not isinstance(fingerprint, str)
+        or not fingerprint
+    ):
+        return None
+
+    try:
+        directory = recall_request_dir(
+            conversation_id,
+            cognitive_request_id,
+        )
+    except ValueError:
+        return None
+
+    if not directory.is_dir():
+        return None
+
+    for path in sorted(
+        directory.glob("recall_*.json")
+    ):
+        artifact = read_json(path)
+
+        if not is_valid_recall_request_artifact(
+            artifact,
+            conversation_id=conversation_id,
+            cognitive_request_id=(
+                cognitive_request_id
+            ),
+        ):
+            continue
+
+        if (
+            artifact.get("request_fingerprint")
+            == fingerprint
+        ):
+            return artifact
+
+    return None
+
+
+def read_recall_request(
+    *,
+    conversation_id: Any,
+    cognitive_request_id: Any,
+    recall_id: Any,
+) -> dict[str, Any] | None:
+    """Read one Recall Request event, identity-validated."""
+
+    if (
+        not is_valid_conversation_id(conversation_id)
+        or not is_valid_cognitive_request_id(
+            cognitive_request_id
+        )
+        or not is_valid_recall_id(recall_id)
+    ):
+        return None
+
+    artifact = read_json(
+        recall_request_path(
+            conversation_id,
+            cognitive_request_id,
+            recall_id,
+        )
+    )
+
+    if not is_valid_recall_request_artifact(
+        artifact,
+        conversation_id=conversation_id,
+        cognitive_request_id=(
+            cognitive_request_id
+        ),
+    ):
+        return None
+
+    if artifact.get("recall_id") != recall_id:
+        return None
+
+    return artifact
+
+
+def record_recall_request(
+    *,
+    recall_request: Any,
+    recall_id: Any,
+) -> dict[str, Any]:
+    """Persist one explicit Recall Request event. Idempotent.
+
+    This is what makes ``recall_requested`` independent of whether the
+    memories can later be loaded: it is written from the authorized
+    request alone, BEFORE any anchor load is attempted, so an anchor
+    that was deleted in the meantime still leaves a real
+    ``recall_requested`` record.
+
+    The fingerprint (conversation + request + anchor + scope) decides
+    identity: a retried request with the same fingerprint reuses the
+    already-persisted recall id and never creates a second event.
+    """
+
+    if not _valid_recall_request_core(
+        recall_request
+    ):
+        return {
+            "stored": False,
+            "mode": _MODE,
+            "decision": "no_record",
+            "reason": "invalid_recall_request",
+            "duplicate": False,
+            "recall_id": None,
+            "recall_request": None,
+        }
+
+    if not is_valid_recall_id(recall_id):
+        return {
+            "stored": False,
+            "mode": _MODE,
+            "decision": "no_record",
+            "reason": "invalid_recall_id",
+            "duplicate": False,
+            "recall_id": None,
+            "recall_request": None,
+        }
+
+    conversation_id = recall_request[
+        "conversation_id"
+    ]
+
+    cognitive_request_id = recall_request[
+        "cognitive_request_id"
+    ]
+
+    fingerprint = recall_request_fingerprint(
+        conversation_id=conversation_id,
+        cognitive_request_id=(
+            cognitive_request_id
+        ),
+        anchor_memory_id=recall_request[
+            "anchor_memory_id"
+        ],
+        requested_scope=recall_request[
+            "requested_scope"
+        ],
+    )
+
+    with LOCK:
+        existing = (
+            find_recall_request_by_fingerprint(
+                conversation_id=(
+                    conversation_id
+                ),
+                cognitive_request_id=(
+                    cognitive_request_id
+                ),
+                fingerprint=fingerprint,
+            )
+        )
+
+        if isinstance(existing, dict):
+            return {
+                "stored": True,
+                "mode": _MODE,
+                "decision": "recorded",
+                "reason":
+                    "duplicate_recall_request",
+                "duplicate": True,
+                "recall_id": existing.get(
+                    "recall_id"
+                ),
+                "recall_request": existing,
+            }
+
+        artifact = {
+            "version": _VERSION,
+            "mode": _MODE,
+            "conversation_id": conversation_id,
+            "cognitive_request_id":
+                cognitive_request_id,
+            "recall_id": recall_id,
+            "anchor_memory_id":
+                recall_request[
+                    "anchor_memory_id"
+                ],
+            "source_flash_request_id":
+                recall_request.get(
+                    "source_flash_request_id"
+                ),
+            "source_flash_unified_revision":
+                recall_request.get(
+                    "source_flash_unified_revision"
+                ),
+            "requested_scope":
+                recall_request[
+                    "requested_scope"
+                ],
+            "request_fingerprint":
+                fingerprint,
+            "created_at": now_iso(),
+            "status": _STATUS_REQUESTED,
+        }
+
+        atomic_write(
+            recall_request_path(
+                conversation_id,
+                cognitive_request_id,
+                recall_id,
+            ),
+            artifact,
+        )
+
+    return {
+        "stored": True,
+        "mode": _MODE,
+        "decision": "recorded",
+        "reason": "recall_request_recorded",
+        "duplicate": False,
+        "recall_id": recall_id,
+        "recall_request": artifact,
+    }
+
+
+def recall_request_status(
+    *,
+    conversation_id: Any,
+    cognitive_request_id: Any,
+    recall_id: Any,
+) -> dict[str, Any]:
+    """Privacy-safe status of one Recall Request event."""
+
+    artifact = read_recall_request(
+        conversation_id=conversation_id,
+        cognitive_request_id=(
+            cognitive_request_id
+        ),
+        recall_id=recall_id,
+    )
+
+    if not isinstance(artifact, dict):
+        return {"exists": False}
+
+    return {
+        "exists": True,
+        "version": artifact.get("version"),
+        "mode": artifact.get("mode"),
+        "status": artifact.get("status"),
+        "requested_scope":
+            artifact.get("requested_scope"),
+        "source_flash_unified_revision":
+            artifact.get(
+                "source_flash_unified_revision"
+            ),
     }
