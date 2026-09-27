@@ -81,9 +81,11 @@ from ombrebrain.context.live_recall_transport_registry import (
     resolve_strict_tool_names,
 )
 from ombrebrain.context.live_recall_usage_attribution import (
-    attribute_live_recall_usage,
     live_recall_usage_attribution_enabled,
     render_live_recall_usage_ack,
+)
+from ombrebrain.context.live_recall_usage_lifecycle_integration import (
+    attribute_live_recall_usage_with_lifecycle,
 )
 from ombrebrain.context.live_recall_usage_surface import (
     compose_live_recall_result_with_usage_refs,
@@ -1495,17 +1497,25 @@ async def _live_memory_usage_tool(
             "UseMemory is unavailable"
         )
 
-    report = attribute_live_recall_usage(
-        conversation_id=binding["conversation_id"],
-        cognitive_request_id=(
-            binding["cognitive_request_id"]
-        ),
-        userefs=userefs,
+    result = (
+        await attribute_live_recall_usage_with_lifecycle(
+            conversation_id=binding[
+                "conversation_id"
+            ],
+            cognitive_request_id=binding[
+                "cognitive_request_id"
+            ],
+            userefs=userefs,
+        )
     )
 
     # Only the tiny, DATA-ONLY acknowledgement leaves: never a useref,
-    # a memory id, a recall id, a CID or a RID.
-    return render_live_recall_usage_ack(report)
+    # a memory id, a recall id, a CID, a RID -- and never the
+    # lifecycle report. The model can only learn whether usage
+    # attribution was recorded.
+    return render_live_recall_usage_ack(
+        result["usage"]
+    )
 
 
 # streamable-http -> the hidden Recall tool exists in the registry.
