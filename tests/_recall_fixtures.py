@@ -21,6 +21,9 @@ from ombrebrain.context.recall_request import (
 )
 from ombrebrain.context.recall_types import (
     estimate_tokens,
+    memory_usage_path,
+    recall_request_path,
+    related_recall_path,
 )
 
 
@@ -615,3 +618,240 @@ def seed_live_exposure(
             )
 
     return memrefs
+
+
+# ------------------------------------------------------
+# Explicit Memory Usage Attribution fixtures
+# ------------------------------------------------------
+
+USAGE_ATTRIBUTION_ENV = (
+    "OMBRE_GATEWAY_CONTEXT_USAGE_ATTRIBUTION"
+)
+USAGE_REFS_MAX_ENV = (
+    "OMBRE_GATEWAY_CONTEXT_USAGE_REFS_MAX"
+)
+USAGE_REFS_TOKEN_BUDGET_ENV = (
+    "OMBRE_GATEWAY_CONTEXT_USAGE_REFS_TOKEN_BUDGET"
+)
+LIFECYCLE_SHADOW_ENV = (
+    "OMBRE_GATEWAY_MEMORY_LIFECYCLE_SHADOW"
+)
+
+DEFAULT_RECALL_ID = "recall_" + "1" * 32
+
+
+def _write_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    path.write_text(
+        json.dumps(payload),
+        encoding="utf-8",
+    )
+
+
+def projected_model_result(
+    memory_ids: list[str],
+    *,
+    kinds: list[str] | None = None,
+    content_prefix: str = "recalled body ",
+) -> dict[str, Any]:
+    """A validated ``memory-live-recall-result.v1`` model projection.
+
+    Ranks are sequential from 1 and the first kind must be ``anchor``.
+    Pass a SHORT ``memory_ids`` list to model the bounded projection
+    dropping the tail: those loaded items were never output to the
+    model and therefore can never obtain a ``useref``.
+    """
+
+    memories = []
+
+    for index, memory_id in enumerate(memory_ids):
+        kind = (
+            kinds[index]
+            if kinds is not None
+            else (
+                "anchor"
+                if index == 0
+                else "related"
+            )
+        )
+
+        memories.append(
+            {
+                "rank": index + 1,
+                "kind": kind,
+                "content": content_prefix + memory_id,
+            }
+        )
+
+    return {
+        "version": "memory-live-recall-result.v1",
+        "mode": "trusted_live_bridge",
+        "status": "recalled",
+        "reason": "recall_completed",
+        "memory_count": len(memories),
+        "memories": memories,
+    }
+
+
+def seed_recall_control_plane(
+    root: str | Path,
+    memory_ids: list[str],
+    *,
+    conversation_id: str = CID,
+    cognitive_request_id: str = RID,
+    recall_id: str = DEFAULT_RECALL_ID,
+    revision: int = 5,
+    loaded_memory_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """Write a validated Recall Request + Related Recall + Usage Signal.
+
+    Nothing is recorded as ``used``: the seeded Usage Signal holds
+    exactly ``recall_requested`` + ``memory_loaded`` events, so the
+    tests can prove that only an explicit attribution moves ``used``.
+
+    ``loaded_memory_ids`` may be a SUBSET of ``memory_ids`` (an item
+    that the Recall loaded into the artifact but that the bounded
+    model projection must never be able to attribute).
+    """
+
+    anchor = memory_ids[0] if memory_ids else "mem-1"
+
+    request = recall_request(
+        anchor,
+        conversation_id=conversation_id,
+        cognitive_request_id=(
+            cognitive_request_id
+        ),
+        revision=revision,
+    )
+
+    request["recall_id"] = recall_id
+
+    request["request_fingerprint"] = (
+        recall_request_fingerprint(
+            conversation_id=conversation_id,
+            cognitive_request_id=(
+                cognitive_request_id
+            ),
+            anchor_memory_id=anchor,
+            requested_scope="related",
+        )
+    )
+
+    request["status"] = "requested"
+
+    artifact = recall_artifact(
+        memory_ids,
+        conversation_id=conversation_id,
+        cognitive_request_id=(
+            cognitive_request_id
+        ),
+        recall_id=recall_id,
+        revision=revision,
+    )
+
+    loaded = (
+        list(memory_ids)
+        if loaded_memory_ids is None
+        else list(loaded_memory_ids)
+    )
+
+    at = old_ts(0)
+
+    usage = {
+        "version": "memory-usage-signal.v1",
+        "mode": "shadow_only",
+        "conversation_id": conversation_id,
+        "cognitive_request_id":
+            cognitive_request_id,
+        "recall_id": recall_id,
+        "anchor_memory_id": anchor,
+        "requested_at": at,
+        "loaded_memory_ids": loaded,
+        "used_memory_ids": [],
+        "loaded_count": len(loaded),
+        "used_count": 0,
+        "events": [
+            {
+                "stage": "recall_requested",
+                "memory_id": anchor,
+                "at": at,
+            }
+        ]
+        + [
+            {
+                "stage": "memory_loaded",
+                "memory_id": memory_id,
+                "at": at,
+            }
+            for memory_id in loaded
+        ],
+    }
+
+    with patch.dict(
+        os.environ,
+        {"OMBRE_CONTEXT_STATE_DIR": str(root)},
+        clear=False,
+    ):
+        _write_json(
+            recall_request_path(
+                conversation_id,
+                cognitive_request_id,
+                recall_id,
+            ),
+            request,
+        )
+
+        _write_json(
+            related_recall_path(
+                conversation_id,
+                cognitive_request_id,
+                recall_id,
+            ),
+            artifact,
+        )
+
+        _write_json(
+            memory_usage_path(
+                conversation_id,
+                cognitive_request_id,
+                recall_id,
+            ),
+            usage,
+        )
+
+    return {
+        "recall_id": recall_id,
+        "anchor_memory_id": anchor,
+        "request_fingerprint":
+            request["request_fingerprint"],
+        "memory_ids": list(memory_ids),
+        "loaded_memory_ids": loaded,
+        "artifact": artifact,
+    }
+
+
+def read_usage(
+    root: str | Path,
+    *,
+    conversation_id: str = CID,
+    cognitive_request_id: str = RID,
+    recall_id: str = DEFAULT_RECALL_ID,
+) -> dict[str, Any] | None:
+    """Read one persisted Usage Signal artifact, raw."""
+
+    path = (
+        Path(root)
+        / "memory_usage"
+        / conversation_id
+        / cognitive_request_id
+        / (recall_id + ".json")
+    )
+
+    if not path.is_file():
+        return None
+
+    return json.loads(
+        path.read_text(encoding="utf-8")
+    )

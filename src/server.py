@@ -76,8 +76,21 @@ from ombrebrain.context.live_recall_transport_context import (
 )
 from ombrebrain.context.live_recall_transport_registry import (
     live_recall_transport_registration_enabled,
+    register_live_memory_usage_transport_tool,
     register_live_recall_transport_tool,
     resolve_strict_tool_names,
+)
+from ombrebrain.context.live_recall_usage_attribution import (
+    attribute_live_recall_usage,
+    live_recall_usage_attribution_enabled,
+    render_live_recall_usage_ack,
+)
+from ombrebrain.context.live_recall_usage_surface import (
+    compose_live_recall_result_with_usage_refs,
+)
+from ombrebrain.context.live_memory_transport_capability import (
+    live_memory_transport_capability_expired,
+    resolve_live_memory_transport_capability,
 )
 from utils import get_version, load_config, setup_logging
 
@@ -428,6 +441,21 @@ _LIVE_RECALL_HTTP_TRANSPORT = (
     live_recall_transport_registration_enabled(
         config.get("transport", "stdio")
     )
+)
+
+# ``UseMemory`` (explicit usage attribution) is transport-only too, and
+# is additionally gated by ``OMBRE_GATEWAY_CONTEXT_USAGE_ATTRIBUTION``:
+#
+#   - stdio                       -> never registered;
+#   - HTTP + Usage flag OFF       -> never registered;
+#   - HTTP + Usage flag ON        -> registered, still hidden from the
+#     normal MCP view and reachable only through the v2 ``obmtcap_``
+#     capability view.
+_LIVE_MEMORY_USAGE_HTTP_TRANSPORT = (
+    live_recall_transport_registration_enabled(
+        config.get("transport", "stdio")
+    )
+    and live_recall_usage_attribution_enabled()
 )
 
 # 3.4.0：信件并回主链路，`/mcp-extra` 再次退役。
@@ -1425,7 +1453,59 @@ async def _live_recall_transport_tool(
     # Only the bounded, DATA-ONLY rendered envelope leaves. Never the
     # full report, a raw artifact, a CID, a RID, a recall id or a
     # memory id.
-    return str(report.get("rendered") or "")
+    rendered = str(report.get("rendered") or "")
+
+    if not live_recall_usage_attribution_enabled():
+        # Frozen v1 behavior: the rendered Recall data, byte for byte.
+        return rendered
+
+    # Usage Attribution is additive and can never fail a Recall: on
+    # any refusal / failure the original Recall data still returns,
+    # just without usage refs.
+    if (
+        report.get("authorized") is not True
+        or report.get("decision") != "recalled"
+    ):
+        return rendered
+
+    # The opaque refs are appended AFTER the frozen Recall envelope;
+    # the Recall data itself is never modified, and with no (or no
+    # fitting) refs the original result is returned unchanged.
+    return compose_live_recall_result_with_usage_refs(
+        rendered=rendered,
+        conversation_id=binding["conversation_id"],
+        cognitive_request_id=binding[
+            "cognitive_request_id"
+        ],
+        anchor_ref=memref,
+        model_result=report.get("model_result"),
+    )
+
+
+async def _live_memory_usage_tool(
+    userefs: list[str],
+) -> str:
+    """Only call this after one or more recalled memory items materially contributed to the current reasoning or answer. Do not call merely because a memory was recalled, loaded, read, or available. Pass only the opaque useref values for the specific recalled items actually used."""
+    binding = current_live_recall_transport_binding()
+
+    if not isinstance(binding, dict):
+        # No trusted binding: there is deliberately no global
+        # useref -> request lookup.
+        raise _RecallToolError(
+            "UseMemory is unavailable"
+        )
+
+    report = attribute_live_recall_usage(
+        conversation_id=binding["conversation_id"],
+        cognitive_request_id=(
+            binding["cognitive_request_id"]
+        ),
+        userefs=userefs,
+    )
+
+    # Only the tiny, DATA-ONLY acknowledgement leaves: never a useref,
+    # a memory id, a recall id, a CID or a RID.
+    return render_live_recall_usage_ack(report)
 
 
 # streamable-http -> the hidden Recall tool exists in the registry.
@@ -1434,6 +1514,21 @@ register_live_recall_transport_tool(
     mcp,
     _live_recall_transport_tool,
     transport=config.get("transport", "stdio"),
+)
+
+
+# ``UseMemory`` follows the same transport-only rule, plus the Usage
+# Attribution rollout flag: HTTP-only AND flag ON. With the flag OFF
+# the tool does not exist in the registry at all, so no view can ever
+# list or call it -- a normal token cannot reach it either way, since
+# every normal MCP view hides it.
+register_live_memory_usage_transport_tool(
+    mcp,
+    _live_memory_usage_tool,
+    transport=config.get("transport", "stdio"),
+    usage_attribution_enabled=(
+        live_recall_usage_attribution_enabled()
+    ),
 )
 
 
@@ -1474,10 +1569,14 @@ _STRICT_TOOL_NAMES = resolve_strict_tool_names(
         "feel",
         "I",
     ),
-    # The internal transport-only Recall tool is strict-adapted ONLY
-    # when it was actually registered (streamable-http). Under stdio it
-    # does not exist, so it is never adapted and never warned about.
+    # The internal transport-only tools are strict-adapted ONLY when
+    # they were actually registered: streamable-http (and, for
+    # UseMemory, the Usage Attribution flag ON). Under stdio they do
+    # not exist, so they are never adapted and never warned about.
     transport=config.get("transport", "stdio"),
+    usage_attribution_enabled=(
+        live_recall_usage_attribution_enabled()
+    ),
 )
 
 
@@ -1658,14 +1757,32 @@ if __name__ == "__main__":
             live_recall_capability_expiry_probe=(
                 live_recall_transport_capability_expired
             ),
+            # The v2 credential is a separate kind: it may also reach
+            # UseMemory. The v1 Recall-only credential is never
+            # widened by enabling Usage Attribution.
+            live_memory_capability_resolver=(
+                resolve_live_memory_transport_capability
+            ),
+            live_memory_capability_expiry_probe=(
+                live_memory_transport_capability_expired
+            ),
         )
         if transport == "streamable-http":
+            _hidden_tools = []
+            if _LIVE_RECALL_HTTP_TRANSPORT:
+                _hidden_tools.append("Recall")
+            if _LIVE_MEMORY_USAGE_HTTP_TRANSPORT:
+                _hidden_tools.append("UseMemory")
             logger.info(
                 "MCP /mcp：16 个基础工具（单连接器），You / Them 各按独立开关动态显隐%s",
                 (
-                    "；另有 1 个隐藏内部 transport 工具 Recall"
+                    "；另有 %d 个隐藏内部 transport 工具 %s"
                     "（不出现在普通 tools/list；stdio 下完全不注册）"
-                    if _LIVE_RECALL_HTTP_TRANSPORT
+                    % (
+                        len(_hidden_tools),
+                        " / ".join(_hidden_tools),
+                    )
+                    if _hidden_tools
                     else ""
                 ),
             )

@@ -20,6 +20,7 @@ from _recall_fixtures import (
     TRANSPORT_ENV,
     TRANSPORT_MCP_URL_ENV,
     TRANSPORT_PROVIDER_ENV,
+    USAGE_ATTRIBUTION_ENV,
     anthropic_body,
     anthropic_payload,
     memory,
@@ -31,6 +32,9 @@ from ombrebrain.context import (
 )
 from ombrebrain.context.live_recall_transport_capability import (
     live_recall_transport_capability_path,
+)
+from ombrebrain.context.live_memory_transport_capability import (
+    live_memory_transport_capability_path,
 )
 from ombrebrain.context.provider_live_recall_transport import (
     is_valid_provider_live_recall_transport_receipt,
@@ -44,6 +48,10 @@ _MCP_URL = "https://example.com/mcp"
 _SERVER_NAME = "ombre-live-recall"
 
 _TOKEN_RE = re.compile(r"^obrcap_[0-9a-f]{64}$")
+
+_MEMORY_TOKEN_RE = re.compile(
+    r"^obmtcap_[0-9a-f]{64}$"
+)
 
 _MEMORIES = [memory("mem-1"), memory("mem-2")]
 
@@ -735,6 +743,344 @@ class ContextPipelineBindingTests(
         self.assertIsNone(
             selection.cognitive_request_id
         )
+
+
+class UsageAttributionTransportTests(
+    unittest.TestCase
+):
+    """``OMBRE_GATEWAY_CONTEXT_USAGE_ATTRIBUTION`` is additive.
+
+    OFF keeps the frozen v1 behavior byte-for-byte in shape: an
+    ``obrcap_`` capability and a Recall-only toolset. ON keeps the
+    SAME server / URL / beta / preserved fields and only changes the
+    capability kind (v2) plus the toolset configs (Recall +
+    UseMemory).
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+
+        self.root = self._tmp.name
+
+        self.addCleanup(self._tmp.cleanup)
+
+        seed_live_exposure(
+            self.root, list(_MEMORIES)
+        )
+
+    def _prepare(self, *, usage=None):
+        """Run ONE transport preparation on a FRESH state root.
+
+        A request can only own one persisted transport receipt, so
+        each comparison call needs its own root -- exactly like two
+        different Gateway requests.
+        """
+
+        tmp = tempfile.TemporaryDirectory()
+
+        self.addCleanup(tmp.cleanup)
+
+        root = tmp.name
+
+        seed_live_exposure(root, list(_MEMORIES))
+
+        extra = (
+            {USAGE_ATTRIBUTION_ENV: usage}
+            if usage is not None
+            else {}
+        )
+
+        with transport_env(root, **extra):
+            body, headers, report = _call(
+                anthropic_body(), {}
+            )
+
+        return body, headers, report, root
+
+    def test_flag_off_is_the_frozen_recall_only_transport(self):
+        new_body, headers, report, root = self._prepare(
+            usage="0"
+        )
+
+        self.assertTrue(report["applied"])
+
+        mutated = json.loads(new_body)
+
+        toolset = mutated["tools"][-1]
+
+        self.assertEqual(
+            toolset["configs"],
+            {"Recall": {"enabled": True}},
+        )
+        self.assertEqual(
+            toolset["default_config"],
+            {"enabled": False},
+        )
+
+        token = mutated["mcp_servers"][0][
+            "authorization_token"
+        ]
+
+        self.assertRegex(token, _TOKEN_RE)
+
+        self.assertNotIn(
+            "UseMemory", new_body.decode("utf-8")
+        )
+
+        # No v2 capability artifact was ever minted.
+        sha = hashlib.sha256(
+            token.encode("utf-8")
+        ).hexdigest()
+
+        with state(root):
+            self.assertFalse(
+                live_memory_transport_capability_path(
+                    sha
+                ).exists()
+            )
+
+        self.assertEqual(
+            headers["anthropic-beta"],
+            "mcp-client-2025-11-20",
+        )
+
+    def test_flag_off_with_no_env_is_byte_identical_to_off(self):
+        off_body, off_headers, off_report, _root = (
+            self._prepare(usage="0")
+        )
+
+        unset_body, unset_headers, unset_report, _root2 = (
+            self._prepare()
+        )
+
+        off = json.loads(off_body)
+        unset = json.loads(unset_body)
+
+        off["mcp_servers"][0][
+            "authorization_token"
+        ] = "token"
+
+        unset["mcp_servers"][0][
+            "authorization_token"
+        ] = "token"
+
+        self.assertEqual(off, unset)
+        self.assertEqual(off_headers, unset_headers)
+        self.assertEqual(
+            off_report["reason"],
+            unset_report["reason"],
+        )
+
+    def test_flag_on_only_adds_use_memory(self):
+        off_body, _off_headers, _off_report, _root = (
+            self._prepare(usage="0")
+        )
+
+        on_body, on_headers, on_report, on_root = (
+            self._prepare(usage="1")
+        )
+
+        self.assertTrue(on_report["applied"])
+        self.assertEqual(
+            on_report["tools_delta"], 1
+        )
+
+        off = json.loads(off_body)
+
+        on = json.loads(on_body)
+
+        # Same keys, same preserved fields.
+        self.assertEqual(
+            set(on.keys()), set(off.keys())
+        )
+
+        for key in (
+            "messages",
+            "system",
+            "model",
+            "stream",
+        ):
+            self.assertEqual(
+                on.get(key), off.get(key), key
+            )
+
+        # Existing entries untouched, one appended toolset / server.
+        self.assertEqual(
+            on["tools"][: len(off["tools"]) - 1],
+            off["tools"][: len(off["tools"]) - 1],
+        )
+        self.assertEqual(len(on["tools"]), 2)
+        self.assertEqual(len(on["mcp_servers"]), 1)
+
+        toolset = on["tools"][-1]
+
+        self.assertEqual(
+            toolset["type"], "mcp_toolset"
+        )
+        self.assertEqual(
+            toolset["mcp_server_name"], _SERVER_NAME
+        )
+        self.assertEqual(
+            toolset["default_config"],
+            {"enabled": False},
+        )
+        self.assertEqual(
+            toolset["configs"],
+            {
+                "Recall": {"enabled": True},
+                "UseMemory": {"enabled": True},
+            },
+        )
+
+        server = on["mcp_servers"][0]
+
+        self.assertEqual(server["type"], "url")
+        self.assertEqual(server["url"], _MCP_URL)
+        self.assertEqual(server["name"], _SERVER_NAME)
+
+        token = server["authorization_token"]
+
+        self.assertRegex(token, _MEMORY_TOKEN_RE)
+
+        # The v2 credential resolves to the trusted binding, and only
+        # its SHA256 is on disk.
+        sha = hashlib.sha256(
+            token.encode("utf-8")
+        ).hexdigest()
+
+        with state(on_root):
+            artifact_path = (
+                live_memory_transport_capability_path(
+                    sha
+                )
+            )
+
+            self.assertTrue(artifact_path.is_file())
+
+            artifact = json.loads(
+                artifact_path.read_text(
+                    encoding="utf-8"
+                )
+            )
+
+            self.assertEqual(
+                artifact["allowed_tools"],
+                ["Recall", "UseMemory"],
+            )
+
+            self.assertFalse(
+                live_recall_transport_capability_path(
+                    sha
+                ).exists()
+            )
+
+        with state(on_root):
+            receipt_path = (
+                provider_live_recall_transport_path(
+                    CID, RID
+                )
+            )
+
+            receipt = json.loads(
+                receipt_path.read_text(
+                    encoding="utf-8"
+                )
+            )
+
+            receipt_text = receipt_path.read_text(
+                encoding="utf-8"
+            )
+
+        self.assertTrue(
+            is_valid_provider_live_recall_transport_receipt(
+                receipt,
+                conversation_id=CID,
+                cognitive_request_id=RID,
+                selected_body_sha256=hashlib.sha256(
+                    on_body
+                ).hexdigest(),
+            )
+        )
+
+        # The receipt (and the report) still never carries the raw
+        # token, a memref or the MCP URL.
+        for text in (
+            receipt_text,
+            json.dumps(on_report),
+        ):
+            self.assertNotIn(token, text)
+            self.assertNotIn("obmtcap_", text)
+            self.assertNotIn("obrcap_", text)
+            self.assertNotIn(_MCP_URL, text)
+            self.assertNotIn("memref_", text)
+
+        self.assertIn(token, on_body.decode("utf-8"))
+
+        self.assertEqual(
+            on_headers["anthropic-beta"],
+            "mcp-client-2025-11-20",
+        )
+
+    def test_flag_on_does_not_relax_the_prerequisites(self):
+        body = anthropic_body()
+
+        for field in ("bridge", "recall", "live"):
+            with transport_env(
+                self.root,
+                **{field: "0"},
+                **{USAGE_ATTRIBUTION_ENV: "1"},
+            ):
+                new_body, _headers, report = _call(
+                    body, {}
+                )
+
+            self.assertEqual(new_body, body, field)
+            self.assertEqual(
+                report["reason"],
+                "prerequisites_disabled",
+                field,
+            )
+
+    def test_flag_on_keeps_the_collision_guard(self):
+        payload = anthropic_payload()
+
+        payload["mcp_servers"] = [
+            {
+                "type": "url",
+                "url": "https://x/mcp",
+                "name": _SERVER_NAME,
+            }
+        ]
+
+        body = json.dumps(payload).encode("utf-8")
+
+        with transport_env(
+            self.root,
+            **{USAGE_ATTRIBUTION_ENV: "1"},
+        ):
+            new_body, _headers, report = _call(
+                body, {}
+            )
+
+        self.assertEqual(new_body, body)
+        self.assertEqual(
+            report["reason"],
+            "mcp_server_name_collision",
+        )
+
+    def test_flag_on_never_changes_the_provider_or_the_url(self):
+        _body, _headers, report, _root = self._prepare(
+            usage="1"
+        )
+
+        self.assertEqual(
+            report["provider"],
+            "anthropic_mcp_connector",
+        )
+        self.assertEqual(
+            report["mcp_servers_delta"], 1
+        )
+        self.assertTrue(report["receipt_valid"])
 
 
 if __name__ == "__main__":
