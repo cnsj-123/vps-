@@ -21,6 +21,7 @@ from _recall_fixtures import (
     DEFAULT_RECALL_ID,
     LIFECYCLE_SHADOW_ENV,
     RID,
+    RID_B,
     USAGE_ATTRIBUTION_ENV,
     USAGE_LIFECYCLE_INTEGRATION_ENV,
     memory,
@@ -33,7 +34,10 @@ from _recall_fixtures import (
 from ombrebrain.context import (
     live_recall_usage_lifecycle_integration as integration,
 )
-from ombrebrain.context import memory_reinforcement
+from ombrebrain.context import (
+    memory_usage_signal,
+    memory_reinforcement,
+)
 from ombrebrain.context.live_recall_usage_attribution import (
     render_live_recall_usage_ack,
 )
@@ -41,6 +45,11 @@ from ombrebrain.context.live_recall_usage_lifecycle_integration import (
     SAFE_LIFECYCLE_INTEGRATION_REASONS,
     attribute_live_recall_usage_with_lifecycle,
     live_recall_usage_lifecycle_integration_enabled,
+)
+from ombrebrain.context.live_recall_usage_ref_receipt import (
+    read_usage_ref_receipt,
+    usage_ref_receipt_path,
+    useref_sha256,
 )
 from ombrebrain.context.live_recall_usage_surface import (
     build_live_recall_usage_surface,
@@ -1015,6 +1024,400 @@ class ReportAndAckTests(LifecycleIntegrationCase):
                 )
 
 
+def _record_usage_spy(calls):
+    """Patch ``record_usage`` while capturing its calls."""
+
+    original = memory_usage_signal.record_usage
+
+    def spy(**kwargs):
+        calls.append(kwargs)
+        return original(**kwargs)
+
+    return patch.object(
+        memory_usage_signal, "record_usage", spy
+    )
+
+
+class UserefBindingIntegrityTests(
+    LifecycleIntegrationCase,
+):
+    """The opaque useref ORIGINAL binding is receipt-anchored.
+
+    A Usage Surface can never be its own authority: swapping two
+    legal userefs, deleting a receipt, corrupting a receipt or
+    editing a receipt must all refuse -- and must produce NO used
+    event and NO lifecycle reinforcement.
+    """
+
+    def _all_on(self):
+        return {
+            USAGE_ATTRIBUTION_ENV: "1",
+            USAGE_LIFECYCLE_INTEGRATION_ENV: "1",
+            LIFECYCLE_SHADOW_ENV: "1",
+        }
+
+    def _surface_file(self):
+        return live_recall_usage_surface_path(CID, RID)
+
+    def _load_surface(self):
+        return json.loads(
+            self._surface_file().read_text(
+                encoding="utf-8"
+            )
+        )
+
+    def _write_surface(self, artifact):
+        self._surface_file().write_text(
+            json.dumps(artifact), encoding="utf-8"
+        )
+
+    def _receipt_path(self, useref):
+        return usage_ref_receipt_path(
+            CID, RID, useref_sha256(useref)
+        )
+
+    def _swap_surface_userefs(self):
+        artifact = self._load_surface()
+
+        mappings = artifact["mappings"]
+
+        mappings[0]["useref"], mappings[1]["useref"] = (
+            mappings[1]["useref"],
+            mappings[0]["useref"],
+        )
+
+        self._write_surface(artifact)
+
+    def _tamper_receipt(self, useref, **changes):
+        path = self._receipt_path(useref)
+
+        artifact = json.loads(
+            path.read_text(encoding="utf-8")
+        )
+
+        artifact.update(changes)
+
+        path.write_text(
+            json.dumps(artifact), encoding="utf-8"
+        )
+
+    async def test_surface_useref_swap_is_refused(self):
+        self._swap_surface_userefs()
+
+        calls = []
+
+        with _record_usage_spy(calls):
+            result = await self._call(
+                [self.refs[1]], **self._all_on()
+            )
+
+        self.assertFalse(result["usage"]["recorded"])
+        self.assertEqual(
+            result["usage"]["reason"],
+            "usage_ref_binding_invalid",
+        )
+        self.assertEqual(calls, [])
+
+    async def test_surface_useref_swap_records_no_used(self):
+        self._swap_surface_userefs()
+
+        await self._call(
+            [self.refs[1]], **self._all_on()
+        )
+
+        usage = read_usage(self.root)
+
+        self.assertEqual(usage["used_count"], 0)
+        self.assertEqual(usage["used_memory_ids"], [])
+        self.assertEqual(
+            [
+                event
+                for event in usage["events"]
+                if event["stage"] == "used"
+            ],
+            [],
+        )
+
+    async def test_surface_useref_swap_creates_no_lifecycle(self):
+        self._swap_surface_userefs()
+
+        result = await self._call(
+            [self.refs[1]], **self._all_on()
+        )
+
+        self.assertFalse(result["usage"]["recorded"])
+        self.assertFalse(
+            result["lifecycle"]["observed"]
+        )
+        self.assertEqual(
+            result["lifecycle"]["new_event_count"], 0
+        )
+
+        self.assertEqual(
+            read_lifecycle_events("mem-1")["events"], []
+        )
+        self.assertFalse(_has_lifecycle_dirs(self.root))
+
+    async def test_missing_issuance_receipt_is_refused(self):
+        path = self._receipt_path(self.refs[1])
+
+        self.assertTrue(path.is_file())
+
+        path.unlink()
+
+        calls = []
+
+        with _record_usage_spy(calls):
+            result = await self._call(
+                [self.refs[1]], **self._all_on()
+            )
+
+        self.assertFalse(result["usage"]["recorded"])
+        self.assertEqual(
+            result["usage"]["reason"],
+            "usage_ref_binding_invalid",
+        )
+        self.assertEqual(calls, [])
+        self.assertEqual(
+            read_usage(self.root)["used_count"], 0
+        )
+        self.assertFalse(_has_lifecycle_dirs(self.root))
+
+    async def test_corrupt_issuance_receipt_is_refused(self):
+        self._receipt_path(self.refs[1]).write_text(
+            "{not-json", encoding="utf-8"
+        )
+
+        result = await self._call(
+            [self.refs[1]], **self._all_on()
+        )
+
+        self.assertFalse(result["usage"]["recorded"])
+        self.assertEqual(
+            result["usage"]["reason"],
+            "usage_ref_binding_invalid",
+        )
+        self.assertEqual(
+            read_usage(self.root)["used_count"], 0
+        )
+
+    async def test_receipt_filename_hash_mismatch_is_refused(
+        self,
+    ):
+        # Copy the receipt of useref_A onto the path of useref_B.
+        source = self._receipt_path(self.refs[1])
+
+        target = self._receipt_path(self.refs[2])
+
+        target.write_text(
+            source.read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+
+        self.assertIsNone(
+            read_usage_ref_receipt(
+                conversation_id=CID,
+                cognitive_request_id=RID,
+                ref_sha256=useref_sha256(self.refs[2]),
+            )
+        )
+
+        result = await self._call(
+            [self.refs[2]], **self._all_on()
+        )
+
+        self.assertFalse(result["usage"]["recorded"])
+        self.assertEqual(
+            result["usage"]["reason"],
+            "usage_ref_binding_invalid",
+        )
+        self.assertEqual(
+            read_usage(self.root)["used_count"], 0
+        )
+
+    async def test_cross_request_receipt_is_refused(self):
+        source = self._receipt_path(self.refs[1])
+
+        other = usage_ref_receipt_path(
+            CID, RID_B, useref_sha256(self.refs[1])
+        )
+
+        other.parent.mkdir(
+            parents=True, exist_ok=True
+        )
+
+        other.write_text(
+            source.read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+
+        # The artifact still names request A, so it can never resolve
+        # under request B.
+        self.assertIsNone(
+            read_usage_ref_receipt(
+                conversation_id=CID,
+                cognitive_request_id=RID_B,
+                ref_sha256=useref_sha256(
+                    self.refs[1]
+                ),
+            )
+        )
+
+    async def test_receipt_memory_id_tamper_is_refused(self):
+        self._tamper_receipt(
+            self.refs[1], memory_id="mem-2"
+        )
+
+        calls = []
+
+        with _record_usage_spy(calls):
+            result = await self._call(
+                [self.refs[1]], **self._all_on()
+            )
+
+        self.assertFalse(result["usage"]["recorded"])
+        self.assertEqual(
+            result["usage"]["reason"],
+            "usage_ref_binding_invalid",
+        )
+        self.assertEqual(calls, [])
+        self.assertFalse(_has_lifecycle_dirs(self.root))
+
+    async def test_receipt_rank_tamper_is_refused(self):
+        self._tamper_receipt(self.refs[1], rank=2)
+
+        result = await self._call(
+            [self.refs[1]], **self._all_on()
+        )
+
+        self.assertFalse(result["usage"]["recorded"])
+        self.assertEqual(
+            result["usage"]["reason"],
+            "usage_ref_binding_invalid",
+        )
+
+    async def test_receipt_kind_tamper_is_refused(self):
+        self._tamper_receipt(
+            self.refs[1], kind="related"
+        )
+
+        result = await self._call(
+            [self.refs[1]], **self._all_on()
+        )
+
+        self.assertFalse(result["usage"]["recorded"])
+        self.assertEqual(
+            result["usage"]["reason"],
+            "usage_ref_binding_invalid",
+        )
+
+    async def test_receipt_recall_id_tamper_is_refused(self):
+        self._tamper_receipt(
+            self.refs[1],
+            recall_id="recall_" + "2" * 32,
+        )
+
+        result = await self._call(
+            [self.refs[1]], **self._all_on()
+        )
+
+        self.assertFalse(result["usage"]["recorded"])
+        self.assertEqual(
+            result["usage"]["reason"],
+            "usage_ref_binding_invalid",
+        )
+
+    async def test_duplicate_recall_reuses_same_useref_and_receipt(
+        self,
+    ):
+        first_refs = {
+            ref["rank"]: ref["useref"]
+            for ref in self.chain["surface"][
+                "usage_refs"
+            ]
+        }
+
+        second = build_live_recall_usage_surface(
+            conversation_id=CID,
+            cognitive_request_id=RID,
+            anchor_ref=self.chain["memrefs"][0],
+            model_result=projected_model_result(
+                _LOADED_IDS
+            ),
+        )
+
+        self.assertTrue(second["stored"])
+        self.assertEqual(second["reused_count"], 3)
+
+        for ref in second["usage_refs"]:
+            self.assertEqual(
+                ref["useref"],
+                first_refs[ref["rank"]],
+            )
+
+        for useref in first_refs.values():
+            self.assertTrue(
+                self._receipt_path(useref).is_file()
+            )
+
+    async def test_persistence_failure_never_exposes_useref(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as root:
+            with patch.dict(
+                os.environ,
+                {
+                    "OMBRE_CONTEXT_STATE_DIR": root,
+                    USAGE_ATTRIBUTION_ENV: "1",
+                    USAGE_LIFECYCLE_INTEGRATION_ENV: "0",
+                    LIFECYCLE_SHADOW_ENV: "0",
+                },
+                clear=False,
+            ):
+                memrefs = seed_live_exposure(
+                    root,
+                    [
+                        memory("mem-1"),
+                        memory("mem-2"),
+                    ],
+                )
+
+                seed_recall_control_plane(
+                    root,
+                    list(_LOADED_IDS),
+                )
+
+                with patch(
+                    "ombrebrain.context."
+                    "live_recall_usage_ref_receipt."
+                    "atomic_write",
+                    side_effect=OSError("boom"),
+                ):
+                    report = (
+                        build_live_recall_usage_surface(
+                            conversation_id=CID,
+                            cognitive_request_id=RID,
+                            anchor_ref=memrefs[0],
+                            model_result=(
+                                projected_model_result(
+                                    list(_LOADED_IDS)
+                                )
+                            ),
+                        )
+                    )
+
+                surface_exists = (
+                    live_recall_usage_surface_path(
+                        CID, RID
+                    ).exists()
+                )
+
+        self.assertFalse(report["stored"])
+        self.assertEqual(report["usage_refs"], [])
+        self.assertEqual(report["mapped_count"], 0)
+        self.assertFalse(surface_exists)
+
+
 class StaticForbiddenChecksTests(unittest.TestCase):
     """Static guards on the new integration module and its wiring."""
 
@@ -1024,6 +1427,14 @@ class StaticForbiddenChecksTests(unittest.TestCase):
         / "ombrebrain"
         / "context"
         / "live_recall_usage_lifecycle_integration.py"
+    )
+
+    _RECEIPT_MODULE = (
+        _REPO_ROOT
+        / "src"
+        / "ombrebrain"
+        / "context"
+        / "live_recall_usage_ref_receipt.py"
     )
 
     _FORBIDDEN_ATTRS = frozenset(
@@ -1050,65 +1461,96 @@ class StaticForbiddenChecksTests(unittest.TestCase):
         "retrieval",
     )
 
-    def _tree(self):
+    def _modules(self):
+        return (self._MODULE, self._RECEIPT_MODULE)
+
+    def _tree(self, path):
         return ast.parse(
-            self._MODULE.read_text(encoding="utf-8")
+            path.read_text(encoding="utf-8")
         )
 
     def test_module_exists(self):
-        self.assertTrue(self._MODULE.is_file())
+        for path in self._modules():
+            with self.subTest(path=str(path)):
+                self.assertTrue(path.is_file())
 
     def test_no_canonical_mutation_or_scan(self):
-        tree = self._tree()
+        for path in self._modules():
+            tree = self._tree(path)
 
-        for node in ast.walk(tree):
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(
-                    node.func, ast.Attribute
-                )
-            ):
-                self.assertNotIn(
-                    node.func.attr.lower(),
-                    self._FORBIDDEN_ATTRS,
-                )
+            with self.subTest(path=str(path)):
+                for node in ast.walk(tree):
+                    if (
+                        isinstance(node, ast.Call)
+                        and isinstance(
+                            node.func, ast.Attribute
+                        )
+                    ):
+                        self.assertNotIn(
+                            node.func.attr.lower(),
+                            self._FORBIDDEN_ATTRS,
+                        )
 
     def test_no_inference_or_retrieval_coupling(self):
-        tree = self._tree()
+        for path in self._modules():
+            tree = self._tree(path)
 
-        identifiers: set[str] = set()
+            identifiers: set[str] = set()
 
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Name):
-                identifiers.add(node.id.lower())
-            elif isinstance(node, ast.Attribute):
-                identifiers.add(node.attr.lower())
-            elif isinstance(node, ast.alias):
-                identifiers.add(node.name.lower())
-            elif (
-                isinstance(node, ast.ImportFrom)
-                and isinstance(node.module, str)
-            ):
-                identifiers.add(node.module.lower())
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Name):
+                    identifiers.add(node.id.lower())
+                elif isinstance(node, ast.Attribute):
+                    identifiers.add(node.attr.lower())
+                elif isinstance(node, ast.alias):
+                    identifiers.add(node.name.lower())
+                elif (
+                    isinstance(node, ast.ImportFrom)
+                    and isinstance(node.module, str)
+                ):
+                    identifiers.add(node.module.lower())
 
-        for forbidden in self._FORBIDDEN_SUBSTRINGS:
-            with self.subTest(forbidden=forbidden):
-                self.assertFalse(
-                    {
-                        identifier
-                        for identifier in identifiers
-                        if forbidden in identifier
-                    },
-                    forbidden,
-                )
+            for forbidden in self._FORBIDDEN_SUBSTRINGS:
+                with self.subTest(
+                    path=str(path),
+                    forbidden=forbidden,
+                ):
+                    self.assertFalse(
+                        {
+                            identifier
+                            for identifier in identifiers
+                            if forbidden in identifier
+                        },
+                        forbidden,
+                    )
 
     def test_no_glob_scan(self):
-        source = self._MODULE.read_text(
-            encoding="utf-8"
-        )
+        for path in self._modules():
+            source = path.read_text(encoding="utf-8")
 
-        self.assertNotIn(".glob(", source)
-        self.assertNotIn(".rglob(", source)
+            with self.subTest(path=str(path)):
+                self.assertNotIn(".glob(", source)
+                self.assertNotIn(".rglob(", source)
+
+    def test_receipt_path_uses_sha256_and_no_raw_useref(
+        self,
+    ):
+        receipt = (
+            _REPO_ROOT
+            / "src"
+            / "ombrebrain"
+            / "context"
+            / "live_recall_usage_ref_receipt.py"
+        ).read_text(encoding="utf-8")
+
+        # The raw handle is never a path component and is never
+        # stored: the file name is the digest of the handle.
+        self.assertIn(
+            "useref.encode(", receipt
+        )
+        self.assertNotIn(
+            '"useref":', receipt
+        )
 
     def test_server_wires_the_coordinator_and_returns_only_usage(
         self,

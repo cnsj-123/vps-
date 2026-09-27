@@ -15,6 +15,13 @@ from ombrebrain.context.live_recall_authorization import (
 from ombrebrain.context.memory_recall_surface import (
     resolve_recall_ref,
 )
+from ombrebrain.context.live_recall_usage_ref_receipt import (
+    build_usage_ref_receipt,
+    persist_usage_ref_receipt,
+    read_usage_ref_receipt,
+    receipt_matches_binding,
+    useref_sha256,
+)
 from ombrebrain.context.memory_usage_signal import (
     read_memory_usage,
 )
@@ -178,6 +185,9 @@ _REASON_PERSISTENCE_FAILED = (
     "usage_surface_persistence_failed"
 )
 _REASON_UNAVAILABLE = "usage_surface_unavailable"
+_REASON_REF_BINDING_INVALID = (
+    "usage_ref_binding_invalid"
+)
 
 SAFE_BUILD_REASONS = frozenset(
     {
@@ -197,6 +207,32 @@ SAFE_BUILD_REASONS = frozenset(
         _REASON_ARTIFACT_INVALID,
         _REASON_PERSISTENCE_FAILED,
         _REASON_UNAVAILABLE,
+        _REASON_REF_BINDING_INVALID,
+    }
+)
+
+# The SHARED useref resolver reasons. Usage Attribution and the Usage
+# -> Lifecycle integration both resolve a model handle through the
+# SAME authority -- exact issuance receipt -> current surface mapping
+# agreement -> real persisted provenance -- so the two implementations
+# can never drift apart.
+_REASON_REFS_RESOLVED = "usage_refs_resolved"
+_REASON_REFS_INVALID = "invalid_usage_refs"
+_REASON_REFS_TOO_MANY = "too_many_refs"
+_REASON_REFS_MIXED = "mixed_recall_refs"
+_REASON_REFS_PROVENANCE_INVALID = (
+    "usage_mapping_provenance_invalid"
+)
+
+SAFE_RESOLVE_REASONS = frozenset(
+    {
+        _REASON_REFS_RESOLVED,
+        _REASON_REFS_INVALID,
+        _REASON_REFS_TOO_MANY,
+        _REASON_UNAVAILABLE,
+        _REASON_REF_BINDING_INVALID,
+        _REASON_REFS_PROVENANCE_INVALID,
+        _REASON_REFS_MIXED,
     }
 )
 
@@ -860,6 +896,265 @@ def validate_live_recall_usage_surface_provenance(
 
 
 # ------------------------------------------------------
+# Receipt-bound useref resolution (the shared authority)
+# ------------------------------------------------------
+
+
+def _mapping_binding(
+    mapping: Any,
+) -> dict[str, Any] | None:
+    """The comparable binding of ONE surface mapping, or None."""
+
+    if not _is_valid_mapping_shape(mapping):
+        return None
+
+    return {
+        "recall_id": mapping["recall_id"],
+        "memory_id": mapping["memory_id"],
+        "rank": mapping["rank"],
+        "kind": mapping["kind"],
+        "source_request_fingerprint": mapping[
+            "source_request_fingerprint"
+        ],
+        "source_model_result_sha256": mapping[
+            "source_model_result_sha256"
+        ],
+    }
+
+
+def _mapping_has_matching_receipt(
+    *,
+    conversation_id: Any,
+    cognitive_request_id: Any,
+    mapping: Any,
+) -> bool:
+    """Is there a valid, EXACTLY matching issuance receipt?
+
+    The receipt is read by its exact ``sha256(useref)`` path -- never
+    a scan -- and must agree with the mapping on every binding field.
+    A missing, corrupt, copied or edited receipt means False.
+    """
+
+    binding = _mapping_binding(mapping)
+
+    if binding is None:
+        return False
+
+    ref_sha = useref_sha256(mapping["useref"])
+
+    if not is_valid_fingerprint(ref_sha):
+        return False
+
+    receipt = read_usage_ref_receipt(
+        conversation_id=conversation_id,
+        cognitive_request_id=(
+            cognitive_request_id
+        ),
+        ref_sha256=ref_sha,
+    )
+
+    if not isinstance(receipt, dict):
+        return False
+
+    return receipt_matches_binding(receipt, binding)
+
+
+def _persist_mapping_receipt(
+    *,
+    conversation_id: Any,
+    cognitive_request_id: Any,
+    mapping: Any,
+) -> bool:
+    """Persist, then re-read, the issuance receipt of one mapping.
+
+    Persistence-before-exposure: the receipt is written first and only
+    a re-read that proves it really exists and matches is accepted.
+    """
+
+    binding = _mapping_binding(mapping)
+
+    if binding is None:
+        return False
+
+    ref_sha = useref_sha256(mapping["useref"])
+
+    if not is_valid_fingerprint(ref_sha):
+        return False
+
+    receipt = build_usage_ref_receipt(
+        conversation_id=conversation_id,
+        cognitive_request_id=(
+            cognitive_request_id
+        ),
+        ref_sha256=ref_sha,
+        recall_id=binding["recall_id"],
+        memory_id=binding["memory_id"],
+        rank=binding["rank"],
+        kind=binding["kind"],
+        source_request_fingerprint=binding[
+            "source_request_fingerprint"
+        ],
+        source_model_result_sha256=binding[
+            "source_model_result_sha256"
+        ],
+    )
+
+    try:
+        outcome = persist_usage_ref_receipt(receipt)
+    except Exception:
+        return False
+
+    if not outcome.get("stored"):
+        return False
+
+    return _mapping_has_matching_receipt(
+        conversation_id=conversation_id,
+        cognitive_request_id=(
+            cognitive_request_id
+        ),
+        mapping=mapping,
+    )
+
+
+def resolve_verified_live_recall_usage_refs(
+    *,
+    conversation_id: Any,
+    cognitive_request_id: Any,
+    userefs: Any,
+) -> dict[str, Any]:
+    """The ONE trusted way a model ``useref`` becomes a real mapping.
+
+    Usage Attribution and the Usage -> Lifecycle integration both call
+    this, so a handle resolves through the SAME authority:
+
+        format -> exact current surface
+          -> real persisted provenance (fingerprint + projection
+             RECOMPUTED from the real artifacts)
+            -> independent write-once issuance receipt agreement
+
+    A surface-only tamper (a swapped ``useref`` included) is refused:
+    the surface can never be its own authority for the ORIGINAL
+    binding. Returns a privacy-safe report whose ``mappings`` are the
+    verified surface mappings in surface order, plus the single
+    ``recall_id`` they agree on.
+    """
+
+    requested = (
+        len(userefs)
+        if isinstance(userefs, (list, tuple))
+        else 0
+    )
+
+    report: dict[str, Any] = {
+        "version": _VERSION,
+        "mode": _MODE,
+        "ok": False,
+        "reason": _REASON_REFS_INVALID,
+        "requested_ref_count": requested,
+        "resolved_ref_count": 0,
+        "recall_ids": (),
+        "recall_id": None,
+        "mappings": (),
+    }
+
+    if not isinstance(userefs, (list, tuple)):
+        return report
+
+    if requested == 0:
+        return report
+
+    if requested > resolve_usage_refs_max_refs():
+        report["reason"] = _REASON_REFS_TOO_MANY
+        return report
+
+    wanted: set[str] = set()
+
+    for value in userefs:
+        if not is_valid_useref(value):
+            return report
+
+        wanted.add(value)
+
+    surface = read_live_recall_usage_surface(
+        conversation_id=conversation_id,
+        cognitive_request_id=(
+            cognitive_request_id
+        ),
+    )
+
+    if not isinstance(surface, dict):
+        report["reason"] = _REASON_UNAVAILABLE
+        return report
+
+    mappings = surface.get("mappings") or []
+
+    # Surface order, never argument order; a ref that is not in THIS
+    # request's exact surface is simply invalid.
+    selected = [
+        mapping
+        for mapping in mappings
+        if isinstance(mapping, dict)
+        and mapping.get("useref") in wanted
+    ]
+
+    if len(
+        {mapping.get("useref") for mapping in selected}
+    ) != len(wanted):
+        return report
+
+    # The REAL persisted provenance first: a surface-only tamper is
+    # still reported exactly as before.
+    if not validate_live_recall_usage_surface_provenance(
+        conversation_id=conversation_id,
+        cognitive_request_id=(
+            cognitive_request_id
+        ),
+        artifact=surface,
+        mappings=selected,
+    ):
+        report["reason"] = (
+            _REASON_REFS_PROVENANCE_INVALID
+        )
+        return report
+
+    # Then the independent, write-once issuance receipt must agree
+    # EXACTLY with the current surface mapping.
+    for mapping in selected:
+        if not _mapping_has_matching_receipt(
+            conversation_id=conversation_id,
+            cognitive_request_id=(
+                cognitive_request_id
+            ),
+            mapping=mapping,
+        ):
+            report["reason"] = (
+                _REASON_REF_BINDING_INVALID
+            )
+            return report
+
+    ordered_recall_ids: list[Any] = []
+
+    for mapping in selected:
+        recall_id = mapping.get("recall_id")
+
+        if recall_id not in ordered_recall_ids:
+            ordered_recall_ids.append(recall_id)
+
+    if len(ordered_recall_ids) != 1:
+        report["reason"] = _REASON_REFS_MIXED
+        return report
+
+    report["ok"] = True
+    report["reason"] = _REASON_REFS_RESOLVED
+    report["resolved_ref_count"] = len(selected)
+    report["recall_ids"] = tuple(ordered_recall_ids)
+    report["recall_id"] = ordered_recall_ids[0]
+    report["mappings"] = tuple(selected)
+
+    return report
+
+
+# ------------------------------------------------------
 # Builder
 # ------------------------------------------------------
 
@@ -1210,7 +1505,22 @@ def build_live_recall_usage_surface(
 
                 if isinstance(found, dict):
                     # A duplicate Recall reuses the original useref, so
-                    # a retry yields identical attribution refs.
+                    # a retry yields identical attribution refs -- but
+                    # ONLY while the independent issuance receipt still
+                    # exists and exactly matches. A missing / corrupt /
+                    # conflicting receipt is never re-minted or
+                    # repaired: the whole build fails closed.
+                    if not _mapping_has_matching_receipt(
+                        conversation_id=conversation_id,
+                        cognitive_request_id=(
+                            cognitive_request_id
+                        ),
+                        mapping=found,
+                    ):
+                        return _no_surface(
+                            _REASON_REF_BINDING_INVALID
+                        )
+
                     reused += 1
                     target["useref"] = found["useref"]
                     continue
@@ -1232,6 +1542,20 @@ def build_live_recall_usage_surface(
                         source_sha
                     ),
                 }
+
+                # Persistence-before-exposure: the write-once issuance
+                # receipt is persisted (and re-read) BEFORE the ref can
+                # ever be added to the surface or returned.
+                if not _persist_mapping_receipt(
+                    conversation_id=conversation_id,
+                    cognitive_request_id=(
+                        cognitive_request_id
+                    ),
+                    mapping=mapping,
+                ):
+                    return _no_surface(
+                        _REASON_REF_BINDING_INVALID
+                    )
 
                 by_key[key] = mapping
 
@@ -1317,6 +1641,20 @@ def build_live_recall_usage_surface(
                 ):
                     return _no_surface(
                         _REASON_PERSISTENCE_FAILED
+                    )
+
+                # The persisted mapping's independent issuance receipt
+                # must still exist and agree exactly before ANY ref is
+                # exposed to the model.
+                if not _mapping_has_matching_receipt(
+                    conversation_id=conversation_id,
+                    cognitive_request_id=(
+                        cognitive_request_id
+                    ),
+                    mapping=persisted_mapping,
+                ):
+                    return _no_surface(
+                        _REASON_REF_BINDING_INVALID
                     )
 
                 usage_refs.append(
@@ -1491,6 +1829,7 @@ def compose_live_recall_result_with_usage_refs(
 
 __all__ = [
     "SAFE_BUILD_REASONS",
+    "SAFE_RESOLVE_REASONS",
     "append_live_recall_usage_refs",
     "build_live_recall_usage_surface",
     "compose_live_recall_result_with_usage_refs",
@@ -1503,6 +1842,7 @@ __all__ = [
     "render_live_recall_usage_refs",
     "resolve_usage_refs_max_refs",
     "resolve_usage_refs_token_budget",
+    "resolve_verified_live_recall_usage_refs",
     "validate_live_recall_usage_mapping_provenance",
     "validate_live_recall_usage_surface_provenance",
 ]

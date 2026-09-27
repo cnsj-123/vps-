@@ -7,9 +7,8 @@ from typing import Any
 from ombrebrain.context import memory_usage_signal
 from ombrebrain.context.live_recall_usage_surface import (
     is_valid_useref,
-    read_live_recall_usage_surface,
     resolve_usage_refs_max_refs,
-    validate_live_recall_usage_surface_provenance,
+    resolve_verified_live_recall_usage_refs,
 )
 from ombrebrain.context.memory_usage_signal import (
     read_memory_usage,
@@ -98,6 +97,9 @@ _REASON_PROVENANCE_INVALID = (
 )
 _REASON_DISABLED = "usage_attribution_disabled"
 _REASON_RECORD_FAILED = "usage_record_failed"
+_REASON_REF_BINDING_INVALID = (
+    "usage_ref_binding_invalid"
+)
 
 SAFE_ATTRIBUTION_REASONS = frozenset(
     {
@@ -110,6 +112,7 @@ SAFE_ATTRIBUTION_REASONS = frozenset(
         _REASON_PROVENANCE_INVALID,
         _REASON_DISABLED,
         _REASON_RECORD_FAILED,
+        _REASON_REF_BINDING_INVALID,
     }
 )
 
@@ -267,99 +270,47 @@ def attribute_live_recall_usage(
             )
 
     try:
-        surface = read_live_recall_usage_surface(
-            conversation_id=conversation_id,
-            cognitive_request_id=(
-                cognitive_request_id
-            ),
+        # The SHARED, receipt-bound resolver: a handle only resolves
+        # through the exact current surface, the REAL persisted
+        # provenance (fingerprint + projection recomputed) AND its
+        # independent, write-once issuance receipt. A surface-only
+        # tamper -- a swapped useref included -- can never record
+        # ``used``.
+        resolution = (
+            resolve_verified_live_recall_usage_refs(
+                conversation_id=conversation_id,
+                cognitive_request_id=(
+                    cognitive_request_id
+                ),
+                userefs=userefs,
+            )
         )
 
-        if not isinstance(surface, dict):
-            # No usable surface for THIS request: nothing to resolve,
-            # and no memory_usage / recall / lifecycle artifact is
-            # created by the refusal.
-            return _report(
-                reason=_REASON_SURFACE_UNAVAILABLE,
-                requested_ref_count=requested,
-            )
-
-        mappings = surface.get("mappings") or []
-
-        by_ref: dict[str, dict[str, Any]] = {}
-
-        surface_order: dict[str, int] = {}
-
-        for index, mapping in enumerate(mappings):
-            if not isinstance(mapping, dict):
-                continue
-
-            useref = mapping.get("useref")
-
-            if isinstance(useref, str):
-                by_ref[useref] = mapping
-                surface_order[useref] = index
-
-        resolved: list[dict[str, Any]] = []
-
-        seen: set[str] = set()
-
-        for value in userefs:
-            mapping = by_ref.get(value)
-
-            if not isinstance(mapping, dict):
-                return _report(
-                    reason=_REASON_INVALID_REFS,
-                    requested_ref_count=requested,
-                )
-
-            if value in seen:
-                # Duplicates are folded; used events are never
-                # double-counted.
-                continue
-
-            seen.add(value)
-
-            resolved.append(mapping)
-
-        # Surface rank order, never the model's argument order.
-        resolved.sort(
-            key=lambda mapping: surface_order[
-                mapping["useref"]
-            ]
-        )
-
-        recall_ids = {
-            mapping.get("recall_id")
-            for mapping in resolved
-        }
-
-        # One call, one recall: a mixed call records nothing at all.
-        if len(recall_ids) != 1:
-            return _report(
-                reason=_REASON_MIXED_RECALLS,
-                requested_ref_count=requested,
-            )
-
-        recall_id = next(iter(recall_ids))
-
-        # The surface's own provenance is NEVER trusted: every
-        # SELECTED mapping is re-validated against the real persisted
-        # Recall Request, Related Recall and Usage Signal -- the
-        # request fingerprint and the model projection are recomputed
-        # from the real artifacts. Any invalid mapping fails the whole
-        # call closed and ``record_usage()`` is never reached.
-        if not validate_live_recall_usage_surface_provenance(
-            conversation_id=conversation_id,
-            cognitive_request_id=(
-                cognitive_request_id
-            ),
-            artifact=surface,
-            mappings=resolved,
+        if (
+            not isinstance(resolution, dict)
+            or resolution.get("ok") is not True
         ):
+            reason = (
+                resolution.get("reason")
+                if isinstance(resolution, dict)
+                else None
+            )
+
             return _report(
-                reason=_REASON_PROVENANCE_INVALID,
+                reason=(
+                    reason
+                    if reason
+                    in SAFE_ATTRIBUTION_REASONS
+                    else _REASON_PROVENANCE_INVALID
+                ),
                 requested_ref_count=requested,
             )
+
+        recall_id = resolution.get("recall_id")
+
+        resolved = list(
+            resolution.get("mappings") or []
+        )
 
         usage = read_memory_usage(
             conversation_id=conversation_id,

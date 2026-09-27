@@ -9,16 +9,11 @@ from ombrebrain.context.live_recall_usage_attribution import (
     attribute_live_recall_usage,
 )
 from ombrebrain.context.live_recall_usage_surface import (
-    is_valid_useref,
-    read_live_recall_usage_surface,
-    validate_live_recall_usage_surface_provenance,
+    resolve_verified_live_recall_usage_refs,
 )
 from ombrebrain.context.memory_reinforcement import (
     memory_lifecycle_shadow_enabled,
     process_completed_usage_for_lifecycle,
-)
-from ombrebrain.context.recall_types import (
-    is_valid_recall_id,
 )
 
 
@@ -132,6 +127,9 @@ _REASON_USAGE_PROVENANCE_INVALID = (
     "usage_provenance_invalid"
 )
 _REASON_MIXED_RECALL_REFS = "mixed_recall_refs"
+_REASON_USAGE_REF_BINDING_INVALID = (
+    "usage_ref_binding_invalid"
+)
 _REASON_LIFECYCLE_OBSERVED = "lifecycle_observed"
 _REASON_LIFECYCLE_UNAVAILABLE = "lifecycle_unavailable"
 
@@ -144,6 +142,7 @@ SAFE_LIFECYCLE_INTEGRATION_REASONS = frozenset(
         _REASON_USAGE_SURFACE_UNAVAILABLE,
         _REASON_USAGE_PROVENANCE_INVALID,
         _REASON_MIXED_RECALL_REFS,
+        _REASON_USAGE_REF_BINDING_INVALID,
         _REASON_LIFECYCLE_OBSERVED,
         _REASON_LIFECYCLE_UNAVAILABLE,
     }
@@ -287,10 +286,12 @@ def _resolve_selected_recall_id(
 ) -> tuple[str | None, str]:
     """Re-derive the ONE recall id of the SELECTED refs, internally.
 
-    Independent downstream trust boundary: this re-reads the EXACT
-    request-scoped surface (never a glob, never a global ref index)
-    and re-validates every selected mapping against the real persisted
-    provenance chain. The model can never supply the recall id.
+    Independent downstream trust boundary, but NOT an independent
+    implementation: it reuses the SAME receipt-bound resolver Usage
+    Attribution uses, so a surface-only tamper (a swapped ``useref``
+    included), a missing / corrupt issuance receipt and a mixed-recall
+    selection are all refused here too. The model can never supply the
+    recall id.
 
     Returns ``(recall_id, reason)``; ``recall_id`` is None on refusal
     and the reason is one of the safe enum values.
@@ -303,84 +304,49 @@ def _resolve_selected_recall_id(
         return None, _REASON_USAGE_SURFACE_UNAVAILABLE
 
     try:
-        surface = read_live_recall_usage_surface(
-            conversation_id=conversation_id,
-            cognitive_request_id=(
-                cognitive_request_id
-            ),
-        )
-    except Exception:
-        return None, _REASON_USAGE_SURFACE_UNAVAILABLE
-
-    if not isinstance(surface, dict):
-        return None, _REASON_USAGE_SURFACE_UNAVAILABLE
-
-    by_ref: dict[str, dict[str, Any]] = {}
-
-    for mapping in surface.get("mappings") or []:
-        if not isinstance(mapping, dict):
-            continue
-
-        useref = mapping.get("useref")
-
-        if isinstance(useref, str):
-            by_ref[useref] = mapping
-
-    selected: list[dict[str, Any]] = []
-
-    seen: set[str] = set()
-
-    for value in userefs:
-        if not is_valid_useref(value):
-            return None, _REASON_USAGE_SURFACE_UNAVAILABLE
-
-        mapping = by_ref.get(value)
-
-        if not isinstance(mapping, dict):
-            return None, _REASON_USAGE_SURFACE_UNAVAILABLE
-
-        if value in seen:
-            continue
-
-        seen.add(value)
-
-        selected.append(mapping)
-
-    if not selected:
-        return None, _REASON_USAGE_SURFACE_UNAVAILABLE
-
-    recall_ids = {
-        mapping.get("recall_id")
-        for mapping in selected
-    }
-
-    # One observer call, one recall: a mixed selection is refused.
-    if len(recall_ids) != 1:
-        return None, _REASON_MIXED_RECALL_REFS
-
-    recall_id = next(iter(recall_ids))
-
-    if not is_valid_recall_id(recall_id):
-        return None, _REASON_USAGE_SURFACE_UNAVAILABLE
-
-    try:
-        valid = (
-            validate_live_recall_usage_surface_provenance(
+        resolution = (
+            resolve_verified_live_recall_usage_refs(
                 conversation_id=conversation_id,
                 cognitive_request_id=(
                     cognitive_request_id
                 ),
-                artifact=surface,
-                mappings=selected,
+                userefs=userefs,
             )
         )
     except Exception:
-        return None, _REASON_USAGE_PROVENANCE_INVALID
+        return None, _REASON_LIFECYCLE_UNAVAILABLE
 
-    if not valid:
-        return None, _REASON_USAGE_PROVENANCE_INVALID
+    if (
+        not isinstance(resolution, dict)
+        or resolution.get("ok") is not True
+    ):
+        return None, _map_resolve_reason(
+            resolution.get("reason")
+            if isinstance(resolution, dict)
+            else None
+        )
+
+    recall_id = resolution.get("recall_id")
+
+    if not isinstance(recall_id, str) or not recall_id:
+        return None, _REASON_USAGE_SURFACE_UNAVAILABLE
 
     return recall_id, _REASON_LIFECYCLE_OBSERVED
+
+
+def _map_resolve_reason(reason: Any) -> str:
+    """Map a shared resolver reason onto the lifecycle enum."""
+
+    if reason == "mixed_recall_refs":
+        return _REASON_MIXED_RECALL_REFS
+
+    if reason == "usage_mapping_provenance_invalid":
+        return _REASON_USAGE_PROVENANCE_INVALID
+
+    if reason == "usage_ref_binding_invalid":
+        return _REASON_USAGE_REF_BINDING_INVALID
+
+    return _REASON_USAGE_SURFACE_UNAVAILABLE
 
 
 async def attribute_live_recall_usage_with_lifecycle(
