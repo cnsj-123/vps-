@@ -17,6 +17,7 @@ from _recall_fixtures import (
     CID_B,
     RID,
     RID_B,
+    USAGE_ATTRIBUTION_ENV,
     memory,
     seed_live_exposure,
 )
@@ -25,6 +26,7 @@ from ombrebrain.context.live_memory_transport_capability import (
     _ALLOWED_TOOLS,
     _MODE,
     _VERSION,
+    SAFE_MINT_REASONS,
     is_live_memory_transport_capability_token,
     is_valid_live_memory_transport_capability_artifact,
     live_memory_transport_capability_expired,
@@ -61,6 +63,10 @@ def cap_env(root, *, ttl=None, **extra):
         CAPABILITY_TTL_ENV: (
             str(ttl) if ttl is not None else "300"
         ),
+        # A v2 ``obmtcap_`` credential only exists while Usage
+        # Attribution is ON; a test that wants the flag OFF passes it
+        # through ``extra``.
+        USAGE_ATTRIBUTION_ENV: "1",
     }
 
     values.update(extra)
@@ -108,9 +114,8 @@ def _exposure_path(root, conversation_id=CID, rid=RID):
     )
 
 
-class LiveMemoryTransportCapabilityTests(
-    unittest.TestCase
-):
+class _CapabilityCase(unittest.TestCase):
+    """Shared seeding: one live-exposed request in a state root."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -149,6 +154,9 @@ class LiveMemoryTransportCapabilityTests(
             return resolve_live_memory_transport_capability(
                 token, **kwargs
             )
+
+
+class LiveMemoryTransportCapabilityTests(_CapabilityCase):
 
     # --------------------------------------------------
     # Format
@@ -628,6 +636,126 @@ class LiveMemoryTransportCapabilityTests(
                 (Path(self.root) / directory).exists(),
                 directory,
             )
+
+
+class UsageAttributionKillSwitchTests(_CapabilityCase):
+    """``OMBRE_GATEWAY_CONTEXT_USAGE_ATTRIBUTION`` is the FINAL gate.
+
+    A v2 credential only exists while the flag is ON, and turning the
+    flag OFF immediately invalidates every not-yet-expired token --
+    without deleting anything and without touching v1.
+    """
+
+    _FLAG_OFF = {USAGE_ATTRIBUTION_ENV: "0"}
+
+    def test_mint_is_refused_while_the_flag_is_off(self):
+        with cap_env(self.root, **self._FLAG_OFF):
+            token, report = (
+                mint_live_memory_transport_capability(
+                    conversation_id=CID,
+                    cognitive_request_id=RID,
+                )
+            )
+
+        self.assertIsNone(token)
+        self.assertFalse(report["minted"])
+        self.assertFalse(report["enabled"])
+        self.assertEqual(
+            report["reason"],
+            "usage_attribution_disabled",
+        )
+        self.assertIn(
+            report["reason"], SAFE_MINT_REASONS
+        )
+
+        # Nothing was persisted: no v2 artifact at all.
+        self.assertFalse(
+            (
+                Path(self.root)
+                / "live_memory_transport_capability"
+            ).exists()
+        )
+
+        # The report stays privacy-safe.
+        text = json.dumps(report)
+
+        for forbidden in (
+            "obmtcap_",
+            "memref_",
+            "mem-1",
+            CID,
+            RID,
+        ):
+            self.assertNotIn(forbidden, text)
+
+    def test_resolve_is_refused_while_the_flag_is_off(self):
+        token = self._mint_token()
+
+        self.assertIsNotNone(self._resolve(token))
+
+        with cap_env(self.root, **self._FLAG_OFF):
+            self.assertIsNone(
+                resolve_live_memory_transport_capability(
+                    token
+                )
+            )
+
+            # The probe stays expiry-only: a live token is not
+            # "expired", and nothing about it is leaked.
+            self.assertFalse(
+                live_memory_transport_capability_expired(
+                    token
+                )
+            )
+
+            # The artifact survives the flag flip untouched.
+            self.assertTrue(
+                _artifact_path(
+                    self.root, token
+                ).is_file()
+            )
+
+        # Turning the flag back ON restores the SAME token inside its
+        # original TTL.
+        self.assertEqual(
+            self._resolve(token)["allowed_tools"],
+            ["Recall", "UseMemory"],
+        )
+
+    def test_v1_recall_capability_is_unaffected(self):
+        with cap_env(self.root, **self._FLAG_OFF):
+            token, report = (
+                mint_live_recall_transport_capability(
+                    conversation_id=CID,
+                    cognitive_request_id=RID,
+                )
+            )
+
+            self.assertIsInstance(token, str)
+            self.assertTrue(report["minted"])
+
+            binding = (
+                resolve_live_recall_transport_capability(
+                    token
+                )
+            )
+
+        self.assertIsNotNone(binding)
+        self.assertEqual(
+            binding,
+            {
+                "conversation_id": CID,
+                "cognitive_request_id": RID,
+            },
+        )
+
+        # ...and the v1 token is still a v1 token:
+        # it can never resolve as a v2 credential.
+        self.assertFalse(
+            is_live_memory_transport_capability_token(
+                token
+            )
+        )
 
 
 if __name__ == "__main__":

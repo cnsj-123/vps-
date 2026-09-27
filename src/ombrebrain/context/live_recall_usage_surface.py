@@ -10,6 +10,7 @@ from typing import Any
 
 from ombrebrain.context.live_recall_authorization import (
     is_valid_live_recall_result,
+    project_live_recall_result,
 )
 from ombrebrain.context.memory_recall_surface import (
     resolve_recall_ref,
@@ -20,6 +21,7 @@ from ombrebrain.context.memory_usage_signal import (
 from ombrebrain.context.recall_request import (
     find_recall_request_by_fingerprint,
     is_valid_recall_request_artifact,
+    read_recall_request,
     recall_request_fingerprint,
 )
 from ombrebrain.context.recall_types import (
@@ -77,6 +79,28 @@ from ombrebrain.context.related_recall import (
 #           -> find_recall_request_by_fingerprint  -> real recall id
 #             -> read_related_recall(...)          -> real artifact
 #               -> read_memory_usage(...)          -> real loaded set
+#
+# A STRUCTURAL valid surface proves nothing about its content, so every
+# mapping is re-validated against the real persisted sources before a
+# ``useref`` may ever become ``used``:
+#
+#   - the real Recall Request is re-read and its fingerprint is
+#     RECOMPUTED (a stored 64-hex string is never trusted as
+#     provenance);
+#   - the real Related Recall is re-read and re-validated, and the
+#     mapping's ``rank`` must re-bind to the SAME raw ``memory_id``
+#     whose internal ``reason`` matches the mapping's ``kind``;
+#   - the real Usage Signal is re-read and the memory must still be in
+#     ``loaded_memory_ids`` (``used ⊆ loaded``);
+#   - the model projection is RECOMPUTED from the real artifact and
+#     the mapping's ``source_model_result_sha256`` must equal its
+#     canonical digest, and the mapping's ``rank`` + ``kind`` must
+#     exist in that projection.
+#
+# So a structurally-valid tamper (a swapped ``memory_id``, a rewritten
+# 64-hex fingerprint / digest, a shifted rank, a flipped kind or a
+# mapping borrowed from another real recall of the same request) can
+# never become an attribution handle.
 #
 # No glob, no rglob, no "most recent related recall", no global
 # ``useref`` index, no retrieval, no memory content load, no model
@@ -143,6 +167,12 @@ _REASON_USAGE_NOT_FOUND = "usage_signal_not_found"
 _REASON_RANK_NOT_FOUND = "rank_not_found"
 _REASON_KIND_MISMATCH = "kind_mismatch"
 _REASON_MEMORY_NOT_LOADED = "memory_not_loaded"
+_REASON_PROJECTION_UNAVAILABLE = (
+    "model_projection_unavailable"
+)
+_REASON_PROJECTION_MISMATCH = (
+    "model_projection_mismatch"
+)
 _REASON_ARTIFACT_INVALID = "usage_surface_invalid"
 _REASON_PERSISTENCE_FAILED = (
     "usage_surface_persistence_failed"
@@ -162,6 +192,8 @@ SAFE_BUILD_REASONS = frozenset(
         _REASON_RANK_NOT_FOUND,
         _REASON_KIND_MISMATCH,
         _REASON_MEMORY_NOT_LOADED,
+        _REASON_PROJECTION_UNAVAILABLE,
+        _REASON_PROJECTION_MISMATCH,
         _REASON_ARTIFACT_INVALID,
         _REASON_PERSISTENCE_FAILED,
         _REASON_UNAVAILABLE,
@@ -363,65 +395,69 @@ def is_valid_live_recall_usage_surface_artifact(
     seen_rank_keys: set[tuple[str, int]] = set()
 
     for mapping in mappings:
-        if not isinstance(mapping, dict):
+        if not _is_valid_mapping_shape(mapping):
             return False
 
-        if set(mapping.keys()) != _MAPPING_KEYS:
-            return False
-
-        useref = mapping.get("useref")
-
-        if not is_valid_useref(useref):
-            return False
+        useref = mapping["useref"]
 
         if useref in seen_refs:
             return False
 
         seen_refs.add(useref)
 
-        if not is_valid_recall_id(
-            mapping.get("recall_id")
-        ):
-            return False
-
-        if not _is_nonempty_text(
-            mapping.get("memory_id")
-        ):
-            return False
-
-        rank = mapping.get("rank")
-
-        if not _is_positive_rank(rank):
-            return False
-
-        rank_key = (mapping["recall_id"], rank)
+        rank_key = (mapping["recall_id"], mapping["rank"])
 
         if rank_key in seen_rank_keys:
             return False
 
         seen_rank_keys.add(rank_key)
 
-        if mapping.get("kind") not in (
-            _KIND_ANCHOR,
-            _KIND_RELATED,
-        ):
-            return False
-
-        if not is_valid_fingerprint(
-            mapping.get(
-                "source_request_fingerprint"
-            )
-        ):
-            return False
-
-        if not is_valid_fingerprint(
-            mapping.get(
-                "source_model_result_sha256"
-            )
-        ):
-            return False
-
     return True
+
+
+def _is_valid_mapping_shape(
+    mapping: Any,
+) -> bool:
+    """The structural shape of ONE mapping, as persisted.
+
+    This is only the SHAPE: it can never prove that the mapping came
+    from the real sources, so a reader that is about to act on a
+    mapping must also pass ``validate_live_recall_usage_
+    mapping_provenance`` (or the surface-level equivalent).
+    """
+
+    if not isinstance(mapping, dict):
+        return False
+
+    if set(mapping.keys()) != _MAPPING_KEYS:
+        return False
+
+    if not is_valid_useref(mapping.get("useref")):
+        return False
+
+    if not is_valid_recall_id(mapping.get("recall_id")):
+        return False
+
+    if not _is_nonempty_text(mapping.get("memory_id")):
+        return False
+
+    if not _is_positive_rank(mapping.get("rank")):
+        return False
+
+    if mapping.get("kind") not in (
+        _KIND_ANCHOR,
+        _KIND_RELATED,
+    ):
+        return False
+
+    if not is_valid_fingerprint(
+        mapping.get("source_request_fingerprint")
+    ):
+        return False
+
+    return is_valid_fingerprint(
+        mapping.get("source_model_result_sha256")
+    )
 
 
 def read_live_recall_usage_surface(
@@ -498,6 +534,332 @@ def live_recall_usage_surface_status(
 
 
 # ------------------------------------------------------
+# Provenance (re-read the REAL sources)
+# ------------------------------------------------------
+
+
+def _verified_sources(
+    *,
+    request_fingerprint: str,
+    recall_artifact: dict[str, Any],
+    loaded_memory_ids: set[str],
+    projection: dict[str, Any],
+    model_result_sha256: str,
+) -> dict[str, Any]:
+    """The verified authority a mapping must match."""
+
+    return {
+        "request_fingerprint": request_fingerprint,
+        "related_by_rank": {
+            item["rank"]: item
+            for item in recall_artifact["memories"]
+            if isinstance(item, dict)
+            and _is_positive_rank(item.get("rank"))
+        },
+        "loaded_memory_ids": set(loaded_memory_ids),
+        "projection_by_rank": {
+            item["rank"]: item
+            for item in projection["memories"]
+            if isinstance(item, dict)
+            and _is_positive_rank(item.get("rank"))
+        },
+        "model_result_sha256": model_result_sha256,
+    }
+
+
+def _mapping_matches_sources(
+    mapping: Any,
+    sources: dict[str, Any],
+) -> bool:
+    """Does ONE mapping re-bind to the verified real sources?
+
+    Every provenance field is re-derived, never trusted:
+    ``source_request_fingerprint`` must equal the RECOMPUTED request
+    fingerprint, ``source_model_result_sha256`` must equal the
+    RECOMPUTED projection digest, the ``rank`` must re-bind to the
+    SAME raw ``memory_id`` (with a matching internal ``reason``), the
+    memory must still be loaded and the ``rank`` + ``kind`` must exist
+    in the recomputed model projection.
+    """
+
+    if not _is_valid_mapping_shape(mapping):
+        return False
+
+    if (
+        mapping["source_request_fingerprint"]
+        != sources.get("request_fingerprint")
+    ):
+        return False
+
+    if (
+        mapping["source_model_result_sha256"]
+        != sources.get("model_result_sha256")
+    ):
+        return False
+
+    item = sources["related_by_rank"].get(
+        mapping["rank"]
+    )
+
+    if not isinstance(item, dict):
+        return False
+
+    if item.get("memory_id") != mapping["memory_id"]:
+        return False
+
+    if item.get("reason") != _KIND_TO_REASON.get(
+        mapping["kind"]
+    ):
+        return False
+
+    if (
+        mapping["memory_id"]
+        not in sources["loaded_memory_ids"]
+    ):
+        return False
+
+    projected = sources["projection_by_rank"].get(
+        mapping["rank"]
+    )
+
+    if not isinstance(projected, dict):
+        return False
+
+    return projected.get("kind") == mapping["kind"]
+
+
+def _read_verified_sources(
+    *,
+    conversation_id: Any,
+    cognitive_request_id: Any,
+    recall_id: Any,
+) -> dict[str, Any] | None:
+    """Re-read and re-validate the REAL persisted provenance chain.
+
+    Recall Request -> recomputed fingerprint -> Related Recall ->
+    Usage Signal -> recomputed model projection. Any missing or
+    corrupt link returns None, so a mapping can never be validated
+    against a guess.
+    """
+
+    if (
+        not is_valid_conversation_id(conversation_id)
+        or not is_valid_cognitive_request_id(
+            cognitive_request_id
+        )
+        or not is_valid_recall_id(recall_id)
+    ):
+        return None
+
+    request_artifact = read_recall_request(
+        conversation_id=conversation_id,
+        cognitive_request_id=(
+            cognitive_request_id
+        ),
+        recall_id=recall_id,
+    )
+
+    if not is_valid_recall_request_artifact(
+        request_artifact,
+        conversation_id=conversation_id,
+        cognitive_request_id=(
+            cognitive_request_id
+        ),
+    ):
+        return None
+
+    # The fingerprint is RECOMPUTED from the real artifact; the
+    # string a surface stores about itself is never trusted.
+    fingerprint = recall_request_fingerprint(
+        conversation_id=conversation_id,
+        cognitive_request_id=(
+            cognitive_request_id
+        ),
+        anchor_memory_id=request_artifact.get(
+            "anchor_memory_id"
+        ),
+        requested_scope=request_artifact.get(
+            "requested_scope"
+        ),
+    )
+
+    if request_artifact.get(
+        "request_fingerprint"
+    ) != fingerprint:
+        return None
+
+    recall_artifact = read_related_recall(
+        conversation_id=conversation_id,
+        cognitive_request_id=(
+            cognitive_request_id
+        ),
+        recall_id=recall_id,
+    )
+
+    if not is_valid_related_recall_artifact(
+        recall_artifact,
+        conversation_id=conversation_id,
+        cognitive_request_id=(
+            cognitive_request_id
+        ),
+        recall_id=recall_id,
+        request_fingerprint=fingerprint,
+    ):
+        return None
+
+    usage = read_memory_usage(
+        conversation_id=conversation_id,
+        cognitive_request_id=(
+            cognitive_request_id
+        ),
+        recall_id=recall_id,
+    )
+
+    if not isinstance(usage, dict):
+        return None
+
+    loaded = {
+        memory_id
+        for memory_id in (
+            usage.get("loaded_memory_ids") or []
+        )
+        if _is_nonempty_text(memory_id)
+    }
+
+    # The projection is RECOMPUTED from the real artifact.
+    projection = project_live_recall_result(
+        artifact=recall_artifact
+    )
+
+    if (
+        not isinstance(projection, dict)
+        or not is_valid_live_recall_result(projection)
+    ):
+        return None
+
+    projection_sha = _canonical_sha256(projection)
+
+    if not is_valid_fingerprint(projection_sha):
+        return None
+
+    return _verified_sources(
+        request_fingerprint=fingerprint,
+        recall_artifact=recall_artifact,
+        loaded_memory_ids=loaded,
+        projection=projection,
+        model_result_sha256=projection_sha,
+    )
+
+
+def validate_live_recall_usage_mapping_provenance(
+    *,
+    conversation_id: Any,
+    cognitive_request_id: Any,
+    mapping: Any,
+) -> bool:
+    """Re-validate ONE mapping against the real persisted sources.
+
+    A structurally valid mapping is NOT trustworthy: it may have been
+    edited after it was written. This re-reads the real Recall
+    Request, Related Recall and Usage Signal, recomputes the request
+    fingerprint and the model projection, and requires the mapping to
+    re-bind to all of them. Nothing the surface declares about itself
+    is treated as authority.
+    """
+
+    if not _is_valid_mapping_shape(mapping):
+        return False
+
+    try:
+        sources = _read_verified_sources(
+            conversation_id=conversation_id,
+            cognitive_request_id=(
+                cognitive_request_id
+            ),
+            recall_id=mapping["recall_id"],
+        )
+    except Exception:
+        return False
+
+    if not isinstance(sources, dict):
+        return False
+
+    return _mapping_matches_sources(mapping, sources)
+
+
+def validate_live_recall_usage_surface_provenance(
+    *,
+    conversation_id: Any,
+    cognitive_request_id: Any,
+    artifact: Any = None,
+    mappings: Any = None,
+) -> bool:
+    """Re-validate every selected mapping of one Usage Surface.
+
+    The real sources are read ONCE per recall id and reused for that
+    recall's mappings. Any invalid mapping makes the whole selection
+    invalid -- the caller then fails closed and records nothing.
+    """
+
+    if artifact is None:
+        artifact = read_live_recall_usage_surface(
+            conversation_id=conversation_id,
+            cognitive_request_id=(
+                cognitive_request_id
+            ),
+        )
+
+    if not is_valid_live_recall_usage_surface_artifact(
+        artifact,
+        conversation_id=conversation_id,
+        cognitive_request_id=(
+            cognitive_request_id
+        ),
+    ):
+        return False
+
+    if mappings is None:
+        selected = list(artifact["mappings"])
+    elif isinstance(mappings, (list, tuple)):
+        selected = list(mappings)
+    else:
+        return False
+
+    if not selected:
+        return False
+
+    cache: dict[str, dict[str, Any] | None] = {}
+
+    for mapping in selected:
+        if not _is_valid_mapping_shape(mapping):
+            return False
+
+        recall_id = mapping["recall_id"]
+
+        if recall_id not in cache:
+            try:
+                cache[recall_id] = _read_verified_sources(
+                    conversation_id=conversation_id,
+                    cognitive_request_id=(
+                        cognitive_request_id
+                    ),
+                    recall_id=recall_id,
+                )
+            except Exception:
+                return False
+
+        sources = cache[recall_id]
+
+        if not isinstance(sources, dict):
+            return False
+
+        if not _mapping_matches_sources(mapping, sources):
+            return False
+
+    return True
+
+
+# ------------------------------------------------------
 # Builder
 # ------------------------------------------------------
 
@@ -521,6 +883,7 @@ def _targets(
     *,
     model_result: dict[str, Any],
     recall_artifact: dict[str, Any],
+    projection: dict[str, Any],
     loaded_memory_ids: set[str],
     recall_id: str,
 ) -> tuple[list[dict[str, Any]] | None, str]:
@@ -528,9 +891,11 @@ def _targets(
 
     Only the exact same rank may be mapped, and the model-facing
     ``kind`` must agree with the internal ``reason`` -- rank alone is
-    never enough. An item the Recall loaded but the bounded
-    projection never output has no rank here and can never obtain a
-    ``useref``.
+    never enough. The (rank, kind) pair must also exist in the
+    projection RECOMPUTED from the real artifact, so an item the
+    Recall loaded but the bounded projection dropped can never obtain
+    a ``useref`` -- and the builder can never mint a mapping the
+    provenance validator would have to reject.
 
     Returns ``(targets, reason)``; ``targets`` is None on refusal and
     the reason is one of the safe enum values.
@@ -539,6 +904,13 @@ def _targets(
     by_rank = {
         item["rank"]: item
         for item in recall_artifact["memories"]
+        if isinstance(item, dict)
+        and _is_positive_rank(item.get("rank"))
+    }
+
+    projection_by_rank = {
+        item["rank"]: item
+        for item in projection["memories"]
         if isinstance(item, dict)
         and _is_positive_rank(item.get("rank"))
     }
@@ -557,6 +929,14 @@ def _targets(
             item["kind"]
         ):
             return None, _REASON_KIND_MISMATCH
+
+        projected = projection_by_rank.get(rank)
+
+        if (
+            not isinstance(projected, dict)
+            or projected.get("kind") != item["kind"]
+        ):
+            return None, _REASON_PROJECTION_MISMATCH
 
         memory_id = source.get("memory_id")
 
@@ -733,22 +1113,39 @@ def build_live_recall_usage_surface(
             if _is_nonempty_text(memory_id)
         }
 
+        # The model projection is RECOMPUTED from the real artifact:
+        # the surface may only ever describe the projection this
+        # Recall really yields, and the digest it stores is the
+        # RECOMPUTED one -- never a digest a caller supplied.
+        projection = project_live_recall_result(
+            artifact=recall_artifact
+        )
+
+        if (
+            not isinstance(projection, dict)
+            or not is_valid_live_recall_result(projection)
+        ):
+            return _no_surface(
+                _REASON_PROJECTION_UNAVAILABLE
+            )
+
+        source_sha = _canonical_sha256(projection)
+
+        if not is_valid_fingerprint(source_sha):
+            return _no_surface(
+                _REASON_PROJECTION_UNAVAILABLE
+            )
+
         targets, targets_reason = _targets(
             model_result=model_result,
             recall_artifact=recall_artifact,
+            projection=projection,
             loaded_memory_ids=loaded,
             recall_id=recall_id,
         )
 
         if targets is None:
             return _no_surface(targets_reason)
-
-        source_sha = _canonical_sha256(model_result)
-
-        if not is_valid_fingerprint(source_sha):
-            return _no_surface(
-                _REASON_INVALID_MODEL_RESULT
-            )
 
         path = live_recall_usage_surface_path(
             conversation_id,
@@ -1106,4 +1503,6 @@ __all__ = [
     "render_live_recall_usage_refs",
     "resolve_usage_refs_max_refs",
     "resolve_usage_refs_token_budget",
+    "validate_live_recall_usage_mapping_provenance",
+    "validate_live_recall_usage_surface_provenance",
 ]

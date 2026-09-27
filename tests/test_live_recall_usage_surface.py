@@ -21,6 +21,9 @@ from _recall_fixtures import (
     seed_recall_control_plane,
 )
 
+from ombrebrain.context.live_recall_authorization import (
+    project_live_recall_result,
+)
 from ombrebrain.context.live_recall_usage_surface import (
     SAFE_BUILD_REASONS,
     append_live_recall_usage_refs,
@@ -35,6 +38,8 @@ from ombrebrain.context.live_recall_usage_surface import (
     render_live_recall_usage_refs,
     resolve_usage_refs_max_refs,
     resolve_usage_refs_token_budget,
+    validate_live_recall_usage_mapping_provenance,
+    validate_live_recall_usage_surface_provenance,
 )
 
 
@@ -770,6 +775,334 @@ class SurfaceValidatorTests(unittest.TestCase):
                 cognitive_request_id=RID,
             )
         )
+
+
+class ProvenanceValidationTests(UsageSurfaceCase):
+    """A structurally valid surface proves NOTHING about its content.
+
+    Every mapping is re-validated against the real persisted Recall
+    Request, Related Recall and Usage Signal -- the fingerprint and
+    the model projection are RECOMPUTED from the real artifacts.
+    """
+
+    def _built(self):
+        report = self._build()
+
+        self.assertTrue(report["stored"])
+
+        return report
+
+    def _tamper(self, mutate):
+        path = live_recall_usage_surface_path(CID, RID)
+
+        artifact = json.loads(
+            path.read_text(encoding="utf-8")
+        )
+
+        mutate(artifact)
+
+        path.write_text(
+            json.dumps(artifact), encoding="utf-8"
+        )
+
+        surface = read_live_recall_usage_surface(
+            conversation_id=CID,
+            cognitive_request_id=RID,
+        )
+
+        # The STRUCTURAL validator alone cannot stop this tamper.
+        self.assertIsInstance(surface, dict)
+
+        return surface
+
+    def _mapping_provenance(self, mapping, **kwargs):
+        return validate_live_recall_usage_mapping_provenance(
+            conversation_id=kwargs.pop(
+                "conversation_id", CID
+            ),
+            cognitive_request_id=kwargs.pop(
+                "cognitive_request_id", RID
+            ),
+            mapping=mapping,
+        )
+
+    def _surface_provenance(self, artifact, **kwargs):
+        return (
+            validate_live_recall_usage_surface_provenance(
+                conversation_id=kwargs.pop(
+                    "conversation_id", CID
+                ),
+                cognitive_request_id=kwargs.pop(
+                    "cognitive_request_id", RID
+                ),
+                artifact=artifact,
+            )
+        )
+
+    def test_genuine_mappings_pass_provenance(self):
+        self._built()
+
+        surface = self._surface()
+
+        self.assertTrue(
+            self._surface_provenance(surface)
+        )
+
+        for mapping in surface["mappings"]:
+            self.assertTrue(
+                self._mapping_provenance(mapping)
+            )
+
+    def test_swapped_memory_id_is_refused(self):
+        self._built()
+
+        surface = self._tamper(
+            lambda artifact: artifact["mappings"][0].update(
+                {"memory_id": "mem-2"}
+            )
+        )
+
+        # mem-2 is loaded by THIS recall AND projected at rank 2, so
+        # the tampered mapping is fully structurally valid -- and must
+        # still be refused.
+        self.assertFalse(
+            self._mapping_provenance(
+                surface["mappings"][0]
+            )
+        )
+        self.assertFalse(
+            self._surface_provenance(surface)
+        )
+
+    def test_forged_request_fingerprint_is_refused(self):
+        self._built()
+
+        surface = self._tamper(
+            lambda artifact: artifact["mappings"][1].update(
+                {"source_request_fingerprint": "b" * 64}
+            )
+        )
+
+        self.assertFalse(
+            self._mapping_provenance(
+                surface["mappings"][1]
+            )
+        )
+        self.assertFalse(
+            self._surface_provenance(surface)
+        )
+
+    def test_forged_model_result_digest_is_refused(self):
+        self._built()
+
+        surface = self._tamper(
+            lambda artifact: artifact["mappings"][1].update(
+                {"source_model_result_sha256": "c" * 64}
+            )
+        )
+
+        self.assertFalse(
+            self._mapping_provenance(
+                surface["mappings"][1]
+            )
+        )
+        self.assertFalse(
+            self._surface_provenance(surface)
+        )
+
+    def test_shifted_rank_is_refused(self):
+        self._built()
+
+        surface = self._tamper(
+            lambda artifact: artifact["mappings"][2].update(
+                {"rank": 4}
+            )
+        )
+
+        # Rank 4 is a real, loaded artifact rank; the mapping's
+        # memory_id no longer re-binds to it.
+        self.assertFalse(
+            self._mapping_provenance(
+                surface["mappings"][2]
+            )
+        )
+        self.assertFalse(
+            self._surface_provenance(surface)
+        )
+
+    def test_flipped_kind_is_refused(self):
+        self._built()
+
+        surface = self._tamper(
+            lambda artifact: artifact["mappings"][1].update(
+                {"kind": "anchor"}
+            )
+        )
+
+        self.assertFalse(
+            self._mapping_provenance(
+                surface["mappings"][1]
+            )
+        )
+        self.assertFalse(
+            self._surface_provenance(surface)
+        )
+
+    def test_mapping_borrowed_from_another_real_recall_is_refused(
+        self,
+    ):
+        self._built()
+
+        # A SECOND real recall of the SAME request: a real recall id
+        # exists, but it is not THIS mapping's provenance.
+        second = seed_recall_control_plane(
+            self.root,
+            ["mem-2", "mem-3"],
+            recall_id="recall_" + "2" * 32,
+        )
+
+        surface = self._tamper(
+            lambda artifact: artifact["mappings"][0].update(
+                {"recall_id": second["recall_id"]}
+            )
+        )
+
+        self.assertFalse(
+            self._mapping_provenance(
+                surface["mappings"][0]
+            )
+        )
+        self.assertFalse(
+            self._surface_provenance(surface)
+        )
+
+        # The untouched mappings of the FIRST recall stay valid.
+        self.assertTrue(
+            self._mapping_provenance(
+                surface["mappings"][1]
+            )
+        )
+
+    def test_loaded_but_not_projected_mapping_is_refused(self):
+        with tempfile.TemporaryDirectory() as root:
+            with patch.dict(
+                os.environ,
+                {"OMBRE_CONTEXT_STATE_DIR": root},
+                clear=False,
+            ):
+                memrefs = seed_live_exposure(
+                    root, _exposed_memories()
+                )
+
+                # Enough loaded items that the bounded projection
+                # really drops the tail.
+                many = [
+                    "mem-%d" % index
+                    for index in range(1, 41)
+                ]
+
+                plane = seed_recall_control_plane(
+                    root, many
+                )
+
+                report = build_live_recall_usage_surface(
+                    conversation_id=CID,
+                    cognitive_request_id=RID,
+                    anchor_ref=memrefs[0],
+                    model_result=projected_model_result(
+                        many[:3]
+                    ),
+                )
+
+                self.assertTrue(report["stored"])
+
+                projection = project_live_recall_result(
+                    artifact=plane["artifact"]
+                )
+
+                projected_ranks = {
+                    item["rank"]
+                    for item in projection["memories"]
+                }
+
+                self.assertLess(
+                    len(projected_ranks), len(many)
+                )
+
+                dropped_rank = max(projected_ranks) + 1
+
+                real_item = plane["artifact"]["memories"][
+                    dropped_rank - 1
+                ]
+
+                self.assertIn(
+                    real_item["memory_id"],
+                    plane["loaded_memory_ids"],
+                )
+                self.assertLessEqual(
+                    dropped_rank,
+                    len(plane["artifact"]["memories"]),
+                )
+
+                path = live_recall_usage_surface_path(
+                    CID, RID
+                )
+
+                artifact = json.loads(
+                    path.read_text(encoding="utf-8")
+                )
+
+                template = artifact["mappings"][1]
+
+                artifact["mappings"].append(
+                    {
+                        "useref": new_useref(),
+                        "recall_id": template["recall_id"],
+                        "memory_id": real_item["memory_id"],
+                        "rank": dropped_rank,
+                        "kind": (
+                            "anchor"
+                            if real_item["reason"]
+                            == "anchor_memory"
+                            else "related"
+                        ),
+                        "source_request_fingerprint":
+                            template[
+                                "source_request_fingerprint"
+                            ],
+                        "source_model_result_sha256":
+                            template[
+                                "source_model_result_sha256"
+                            ],
+                    }
+                )
+
+                path.write_text(
+                    json.dumps(artifact),
+                    encoding="utf-8",
+                )
+
+                surface = read_live_recall_usage_surface(
+                    conversation_id=CID,
+                    cognitive_request_id=RID,
+                )
+
+                # Structurally valid, real artifact item, really
+                # loaded -- but never part of the model projection.
+                self.assertIsInstance(surface, dict)
+
+                self.assertNotIn(
+                    dropped_rank, projected_ranks
+                )
+
+                self.assertFalse(
+                    self._mapping_provenance(
+                        surface["mappings"][-1]
+                    )
+                )
+                self.assertFalse(
+                    self._surface_provenance(surface)
+                )
 
 
 class RecallResultCompositionTests(UsageSurfaceCase):

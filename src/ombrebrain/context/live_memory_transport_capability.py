@@ -11,6 +11,9 @@ from typing import Any
 from ombrebrain.context.live_recall_transport_capability import (
     resolve_capability_ttl_seconds,
 )
+from ombrebrain.context.live_recall_usage_attribution import (
+    live_recall_usage_attribution_enabled,
+)
 from ombrebrain.context.memory_flash_live_exposure import (
     read_live_memory_exposure,
 )
@@ -55,6 +58,12 @@ from ombrebrain.context.recall_types import (
 # set is chosen by the server from the token KIND, never from anything
 # the model sends.
 #
+# The rollout flag is the FINAL kill-switch, enforced HERE and not only
+# by the surrounding provider wiring: with Usage Attribution OFF no v2
+# capability is ever minted, and ``resolve`` returns None -- so every
+# already-minted, still-unexpired ``obmtcap_`` token stops
+# authenticating the moment an operator turns the feature off.
+#
 # Default OFF at the transport layer; fail-closed here: any unexpected
 # failure returns None instead of a token.
 
@@ -79,6 +88,7 @@ _REASON_EXPOSURE_UNAVAILABLE = "live_exposure_unavailable"
 _REASON_PERSISTENCE_FAILED = (
     "capability_persistence_failed"
 )
+_REASON_DISABLED = "usage_attribution_disabled"
 _REASON_MINT_EXCEPTION = "capability_mint_exception"
 
 SAFE_MINT_REASONS = frozenset(
@@ -88,6 +98,7 @@ SAFE_MINT_REASONS = frozenset(
         _REASON_INVALID_IDENTITY,
         _REASON_EXPOSURE_UNAVAILABLE,
         _REASON_PERSISTENCE_FAILED,
+        _REASON_DISABLED,
         _REASON_MINT_EXCEPTION,
     }
 )
@@ -394,6 +405,9 @@ def mint_live_memory_transport_capability(
     Preconditions (identical to v1, no fallback to Memory Flash, the
     Recall Surface or the Exposure Ledger):
 
+      - ``OMBRE_GATEWAY_CONTEXT_USAGE_ATTRIBUTION`` is ON (the flag
+        is the FINAL kill-switch: with it OFF no v2 credential may
+        exist at all);
       - valid trusted ``conversation_id`` / ``cognitive_request_id``;
       - a validated Live Exposure receipt exists for THIS request;
       - ``live_exposed_count >= 1`` and ``exposed_memrefs`` non-empty.
@@ -404,6 +418,11 @@ def mint_live_memory_transport_capability(
     report = _base_report()
 
     try:
+        if not live_recall_usage_attribution_enabled():
+            report["enabled"] = False
+            report["reason"] = _REASON_DISABLED
+            return None, report
+
         if (
             not is_valid_conversation_id(conversation_id)
             or not is_valid_cognitive_request_id(
@@ -537,9 +556,18 @@ def resolve_live_memory_transport_capability(
     re-read THIS artifact's Live Exposure receipt and require it to
     still match the capability's source binding. No glob, no rglob, no
     directory scan, and no fallback when the exposure receipt is gone.
+
+    With ``OMBRE_GATEWAY_CONTEXT_USAGE_ATTRIBUTION`` OFF this returns
+    None for every token, so an operator turning the feature off
+    instantly invalidates all not-yet-expired v2 credentials. The
+    expiry probe stays expiry-only; nothing about the token, the hash
+    or the request identity is ever logged or surfaced here.
     """
 
     try:
+        if not live_recall_usage_attribution_enabled():
+            return None
+
         if not is_live_memory_transport_capability_token(
             token
         ):

@@ -30,9 +30,14 @@ from ombrebrain.context.live_recall_usage_attribution import (
     live_recall_usage_attribution_enabled,
     render_live_recall_usage_ack,
 )
+from ombrebrain.context.live_recall_authorization import (
+    project_live_recall_result,
+)
 from ombrebrain.context.live_recall_usage_surface import (
     build_live_recall_usage_surface,
     live_recall_usage_surface_path,
+    new_useref,
+    read_live_recall_usage_surface,
 )
 
 
@@ -64,7 +69,12 @@ class AttributionCase(unittest.TestCase):
 
         env = patch.dict(
             os.environ,
-            {"OMBRE_CONTEXT_STATE_DIR": self.root},
+            {
+                "OMBRE_CONTEXT_STATE_DIR": self.root,
+                # Attribution only exists while its rollout flag is
+                # ON; the kill-switch tests flip it OFF explicitly.
+                USAGE_ATTRIBUTION_ENV: "1",
+            },
             clear=False,
         )
 
@@ -539,7 +549,10 @@ class RefusalTests(AttributionCase):
         with tempfile.TemporaryDirectory() as root:
             with patch.dict(
                 os.environ,
-                {"OMBRE_CONTEXT_STATE_DIR": root},
+                {
+                    "OMBRE_CONTEXT_STATE_DIR": root,
+                    USAGE_ATTRIBUTION_ENV: "1",
+                },
                 clear=False,
             ):
                 report = attribute_live_recall_usage(
@@ -836,6 +849,424 @@ class NoLifecycleIntegrationTests(AttributionCase):
                 (Path(self.root) / directory).exists(),
                 directory,
             )
+
+
+def _record_usage_spy(calls):
+    """Patch ``record_usage`` while capturing its calls."""
+
+    original = memory_usage_signal.record_usage
+
+    def spy(**kwargs):
+        calls.append(kwargs)
+        return original(**kwargs)
+
+    return patch.object(
+        memory_usage_signal, "record_usage", spy
+    )
+
+
+class UsageAttributionKillSwitchTests(AttributionCase):
+    """The rollout flag is the FINAL authority before ``used``.
+
+    A v2 ``obmtcap_`` may still be unexpired and the trusted binding
+    still valid; with the flag OFF nothing may be recorded.
+    """
+
+    def _attribute_with_flag_off(self, userefs):
+        calls = []
+
+        with patch.dict(
+            os.environ,
+            {USAGE_ATTRIBUTION_ENV: "0"},
+            clear=False,
+        ), _record_usage_spy(calls):
+            report = self._attribute(userefs)
+
+        return report, calls
+
+    def _assert_no_usage(self):
+        usage = self._usage()
+
+        self.assertEqual(usage["used_count"], 0)
+        self.assertEqual(usage["used_memory_ids"], [])
+        self.assertEqual(
+            [
+                event
+                for event in usage["events"]
+                if event["stage"] == "used"
+            ],
+            [],
+        )
+
+    def test_flag_off_blocks_record_usage(self):
+        surface_before = live_recall_usage_surface_path(
+            CID, RID
+        ).read_text(encoding="utf-8")
+
+        report, calls = self._attribute_with_flag_off(
+            [self.refs[1], self.refs[3]]
+        )
+
+        self.assertFalse(report["recorded"])
+        self.assertEqual(
+            report["reason"], "usage_attribution_disabled"
+        )
+        self.assertIn(
+            report["reason"], SAFE_ATTRIBUTION_REASONS
+        )
+        self.assertEqual(report["requested_ref_count"], 2)
+        self.assertEqual(report["accepted_ref_count"], 0)
+        self.assertEqual(report["newly_used_count"], 0)
+
+        # ``record_usage()`` is never reached.
+        self.assertEqual(calls, [])
+
+        self._assert_no_usage()
+
+        self.assertEqual(
+            live_recall_usage_surface_path(
+                CID, RID
+            ).read_text(encoding="utf-8"),
+            surface_before,
+        )
+
+    def test_flag_off_is_the_first_layer(self):
+        # Even a malformed ref cannot get a different answer while the
+        # flag is OFF: the refusal happens before any ref handling.
+        report, calls = self._attribute_with_flag_off(
+            ["not-a-ref"]
+        )
+
+        self.assertEqual(
+            report["reason"], "usage_attribution_disabled"
+        )
+        self.assertEqual(calls, [])
+
+        self._assert_no_usage()
+
+    def test_flag_off_ack_is_privacy_safe(self):
+        report, _calls = self._attribute_with_flag_off(
+            [self.refs[1]]
+        )
+
+        rendered = render_live_recall_usage_ack(report)
+
+        payload = json.loads(
+            rendered.split("\n", 1)[1]
+        )
+
+        self.assertEqual(
+            payload,
+            {
+                "status": "refused",
+                "reason": "usage_attribution_disabled",
+            },
+        )
+
+        for forbidden in (
+            "useref",
+            "mem-",
+            DEFAULT_RECALL_ID,
+            CID,
+            RID,
+        ):
+            self.assertNotIn(forbidden, rendered)
+
+
+class ProvenanceTamperTests(AttributionCase):
+    """A structurally valid tampered surface can never record ``used``.
+
+    The structural validator still accepts every mutation below; only
+    the provenance re-validation against the real persisted sources
+    can refuse it.
+    """
+
+    def _tamper(self, mutate):
+        path = live_recall_usage_surface_path(CID, RID)
+
+        artifact = json.loads(
+            path.read_text(encoding="utf-8")
+        )
+
+        mutate(artifact)
+
+        path.write_text(
+            json.dumps(artifact), encoding="utf-8"
+        )
+
+        surface = read_live_recall_usage_surface(
+            conversation_id=CID,
+            cognitive_request_id=RID,
+        )
+
+        # Structural validation alone passes: the tamper is only
+        # caught by provenance.
+        self.assertIsInstance(surface, dict)
+
+        return surface
+
+    def _assert_tamper_refused(self, useref):
+        calls = []
+
+        with _record_usage_spy(calls):
+            report = self._attribute([useref])
+
+        self.assertFalse(report["recorded"])
+        self.assertEqual(
+            report["reason"],
+            "usage_mapping_provenance_invalid",
+        )
+        self.assertIn(
+            report["reason"], SAFE_ATTRIBUTION_REASONS
+        )
+        self.assertEqual(report["newly_used_count"], 0)
+        self.assertEqual(calls, [])
+
+        usage = self._usage()
+
+        self.assertEqual(usage["used_count"], 0)
+        self.assertEqual(usage["used_memory_ids"], [])
+        self.assertEqual(
+            [
+                event
+                for event in usage["events"]
+                if event["stage"] == "used"
+            ],
+            [],
+        )
+
+    def test_swapped_memory_id_cannot_record_used(self):
+        # mem-2 is loaded by the SAME recall and projected at rank 2.
+        self._tamper(
+            lambda artifact: artifact["mappings"][0].update(
+                {"memory_id": "mem-2"}
+            )
+        )
+
+        self._assert_tamper_refused(self.refs[1])
+
+    def test_forged_request_fingerprint_cannot_record_used(self):
+        self._tamper(
+            lambda artifact: artifact["mappings"][1].update(
+                {"source_request_fingerprint": "b" * 64}
+            )
+        )
+
+        self._assert_tamper_refused(self.refs[2])
+
+    def test_forged_model_result_digest_cannot_record_used(self):
+        self._tamper(
+            lambda artifact: artifact["mappings"][1].update(
+                {"source_model_result_sha256": "c" * 64}
+            )
+        )
+
+        self._assert_tamper_refused(self.refs[2])
+
+    def test_shifted_rank_cannot_record_used(self):
+        self._tamper(
+            lambda artifact: artifact["mappings"][2].update(
+                {"rank": 4}
+            )
+        )
+
+        self._assert_tamper_refused(self.refs[3])
+
+    def test_flipped_kind_cannot_record_used(self):
+        self._tamper(
+            lambda artifact: artifact["mappings"][1].update(
+                {"kind": "anchor"}
+            )
+        )
+
+        self._assert_tamper_refused(self.refs[2])
+
+    def test_borrowed_recall_id_cannot_record_used(self):
+        # A second REAL recall of the same request exists, so the
+        # tampered recall id is not a fake string -- it is simply not
+        # this mapping's provenance.
+        second = seed_recall_control_plane(
+            self.root,
+            ["mem-2", "mem-3"],
+            recall_id="recall_" + "2" * 32,
+        )
+
+        self._tamper(
+            lambda artifact: artifact["mappings"][0].update(
+                {"recall_id": second["recall_id"]}
+            )
+        )
+
+        self._assert_tamper_refused(self.refs[1])
+
+    def test_unselected_tampered_mapping_does_not_block(self):
+        # Provenance is checked for the SELECTED mappings only, so a
+        # tampered mapping of another rank cannot be exploited to
+        # block an otherwise legitimate call.
+        self._tamper(
+            lambda artifact: artifact["mappings"][1].update(
+                {"source_request_fingerprint": "b" * 64}
+            )
+        )
+
+        calls = []
+
+        with _record_usage_spy(calls):
+            report = self._attribute([self.refs[1]])
+
+        self.assertTrue(report["recorded"])
+        self.assertEqual(len(calls), 1)
+
+        self.assertEqual(
+            self._usage()["used_memory_ids"], ["mem-1"]
+        )
+
+    def test_loaded_but_not_projected_cannot_record_used(self):
+        with tempfile.TemporaryDirectory() as root:
+            with patch.dict(
+                os.environ,
+                {
+                    "OMBRE_CONTEXT_STATE_DIR": root,
+                    USAGE_ATTRIBUTION_ENV: "1",
+                },
+                clear=False,
+            ):
+                memrefs = seed_live_exposure(
+                    root, _exposed_memories()
+                )
+
+                many = [
+                    "mem-%d" % index
+                    for index in range(1, 41)
+                ]
+
+                plane = seed_recall_control_plane(
+                    root, many
+                )
+
+                report = build_live_recall_usage_surface(
+                    conversation_id=CID,
+                    cognitive_request_id=RID,
+                    anchor_ref=memrefs[0],
+                    model_result=projected_model_result(
+                        many[:3]
+                    ),
+                )
+
+                self.assertTrue(report["stored"])
+
+                projection = project_live_recall_result(
+                    artifact=plane["artifact"]
+                )
+
+                projected_ranks = {
+                    item["rank"]
+                    for item in projection["memories"]
+                }
+
+                self.assertLess(
+                    len(projected_ranks), len(many)
+                )
+
+                dropped_rank = max(projected_ranks) + 1
+
+                real_item = plane["artifact"]["memories"][
+                    dropped_rank - 1
+                ]
+
+                # Really loaded, a real artifact rank -- and never
+                # part of the model projection.
+                self.assertIn(
+                    real_item["memory_id"],
+                    plane["loaded_memory_ids"],
+                )
+                self.assertNotIn(
+                    dropped_rank, projected_ranks
+                )
+
+                path = live_recall_usage_surface_path(
+                    CID, RID
+                )
+
+                artifact = json.loads(
+                    path.read_text(encoding="utf-8")
+                )
+
+                template = artifact["mappings"][1]
+
+                artifact["mappings"].append(
+                    {
+                        "useref": new_useref(),
+                        "recall_id": template["recall_id"],
+                        "memory_id": real_item["memory_id"],
+                        "rank": dropped_rank,
+                        "kind": (
+                            "anchor"
+                            if real_item["reason"]
+                            == "anchor_memory"
+                            else "related"
+                        ),
+                        "source_request_fingerprint":
+                            template[
+                                "source_request_fingerprint"
+                            ],
+                        "source_model_result_sha256":
+                            template[
+                                "source_model_result_sha256"
+                            ],
+                    }
+                )
+
+                path.write_text(
+                    json.dumps(artifact),
+                    encoding="utf-8",
+                )
+
+                surface = read_live_recall_usage_surface(
+                    conversation_id=CID,
+                    cognitive_request_id=RID,
+                )
+
+                self.assertIsInstance(surface, dict)
+
+                forged_ref = surface["mappings"][-1][
+                    "useref"
+                ]
+
+                calls = []
+
+                with _record_usage_spy(calls):
+                    usage_report = (
+                        attribute_live_recall_usage(
+                            conversation_id=CID,
+                            cognitive_request_id=RID,
+                            userefs=[forged_ref],
+                        )
+                    )
+
+                self.assertFalse(
+                    usage_report["recorded"]
+                )
+                self.assertEqual(
+                    usage_report["reason"],
+                    "usage_mapping_provenance_invalid",
+                )
+                self.assertEqual(calls, [])
+
+                usage = read_usage(root)
+
+                self.assertEqual(usage["used_count"], 0)
+                self.assertEqual(
+                    usage["used_memory_ids"], []
+                )
+                self.assertEqual(
+                    [
+                        event
+                        for event in usage["events"]
+                        if event["stage"] == "used"
+                    ],
+                    [],
+                )
 
 
 class StaticForbiddenChecksTests(unittest.TestCase):

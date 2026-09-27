@@ -9,6 +9,7 @@ from ombrebrain.context.live_recall_usage_surface import (
     is_valid_useref,
     read_live_recall_usage_surface,
     resolve_usage_refs_max_refs,
+    validate_live_recall_usage_surface_provenance,
 )
 from ombrebrain.context.memory_usage_signal import (
     read_memory_usage,
@@ -34,6 +35,22 @@ from ombrebrain.context.recall_types import (
 # trusted ``conversation_id`` + ``cognitive_request_id`` are injected
 # by the transport from the trusted ContextVar binding; the model can
 # never supply them, and it never sees a raw memory id or a recall id.
+#
+# A ``useref`` is resolved to a mapping by the request-scoped surface,
+# and that mapping is then re-validated against the REAL persisted
+# provenance chain (Recall Request + Related Recall + Usage Signal)
+# before anything may be recorded. The surface's own structural
+# validity is never authority: a structurally-valid tamper -- a
+# swapped ``memory_id``, a rewritten 64-hex fingerprint / digest, a
+# shifted ``rank``, a flipped ``kind`` or a mapping borrowed from
+# another real recall of the same request -- fails the WHOLE call
+# closed, so ``record_usage()`` is never reached and ``used`` never
+# changes.
+#
+# This API is also the FINAL kill-switch for
+# ``OMBRE_GATEWAY_CONTEXT_USAGE_ATTRIBUTION``: with the flag OFF the
+# call is refused before any surface is even read, so an old but
+# still-unexpired v2 capability can never append a usage ref.
 #
 # ``used`` is NEVER inferred. There is no answer-text scan, no keyword
 # matching, no embedding similarity, no LLM judge and no "the Recall
@@ -76,6 +93,10 @@ _REASON_TOO_MANY = "too_many_refs"
 _REASON_SURFACE_UNAVAILABLE = (
     "usage_surface_unavailable"
 )
+_REASON_PROVENANCE_INVALID = (
+    "usage_mapping_provenance_invalid"
+)
+_REASON_DISABLED = "usage_attribution_disabled"
 _REASON_RECORD_FAILED = "usage_record_failed"
 
 SAFE_ATTRIBUTION_REASONS = frozenset(
@@ -86,6 +107,8 @@ SAFE_ATTRIBUTION_REASONS = frozenset(
         _REASON_MIXED_RECALLS,
         _REASON_TOO_MANY,
         _REASON_SURFACE_UNAVAILABLE,
+        _REASON_PROVENANCE_INVALID,
+        _REASON_DISABLED,
         _REASON_RECORD_FAILED,
     }
 )
@@ -177,21 +200,40 @@ def attribute_live_recall_usage(
     The trusted caller binds ``conversation_id`` and
     ``cognitive_request_id``; the model may only pass ``userefs``.
 
+    The rollout flag is the FINAL authority: with
+    ``OMBRE_GATEWAY_CONTEXT_USAGE_ATTRIBUTION`` OFF the call is
+    refused before any surface is read, so an already-minted, still
+    unexpired v2 capability can never append a usage ref.
+
     Resolution is exact and request-scoped:
 
         THIS CID/RID surface file
           -> every useref must exist in it (unknown / fake /
              cross-request / cross-conversation refs are refused)
-            -> all refs must belong to ONE recall id
-              -> frozen ``record_usage()`` (used ⊆ loaded)
+            -> every selected mapping re-validated against the REAL
+               persisted Recall Request / Related Recall / Usage
+               Signal (a structurally-valid tamper fails the WHOLE
+               call closed)
+              -> all refs must belong to ONE recall id
+                -> frozen ``record_usage()`` (used ⊆ loaded)
 
     Fail-closed: any refusal records nothing and never raises.
     """
 
+    requested = (
+        len(userefs)
+        if isinstance(userefs, (list, tuple))
+        else 0
+    )
+
+    if not live_recall_usage_attribution_enabled():
+        return _report(
+            reason=_REASON_DISABLED,
+            requested_ref_count=requested,
+        )
+
     if not isinstance(userefs, (list, tuple)):
         return _report(reason=_REASON_INVALID_REFS)
-
-    requested = len(userefs)
 
     if (
         not is_valid_conversation_id(conversation_id)
@@ -299,6 +341,25 @@ def attribute_live_recall_usage(
             )
 
         recall_id = next(iter(recall_ids))
+
+        # The surface's own provenance is NEVER trusted: every
+        # SELECTED mapping is re-validated against the real persisted
+        # Recall Request, Related Recall and Usage Signal -- the
+        # request fingerprint and the model projection are recomputed
+        # from the real artifacts. Any invalid mapping fails the whole
+        # call closed and ``record_usage()`` is never reached.
+        if not validate_live_recall_usage_surface_provenance(
+            conversation_id=conversation_id,
+            cognitive_request_id=(
+                cognitive_request_id
+            ),
+            artifact=surface,
+            mappings=resolved,
+        ):
+            return _report(
+                reason=_REASON_PROVENANCE_INVALID,
+                requested_ref_count=requested,
+            )
 
         usage = read_memory_usage(
             conversation_id=conversation_id,

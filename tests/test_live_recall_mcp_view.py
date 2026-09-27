@@ -2020,6 +2020,107 @@ class MemoryCapabilityViewTests(unittest.TestCase):
             "ack",
         )
 
+    def test_flag_off_invalidates_an_existing_v2_token(self):
+        """An old, unexpired ``obmtcap_`` dies when the flag flips.
+
+        The token is minted while Usage Attribution is ON, the
+        trusted binding exists and the Usage Surface is already
+        persisted; with the flag OFF the SAME token is unauthorized,
+        ``UseMemory`` never runs and no ``used`` event can appear.
+        """
+
+        root, memrefs = self._seed()
+
+        seed_recall_control_plane(root, ["mem-1", "mem-2"])
+
+        with self._state_env(root):
+            token = self._mint()
+
+            self.assertIsNotNone(
+                resolve_live_memory_transport_capability(
+                    token
+                )
+            )
+
+            surface_report = (
+                build_live_recall_usage_surface(
+                    conversation_id=CID,
+                    cognitive_request_id=RID,
+                    anchor_ref=memrefs[0],
+                    model_result=projected_model_result(
+                        ["mem-1", "mem-2"]
+                    ),
+                )
+            )
+
+            self.assertTrue(surface_report["stored"])
+
+            useref = surface_report["usage_refs"][0][
+                "useref"
+            ]
+
+            with patch.dict(
+                os.environ,
+                {
+                    "OMBRE_GATEWAY_CONTEXT_USAGE_ATTRIBUTION":
+                        "0"
+                },
+                clear=False,
+            ):
+                self.assertIsNone(
+                    resolve_live_memory_transport_capability(
+                        token
+                    )
+                )
+
+                # The probe stays expiry-only: the token is live, it
+                # is simply no longer authorized.
+                self.assertFalse(
+                    live_memory_transport_capability_expired(
+                        token
+                    )
+                )
+
+                app, fake = self._app()
+
+                sent = _run(
+                    _drive(
+                        app,
+                        _tools_call(
+                            "UseMemory",
+                            {"userefs": [useref]},
+                        ),
+                        auth_header=token,
+                    )
+                )
+
+            usage = read_usage(root)
+
+            # Back ON: the SAME token works again inside its original
+            # TTL, so the invalidation really was the flag.
+            self.assertIsNotNone(
+                resolve_live_memory_transport_capability(
+                    token
+                )
+            )
+
+        status, _headers, _payload, _raw = _parse(sent)
+
+        self.assertEqual(status, 401)
+        self.assertEqual(fake.requests, 0)
+        self.assertEqual(fake.handler_calls, [])
+
+        self.assertEqual(usage["used_count"], 0)
+        self.assertEqual(usage["used_memory_ids"], [])
+        self.assertEqual(
+            [
+                event
+                for event in usage["events"]
+                if event["stage"] == "used"
+            ],
+            [],
+        )
+
     def test_end_to_end_attribution_through_the_v2_view(self):
         root, memrefs = self._seed()
 
