@@ -340,10 +340,19 @@ def select_context_injected_body(
       conversation-scoped "latest" files a concurrent request on the
       same conversation may already have overwritten. Request-local
       identity is an ADDITIONAL guarantee: every content-integrity
-      check below still runs unchanged, a malformed / mismatched
-      binding is denied (fail-open to the exact input body), and when
-      either artifact is absent the selector keeps its existing
-      conversation-scoped behaviour.
+      check below still runs unchanged and a malformed / mismatched
+      binding is denied (fail-open to the exact input body).
+
+      The three cases are distinguished explicitly:
+
+        - NEITHER artifact supplied: the legacy conversation-scoped
+          compatibility path is used;
+        - BOTH supplied as conversation-bound dicts: the exact
+          request-local pair is used;
+        - exactly one supplied, or either supplied but malformed:
+          a partial / malformed request-local binding FAILS CLOSED
+          (exact input body, reason ``invalid_request_local_binding``)
+          and never reads conversation-scoped files.
     """
 
     if not _truthy(
@@ -435,21 +444,47 @@ def _select_enabled(
         )
 
     # --------------------------------------------------
-    # 2. Preview
+    # 2. Request-local authority vs legacy compatibility
     # --------------------------------------------------
 
-    use_request_local = (
-        isinstance(
-            request_local_preview,
-            dict,
-        )
-        and isinstance(
-            request_local_gate,
-            dict,
-        )
+    # Three cases, distinguished explicitly:
+    #   1. NEITHER request-local artifact supplied
+    #        -> legacy compatibility path MAY read conversation-scoped
+    #           "latest" files;
+    #   2. BOTH supplied as conversation-bound dicts
+    #        -> use the exact request-local pair;
+    #   3. ANY incomplete/malformed mixture (exactly one supplied, or
+    #      either supplied but malformed / non-dict)
+    #        -> malformed / partial request-local binding: FAIL CLOSED
+    #           (return the exact forward_body), never read a
+    #           conversation-scoped Preview/Gate.
+    # A caller that supplies only one artifact, or a malformed one, has
+    # already declared a request-local authority path; that is NOT the
+    # same as supplying no request-local evidence at all.
+    request_local_supplied = (
+        request_local_preview is not None
+        or request_local_gate is not None
     )
 
-    if use_request_local:
+    if request_local_supplied:
+        if (
+            not isinstance(
+                request_local_preview,
+                dict,
+            )
+            or not isinstance(
+                request_local_gate,
+                dict,
+            )
+        ):
+            return (
+                forward_body,
+                _denied(
+                    report,
+                    "invalid_request_local_binding",
+                ),
+            )
+
         preview = request_local_preview
 
         # Request-local identity is only trustworthy when the pair is
@@ -470,7 +505,11 @@ def _select_enabled(
                     "request_local_conversation_mismatch",
                 ),
             )
+
+        use_request_local = True
     else:
+        use_request_local = False
+
         preview = _read_json_file(
             _root()
             / "injection_preview"

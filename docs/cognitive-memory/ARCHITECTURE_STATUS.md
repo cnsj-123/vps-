@@ -75,9 +75,11 @@ request-local workspace artifact        =  runtime authority for THIS request
 `conversation-scoped artifact != request-local authority`. A conversation-scoped
 file (`unified_context_candidate/{cid}.json`, `injection_preview/{cid}.json`,
 `injection_gate/{cid}.json`, …) is a **latest persisted observation** that a
-concurrent request on the same conversation may overwrite at any time. It stays
-on disk for observability, debugging and compatibility. It is **no longer the
-runtime authority** for a request that produced its own artifacts.
+concurrent request on the same conversation may overwrite at any time. It is
+**no longer the runtime authority** for a request that produced its own artifacts.
+It still serves observability, debugging and compatibility, and a **successful
+Preview/Gate persistence is additionally a v0 freshness / liveness prerequisite**
+(§2.22 "Persistence semantics") — so it is not merely optional observability.
 
 The pipeline now binds each request's exact stage outputs into an in-memory
 **request-local Cognitive Workspace** (see §2.22). Downstream stages for THIS
@@ -111,8 +113,9 @@ Inside `_run_context_pipeline_selection`:
 
 ```
 1. mint cognitive_request_id (ctxreq_<32 hex>, internal only)
-2. create ContextRequestWorkspace(conversation_id, cognitive_request_id)   (in-memory, one per request)
-3. observe_context_sources(forward_body)             -> conversation_id
+2. observe_context_sources(forward_body)             -> conversation_id
+3. create ContextRequestWorkspace(conversation_id, cognitive_request_id)
+     (in-memory, one per request; conversation_id is only known now)
 4. observe_unified_preview_gate(conversation_id, cpu, workspace=ws) -> context_chain_fresh
      - conversation sources -> Unified -> Confidence -> Memory observer chain
        (Surfacing -> Lifecycle -> Flash -> Recall Surface -> Exposure Ledger)
@@ -389,8 +392,12 @@ workspace is present: `update_context_injection_preview_from_unified(...)` rende
 the Preview from **this request's** explicit Unified object, and
 `update_context_injection_gate_from_request_local(...)` evaluates the Gate from
 **this request's** explicit Candidate / Unified / Preview. Persistence still
-writes the conversation-scoped files for observability / compatibility, but the
-request-local artifacts are the runtime authority for this request (§2.22).
+writes the conversation-scoped files. Those files are not the runtime CONTENT /
+IDENTITY authority for THIS request, but persistence is **not** merely optional
+observability: a successful store (`stored=true`) remains a v0 freshness
+prerequisite, so a write failure blocks freshness and prevents injection
+(§2.22 "Persistence semantics"). The request-local artifacts are the runtime
+authority for this request.
 
 ### 2.15 Mutation Shadow
 
@@ -527,12 +534,14 @@ Properties:
 - `has_request_local_chain` — true only when THIS request produced its own
   Candidate + Unified. When false, every downstream stage keeps its existing
   conversation-scoped behaviour.
-- `has_preview_gate_evidence` — true when THIS request stored its own
-  Preview + Gate (even a deny, even a binding that later proves malformed).
-  Distinguishes "this request produced a decision" from "this request produced no
-  decision", so a malformed / foreign binding fails **closed** for mutation
-  instead of silently falling back to a conversation-scoped "latest" pair a
-  concurrent request may own.
+- `has_any_preview_gate_evidence` — true when EITHER Preview OR Gate evidence
+  exists, including a partial binding (only one side) or a malformed binding
+  (non-`None` non-dict). This is the tri-state discriminator downstream stages
+  use: **no** evidence at all permits the legacy conversation-scoped fallback;
+  **any** evidence means the caller must use this request's complete pair or fail
+  closed.
+- `has_preview_gate_evidence` — true when BOTH sides are dicts (the "complete
+  pair" arm); a deny is still a complete pair.
 - `request_local_preview_gate()` — returns the pair only when both artifacts are
   present and bound to this workspace's `conversation_id`; otherwise
   `(None, None)`.
@@ -553,9 +562,31 @@ Fail semantics (unchanged invariants, preserved):
   boundaries.
 - Request-local identity is an **additional** guarantee, never a replacement for
   content-integrity checks.
-- A malformed or mismatched request-local binding fails **closed** for the
-  Mutation Shadow (mutation is skipped) and fails **open** for request forwarding
-  (the exact input body is kept).
+- A **partial or malformed** request-local binding (exactly one artifact
+  supplied / a non-dict value) is NOT equivalent to "no request-local evidence was
+  supplied". It fails **closed** for the Mutation Shadow (mutation is skipped) and
+  fails **open** for request forwarding (the exact input body is kept), and it
+  **never** falls back to conversation-scoped Preview/Gate. The selector reports
+  the stable reason `invalid_request_local_binding`.
+- A complete-but-foreign binding fails closed the same way
+  (`request_local_conversation_mismatch`).
+
+### Persistence semantics (v0, intentionally unchanged)
+
+Conversation-scoped persisted artifacts are **not** the runtime CONTENT /
+IDENTITY authority for THIS request. But they are also **not** merely optional
+observability: for v0, a **successful Preview/Gate persistence** (`stored=true`)
+remains a **freshness / liveness prerequisite**. `observe_unified_preview_gate`
+returns `context_chain_fresh=False` when Preview or Gate did not persist, and Real
+Injection is then not attempted at all — so an actual write failure can never
+inject stale conversation-scoped state. This contract is unchanged by the
+request-local workspace task and may only be redefined by a future explicit task.
+
+Do not confuse the two properties:
+
+- removing conversation-scoped files **after** a successful decision proves the
+  already-captured request-local decision no longer needs a later re-read;
+- it does **not** prove that an initial write failure is ignored.
 
 ### 2.23 Request-local authority migration status
 

@@ -86,15 +86,43 @@ class ContextRequestWorkspace:
         )
 
     @property
-    def has_preview_gate_evidence(self) -> bool:
-        """True when THIS request stored its own Preview + Gate.
+    def has_any_preview_gate_evidence(self) -> bool:
+        """True when ANY request-local Preview OR Gate evidence exists.
 
-        Distinguishes "this request produced a Preview/Gate decision"
-        (even a deny, or a binding that turns out to be malformed) from
-        "this request produced no Preview/Gate at all". Downstream
-        stages use it to fail closed on a malformed / foreign binding
-        instead of silently falling back to a conversation-scoped
-        "latest" pair a concurrent request may own.
+        This is the tri-state discriminator downstream stages need:
+
+          1. ``has_any_preview_gate_evidence`` is False
+             -> NO request-local Preview/Gate evidence at all; the
+                legacy conversation-scoped compatibility path is
+                permitted.
+          2. ``has_any_preview_gate_evidence`` is True but
+             ``request_local_preview_gate()`` returns ``(None, None)``
+             -> SOME evidence exists but the pair is incomplete or
+                invalid; the caller must fail closed, never fall back
+                to conversation-scoped "latest" files.
+          3. ``has_any_preview_gate_evidence`` is True and
+             ``request_local_preview_gate()`` returns a pair
+             -> a complete, conversation-bound pair exists.
+
+        Covers a partial binding (only one side set) and a malformed
+        binding (non-``None`` non-dict) alike: once either side carries
+        anything, THIS request has declared a request-local authority
+        path.
+        """
+
+        return (
+            self.preview is not None
+            or self.gate is not None
+        )
+
+    @property
+    def has_preview_gate_evidence(self) -> bool:
+        """True when THIS request stored a complete Preview + Gate pair.
+
+        Both sides must be dicts. This is the "complete pair" arm of
+        the tri-state above; a deny is still a complete pair. It does
+        NOT distinguish "no evidence" from "partial evidence" -- use
+        ``has_any_preview_gate_evidence`` for that fallback decision.
         """
 
         return (

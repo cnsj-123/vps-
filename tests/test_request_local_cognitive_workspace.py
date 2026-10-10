@@ -15,6 +15,9 @@ from unittest.mock import (
 from ombrebrain.context import (
     context_pipeline_coordinator as coordinator,
 )
+from ombrebrain.context import (
+    context_real_injection as real_injection_module,
+)
 from ombrebrain.context.context_injection_gate import (
     update_context_injection_gate,
     update_context_injection_gate_from_request_local,
@@ -302,6 +305,67 @@ class WorkspaceBindingTests(unittest.TestCase):
             (preview, gate),
         )
 
+    def test_partial_evidence_is_not_absent_evidence(self):
+        # Preview only: some evidence exists, but the pair is
+        # incomplete. It must NOT read as "no evidence at all".
+        preview_only = ContextRequestWorkspace(
+            conversation_id=CID,
+            preview={
+                "conversation_id": CID,
+                "rendered": "x",
+            },
+        )
+
+        self.assertTrue(
+            preview_only.has_any_preview_gate_evidence
+        )
+        self.assertFalse(
+            preview_only.has_preview_gate_evidence
+        )
+        self.assertEqual(
+            preview_only.request_local_preview_gate(),
+            (None, None),
+        )
+
+        # Gate only: mirror case.
+        gate_only = ContextRequestWorkspace(
+            conversation_id=CID,
+            gate={
+                "conversation_id": CID,
+                "decision": "allow_shadow",
+            },
+        )
+
+        self.assertTrue(
+            gate_only.has_any_preview_gate_evidence
+        )
+        self.assertFalse(
+            gate_only.has_preview_gate_evidence
+        )
+        self.assertEqual(
+            gate_only.request_local_preview_gate(),
+            (None, None),
+        )
+
+    def test_malformed_evidence_is_not_absent_evidence(self):
+        # A non-dict binding is malformed evidence, not absent
+        # evidence: the caller declared a request-local path.
+        workspace = ContextRequestWorkspace(
+            conversation_id=CID,
+            preview="not-a-dict",
+        )
+
+        self.assertTrue(
+            workspace.has_any_preview_gate_evidence
+        )
+        self.assertFalse(
+            workspace.has_preview_gate_evidence
+        )
+        self.assertEqual(
+            workspace.request_local_preview_gate(),
+            (None, None),
+        )
+
     def test_chain_requires_both_candidate_and_unified(
         self,
     ):
@@ -372,8 +436,14 @@ class SameConversationAuthorityTests(
 
     The real Unified producer, the real Preview renderer and the real
     Gate evaluator are used -- nothing about the decision chain is
-    mocked. Synchronization is explicit (an asyncio Event) rather than
-    a sleep.
+    mocked. These are deterministic sequential overwrite tests: request
+    A captures and consumes its request-local evidence, then request B
+    advances the shared conversation-scoped files, then A's decision is
+    re-checked against its own request-local evidence. No event or
+    barrier is needed, because the property under test is "A's
+    authority does not depend on the shared latest file", not producer
+    interleaving. Producer-level event/barrier concurrency coverage
+    lives in the existing memory-shadow tests.
     """
 
     def setUp(self):
@@ -714,7 +784,7 @@ class SameConversationAuthorityTests(
             evidence_b["render_sha256"],
         )
 
-    async def test_persistence_loss_keeps_request_local_decision(
+    async def test_later_removal_of_conversation_files_keeps_decision(
         self,
     ):
         self.bind([])
@@ -735,9 +805,13 @@ class SameConversationAuthorityTests(
             gate_a,
         )
 
-        # A persistence failure / removal of the conversation-scoped
-        # observation files must not destroy THIS request's decision,
-        # because the decision does not depend on those files.
+        # These conversation-scoped files were written SUCCESSFULLY for
+        # THIS request (the chain was only marked fresh because
+        # Preview/Gate reported stored=true). Removing them afterwards
+        # proves that an already-captured request-local decision no
+        # longer needs a later re-read. It does NOT prove that an
+        # initial write failure is ignored -- that separate property is
+        # covered by the persist-failure regression tests below.
         for kind in (
             "injection_preview",
             "injection_gate",
@@ -976,6 +1050,217 @@ class SameConversationAuthorityTests(
             chain_b["unified"]["revision"],
         )
 
+    async def test_partial_workspace_evidence_fails_closed(
+        self,
+    ):
+        self.bind([])
+
+        # Valid conversation-scoped B state exists on disk.
+        result_b = await self._produce(
+            fact="B fact",
+            candidate_revision=11,
+            source_revision=6,
+            query="QUERY_B",
+        )
+        chain_b = result_b["request_local_chain"]
+        evidence_b, gate_b = self._render_and_gate(
+            chain_b
+        )
+
+        body = body_from(base_payload())
+
+        for preview_value, gate_value in (
+            (evidence_b, None),
+            (None, gate_b),
+        ):
+            workspace = ContextRequestWorkspace(
+                conversation_id=CID,
+            )
+            workspace.preview = preview_value
+            workspace.gate = gate_value
+
+            # Partial evidence is NOT absent evidence.
+            self.assertTrue(
+                workspace.has_any_preview_gate_evidence
+            )
+            self.assertEqual(
+                workspace.request_local_preview_gate(),
+                (None, None),
+            )
+
+            request_local_builder = Mock()
+            runtime_builder = Mock()
+
+            with patch.dict(
+                os.environ,
+                {
+                    "OMBRE_GATEWAY_CONTEXT_REQUEST_MUTATION_SHADOW":
+                        "1",
+                    _REAL_ENV: "1",
+                },
+                clear=False,
+            ), patch.object(
+                coordinator,
+                "build_context_request_mutation_shadow",
+                request_local_builder,
+            ), patch.object(
+                coordinator,
+                "build_context_request_mutation_shadow_from_runtime",
+                runtime_builder,
+            ):
+                coordinator.observe_request_mutation(
+                    CID,
+                    body,
+                    workspace=workspace,
+                )
+
+                selected = (
+                    coordinator.select_real_injection(
+                        CID,
+                        body,
+                        context_chain_fresh=True,
+                        workspace=workspace,
+                    )
+                )
+
+            # Neither mutation path runs (no B shadow), and forwarding
+            # stays exactly the input body (no B injection).
+            request_local_builder.assert_not_called()
+            runtime_builder.assert_not_called()
+            self.assertEqual(selected, body)
+
+    async def test_preview_persist_failure_never_injects_stale_state(
+        self,
+    ):
+        self.bind([])
+
+        # A previous request left an internally-valid Preview/Gate pair
+        # on the shared conversation-scoped files.
+        old = await self._produce(
+            fact="OLD fact",
+            candidate_revision=10,
+            source_revision=5,
+            query="QUERY_OLD",
+        )
+        self._render_and_gate(
+            old["request_local_chain"]
+        )
+
+        body = body_from(base_payload())
+        workspace = ContextRequestWorkspace()
+
+        failing_preview = Mock(
+            return_value=({"stored": False}, None)
+        )
+
+        with patch.dict(
+            os.environ,
+            {
+                "OMBRE_GATEWAY_CONTEXT_UNIFIED_CANDIDATE_SHADOW":
+                    "1",
+                "OMBRE_GATEWAY_CONTEXT_INJECTION_PREVIEW_SHADOW":
+                    "1",
+                "OMBRE_GATEWAY_CONTEXT_INJECTION_GATE_SHADOW":
+                    "1",
+                _REAL_ENV: "1",
+            },
+            clear=False,
+        ), patch.object(
+            coordinator,
+            "update_context_injection_preview_from_unified",
+            failing_preview,
+        ):
+            fresh = (
+                await coordinator
+                .observe_unified_preview_gate(
+                    CID,
+                    cognitive_request_id=(
+                        "ctxreq_" + "c" * 32
+                    ),
+                    forward_body=body,
+                    workspace=workspace,
+                )
+            )
+
+            selected = coordinator.select_real_injection(
+                CID,
+                body,
+                context_chain_fresh=fresh,
+                workspace=workspace,
+            )
+
+        # An actual Preview write failure does not mark the chain
+        # fresh and never injects the stale conversation-scoped state.
+        self.assertFalse(fresh)
+        self.assertEqual(selected, body)
+
+    async def test_gate_persist_failure_never_injects_stale_state(
+        self,
+    ):
+        self.bind([])
+
+        old = await self._produce(
+            fact="OLD fact",
+            candidate_revision=10,
+            source_revision=5,
+            query="QUERY_OLD",
+        )
+        self._render_and_gate(
+            old["request_local_chain"]
+        )
+
+        body = body_from(base_payload())
+        workspace = ContextRequestWorkspace()
+
+        failing_gate = Mock(
+            return_value={
+                "stored": False,
+                "decision": "deny",
+            }
+        )
+
+        with patch.dict(
+            os.environ,
+            {
+                "OMBRE_GATEWAY_CONTEXT_UNIFIED_CANDIDATE_SHADOW":
+                    "1",
+                "OMBRE_GATEWAY_CONTEXT_INJECTION_PREVIEW_SHADOW":
+                    "1",
+                "OMBRE_GATEWAY_CONTEXT_INJECTION_GATE_SHADOW":
+                    "1",
+                _REAL_ENV: "1",
+            },
+            clear=False,
+        ), patch.object(
+            coordinator,
+            "update_context_injection_gate_from_request_local",
+            failing_gate,
+        ):
+            fresh = (
+                await coordinator
+                .observe_unified_preview_gate(
+                    CID,
+                    cognitive_request_id=(
+                        "ctxreq_" + "d" * 32
+                    ),
+                    forward_body=body,
+                    workspace=workspace,
+                )
+            )
+
+            selected = coordinator.select_real_injection(
+                CID,
+                body,
+                context_chain_fresh=fresh,
+                workspace=workspace,
+            )
+
+        # Preview really persisted, but the Gate write failure alone
+        # blocks freshness, so no stale state is injected.
+        failing_gate.assert_called_once()
+        self.assertFalse(fresh)
+        self.assertEqual(selected, body)
+
 
 # ----------------------------------------------------------
 # real-injection boundary isolation
@@ -1189,6 +1474,187 @@ class RequestLocalInjectionBoundaryTests(
             "request_local_conversation_mismatch",
         )
         self.assertEqual(selected_body, self.body)
+
+    def test_preview_only_is_partial_binding_denied(self):
+        preview_a, _gate_a = self._pair(
+            "CONTEXT_A", 4
+        )
+        _preview_b, gate_b = self._pair(
+            "CONTEXT_B", 9
+        )
+
+        # Valid conversation-scoped B files exist on disk.
+        self._write(
+            "injection_preview", _preview_b
+        )
+        self._write("injection_gate", gate_b)
+
+        reader = Mock(
+            side_effect=real_injection_module._read_json_file
+        )
+
+        with patch.dict(
+            os.environ,
+            {_REAL_ENV: "1"},
+            clear=False,
+        ), patch.object(
+            real_injection_module,
+            "_read_json_file",
+            reader,
+        ):
+            selected_body, report = (
+                select_context_injected_body(
+                    self.body,
+                    conversation_id=CID,
+                    request_local_preview=preview_a,
+                    request_local_gate=None,
+                )
+            )
+
+        # Partial request-local binding: fail closed, exact body.
+        self.assertFalse(report["applied"])
+        self.assertEqual(
+            report["reason"],
+            "invalid_request_local_binding",
+        )
+        self.assertEqual(selected_body, self.body)
+        # The conversation-scoped reader was never consulted.
+        reader.assert_not_called()
+
+    def test_gate_only_is_partial_binding_denied(self):
+        _preview_a, gate_a = self._pair(
+            "CONTEXT_A", 4
+        )
+        preview_b, _gate_b = self._pair(
+            "CONTEXT_B", 9
+        )
+
+        self._write(
+            "injection_preview", preview_b
+        )
+        self._write(
+            "injection_gate", _gate_b
+        )
+
+        reader = Mock(
+            side_effect=real_injection_module._read_json_file
+        )
+
+        with patch.dict(
+            os.environ,
+            {_REAL_ENV: "1"},
+            clear=False,
+        ), patch.object(
+            real_injection_module,
+            "_read_json_file",
+            reader,
+        ):
+            selected_body, report = (
+                select_context_injected_body(
+                    self.body,
+                    conversation_id=CID,
+                    request_local_preview=None,
+                    request_local_gate=gate_a,
+                )
+            )
+
+        self.assertFalse(report["applied"])
+        self.assertEqual(
+            report["reason"],
+            "invalid_request_local_binding",
+        )
+        self.assertEqual(selected_body, self.body)
+        reader.assert_not_called()
+
+    def test_malformed_local_value_fails_closed(self):
+        _preview_a, gate_a = self._pair(
+            "CONTEXT_A", 4
+        )
+        preview_b, gate_b = self._pair(
+            "CONTEXT_B", 9
+        )
+
+        self._write(
+            "injection_preview", preview_b
+        )
+        self._write("injection_gate", gate_b)
+
+        reader = Mock(
+            side_effect=real_injection_module._read_json_file
+        )
+
+        with patch.dict(
+            os.environ,
+            {_REAL_ENV: "1"},
+            clear=False,
+        ), patch.object(
+            real_injection_module,
+            "_read_json_file",
+            reader,
+        ):
+            selected_body, report = (
+                select_context_injected_body(
+                    self.body,
+                    conversation_id=CID,
+                    request_local_preview=(
+                        "not-a-dict"
+                    ),
+                    request_local_gate=gate_a,
+                )
+            )
+
+        # A malformed local value is supplied evidence, not absent
+        # evidence: no disk fallback.
+        self.assertFalse(report["applied"])
+        self.assertEqual(
+            report["reason"],
+            "invalid_request_local_binding",
+        )
+        self.assertEqual(selected_body, self.body)
+        reader.assert_not_called()
+
+    def test_no_local_artifacts_keeps_disk_fallback(self):
+        preview_b, gate_b = self._pair(
+            "CONTEXT_B", 9
+        )
+
+        self._write(
+            "injection_preview", preview_b
+        )
+        self._write("injection_gate", gate_b)
+
+        # No request-local artifact supplied at all: the legacy
+        # conversation-scoped compatibility entry point still works.
+        with patch.dict(
+            os.environ,
+            {_REAL_ENV: "1"},
+            clear=False,
+        ):
+            selected_body, report = (
+                select_context_injected_body(
+                    self.body,
+                    conversation_id=CID,
+                )
+            )
+
+        self.assertTrue(
+            report["applied"],
+            report.get("reason"),
+        )
+        self.assertEqual(
+            report["inserted_context_sha256"],
+            preview_b["render_sha256"],
+        )
+
+        payload = json.loads(selected_body)
+        first_block = payload["messages"][
+            -1
+        ]["content"][0]
+
+        self.assertIn(
+            "CONTEXT_B",
+            first_block["text"],
+        )
 
     def test_real_injection_off_is_exact_body(self):
         preview_a, gate_a = self._pair(

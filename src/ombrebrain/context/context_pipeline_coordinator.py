@@ -1596,7 +1596,7 @@ def observe_request_mutation(
 
     has_request_local_evidence = (
         workspace is not None
-        and workspace.has_preview_gate_evidence
+        and workspace.has_any_preview_gate_evidence
     )
 
     if has_request_local_evidence:
@@ -1611,10 +1611,11 @@ def observe_request_mutation(
             request_local_preview is None
             or request_local_gate is None
         ):
-            # THIS request produced Preview/Gate evidence, but it is
-            # malformed or bound to another conversation. Fail closed:
-            # build no shadow from foreign evidence and never fall back
-            # to a conversation-scoped "latest" pair.
+            # THIS request carries some Preview/Gate evidence, but the
+            # pair is incomplete (only one side), malformed or bound to
+            # another conversation. Fail closed: build no shadow from
+            # foreign evidence and never fall back to a
+            # conversation-scoped "latest" pair.
             logger.warning(
                 "[gateway.context_request_mutation_shadow] "
                 "request_local_binding_invalid "
@@ -1756,7 +1757,7 @@ def select_real_injection(
 
     if (
         workspace is not None
-        and workspace.has_preview_gate_evidence
+        and workspace.has_any_preview_gate_evidence
     ):
         (
             request_local_preview,
@@ -1767,10 +1768,11 @@ def select_real_injection(
             request_local_preview is None
             or request_local_gate is None
         ):
-            # THIS request produced Preview/Gate evidence, but the
-            # binding is malformed or belongs to another conversation.
-            # Fail open for forwarding: keep the exact input body and
-            # never inject a pair that is not this request's own.
+            # THIS request carries some Preview/Gate evidence, but the
+            # pair is incomplete (only one side), malformed or belongs
+            # to another conversation. Fail open for forwarding: keep
+            # the exact input body and never inject a conversation-
+            # scoped "latest" pair that is not this request's own.
             logger.info(
                 "[gateway.context_real_injection] %s",
                 json.dumps(
