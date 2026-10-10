@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import tempfile
-import threading
 import unittest
 from concurrent.futures import (
     ThreadPoolExecutor,
@@ -92,6 +90,41 @@ def _body(messages):
             "messages": messages,
         }
     ).encode("utf-8")
+
+
+def _segment(
+    placement,
+    body,
+    *,
+    attachment_id="front_seg",
+):
+    """Build one canonical Frontend Memory attachment segment.
+
+    ``raw_attachment`` is the exact envelope the request carries, so
+    the model-visible footprint can be measured from real text.
+    """
+
+    return FrontendMemorySegment(
+        placement=placement,
+        source_message_index=0,
+        source_block_index=0,
+        body=body,
+        raw_attachment=_attachment(
+            "relevant_memories.txt",
+            body,
+            attachment_id,
+        ),
+    )
+
+
+def _current_raw(body, index=0):
+    """The exact attachment envelope _frontend_current_body emits."""
+
+    return _attachment(
+        "relevant_memories.txt",
+        body,
+        "front_%d" % index,
+    )
 
 
 def _frontend_current_body(
@@ -244,6 +277,16 @@ class FrontendMemoryExtractionTests(
         self.assertEqual(
             segments[0].placement, "current"
         )
+        # The exact raw envelope is exposed for model-visible
+        # footprint measurement.
+        self.assertEqual(
+            segments[0].raw_attachment,
+            _attachment(
+                "relevant_memories.txt",
+                "MEM-A",
+                "a",
+            ),
+        )
 
     def test_placement_current_and_history(
         self,
@@ -255,6 +298,14 @@ class FrontendMemoryExtractionTests(
         self.assertEqual(segments[0].body, "HIST")
         self.assertEqual(
             segments[0].placement, "history"
+        )
+        self.assertEqual(
+            segments[0].raw_attachment,
+            _attachment(
+                "relevant_memories.txt",
+                "HIST",
+                "front_hist",
+            ),
         )
 
     def test_self_closing_and_empty_are_skipped(
@@ -370,36 +421,96 @@ class ArbitrationBuilderTests(
         metrics = artifact["metrics"]
 
         self.assertEqual(
-            metrics["frontend_candidate_count"], 0
+            metrics["frontend_attachment_count"], 0
         )
         self.assertEqual(
             metrics["ob_candidate_count"], 0
         )
         self.assertEqual(
-            metrics["combined_memory_candidate_count"],
+            metrics["combined_observation_count"],
             0,
         )
         self.assertEqual(
-            metrics["frontend_token_share"], 0.0
+            metrics[
+                "frontend_model_visible_estimated_tokens"
+            ],
+            0,
         )
         self.assertEqual(
-            metrics["ob_token_share"], 0.0
+            metrics[
+                "ob_retrieved_candidate_content"
+                "_estimated_tokens"
+            ],
+            0,
         )
 
-    def test_frontend_metrics_and_token_share(
+    def test_no_ambiguous_share_metrics(self):
+        metrics = self._artifact()["metrics"]
+
+        # There is deliberately no cross-source token share: Frontend
+        # body content is model-visible while OB candidate content is
+        # not, so a share would be semantically wrong.
+        self.assertNotIn(
+            "frontend_token_share", metrics
+        )
+        self.assertNotIn(
+            "ob_token_share", metrics
+        )
+        self.assertNotIn(
+            "combined_estimated_tokens", metrics
+        )
+        self.assertNotIn(
+            "combined_memory_candidate_count",
+            metrics,
+        )
+
+    def test_one_attachment_is_one_frontend_attachment(
         self,
     ):
-        segments = (
-            FrontendMemorySegment(
-                placement="current",
-                source_message_index=0,
-                source_block_index=0,
-                body="ALPHA",
+        artifact = self._artifact(
+            frontend_segments=(
+                _segment("current", "ALPHA"),
             ),
         )
 
+        metrics = artifact["metrics"]
+
+        self.assertEqual(
+            metrics["frontend_attachment_count"], 1
+        )
+        self.assertEqual(
+            metrics[
+                "frontend_current_attachment_count"
+            ],
+            1,
+        )
+        self.assertEqual(
+            metrics[
+                "frontend_history_attachment_count"
+            ],
+            0,
+        )
+
+        observation = artifact["observations"][0]
+
+        # Attachment-level observation, never a claimed memory item.
+        self.assertEqual(
+            observation["kind"],
+            "frontend_attachment",
+        )
+        self.assertEqual(
+            observation["source"], "frontend"
+        )
+
+    def test_frontend_body_vs_model_visible_metrics(
+        self,
+    ):
+        segment = _segment("current", "ALPHA")
+
+        raw = segment.raw_attachment
+
         artifact = self._artifact(
-            frontend_segments=segments,
+            frontend_segments=(segment,),
             ob_memories=[
                 _memory("m1", "BETA")
             ],
@@ -407,50 +518,61 @@ class ArbitrationBuilderTests(
 
         metrics = artifact["metrics"]
 
+        # Body content size uses the extracted inner body only.
         self.assertEqual(
-            metrics["frontend_candidate_count"], 1
+            metrics["frontend_body_chars"], 5
         )
         self.assertEqual(
-            metrics["frontend_current_count"], 1
-        )
-        self.assertEqual(
-            metrics["frontend_history_count"], 0
-        )
-        self.assertEqual(
-            metrics["frontend_chars"], 5
-        )
-        self.assertEqual(
-            metrics["frontend_estimated_tokens"],
+            metrics["frontend_body_estimated_tokens"],
             estimate_tokens("ALPHA"),
         )
+
+        # Model-visible footprint uses the exact raw envelope.
+        self.assertEqual(
+            metrics[
+                "frontend_model_visible_chars"
+            ],
+            len(raw),
+        )
+        self.assertEqual(
+            metrics[
+                "frontend_model_visible"
+                "_estimated_tokens"
+            ],
+            estimate_tokens(raw),
+        )
+        self.assertEqual(
+            metrics[
+                "frontend_model_visible"
+                "_attachment_count"
+            ],
+            1,
+        )
+
+        # The envelope can only be larger than the bare body.
+        self.assertGreaterEqual(
+            metrics[
+                "frontend_model_visible"
+                "_estimated_tokens"
+            ],
+            metrics[
+                "frontend_body_estimated_tokens"
+            ],
+        )
+
         self.assertEqual(
             metrics["ob_candidate_count"], 1
         )
         self.assertEqual(
-            metrics["frontend_currently_model_visible_count"],
-            1,
+            metrics[
+                "ob_retrieved_candidate_content"
+                "_estimated_tokens"
+            ],
+            estimate_tokens("BETA"),
         )
         self.assertEqual(
-            metrics["frontend_currently_model_visible_tokens"],
-            estimate_tokens("ALPHA"),
-        )
-        self.assertEqual(
-            metrics["combined_memory_candidate_count"],
+            metrics["combined_observation_count"],
             2,
-        )
-
-        tokens = estimate_tokens(
-            "ALPHA"
-        ) + estimate_tokens("BETA")
-
-        self.assertEqual(
-            metrics["combined_estimated_tokens"],
-            tokens,
-        )
-        self.assertAlmostEqual(
-            metrics["frontend_token_share"],
-            estimate_tokens("ALPHA") / tokens,
-            places=6,
         )
 
     def test_ob_candidates_are_not_model_visible(
@@ -460,64 +582,71 @@ class ArbitrationBuilderTests(
             ob_memories=[_memory("m1", "OB-1")]
         )
 
-        candidate = artifact["candidates"][0]
+        observation = artifact["observations"][0]
 
         self.assertEqual(
-            candidate["source"], "ob"
+            observation["source"], "ob"
+        )
+        self.assertEqual(
+            observation["kind"], "ob_candidate"
         )
         self.assertFalse(
-            candidate["currently_model_visible"]
+            observation["currently_model_visible"]
         )
-        self.assertTrue(candidate["retrieved"])
+        self.assertTrue(observation["retrieved"])
+        self.assertEqual(
+            observation["model_visible_chars"], 0
+        )
+        self.assertEqual(
+            observation[
+                "model_visible_estimated_tokens"
+            ],
+            0,
+        )
 
-    def test_candidate_never_recalled_used_reinforced(
+    def test_observation_never_recalled_used_reinforced(
         self,
     ):
         artifact = self._artifact(
             frontend_segments=(
-                FrontendMemorySegment(
-                    placement="history",
-                    source_message_index=0,
-                    source_block_index=0,
-                    body="MEM",
-                ),
+                _segment("history", "MEM"),
             ),
         )
 
-        candidate = artifact["candidates"][0]
+        observation = artifact["observations"][0]
 
         self.assertEqual(
-            set(candidate.keys()),
+            set(observation.keys()),
             {
                 "source",
+                "kind",
                 "placement",
                 "index",
-                "candidate",
                 "content_digest",
                 "normalized_digest",
-                "char_count",
-                "estimated_tokens",
+                "content_chars",
+                "content_estimated_tokens",
+                "model_visible_chars",
+                "model_visible_estimated_tokens",
                 "currently_model_visible",
                 "retrieved",
             },
         )
-        self.assertTrue(candidate["candidate"])
         # Frontend Memory is present in the request, which is not
         # recalled / used / reinforced and must not be modelled so.
         self.assertTrue(
-            candidate["currently_model_visible"]
+            observation["currently_model_visible"]
         )
-        self.assertFalse(candidate["retrieved"])
+        self.assertFalse(observation["retrieved"])
+        self.assertEqual(
+            observation["kind"],
+            "frontend_attachment",
+        )
 
     def test_exact_overlap(self):
         artifact = self._artifact(
             frontend_segments=(
-                FrontendMemorySegment(
-                    placement="current",
-                    source_message_index=0,
-                    source_block_index=0,
-                    body="SAME",
-                ),
+                _segment("current", "SAME"),
             ),
             ob_memories=[_memory("m1", "SAME")],
         )
@@ -525,23 +654,37 @@ class ArbitrationBuilderTests(
         metrics = artifact["metrics"]
 
         self.assertEqual(
-            metrics["exact_overlap_count"], 1
+            metrics[
+                "frontend_bundle_ob_exact_pair_count"
+            ],
+            1,
         )
         self.assertEqual(
-            metrics["normalized_overlap_count"], 1
+            metrics[
+                "frontend_bundle_ob"
+                "_normalized_pair_count"
+            ],
+            1,
         )
         self.assertEqual(
-            metrics["duplicate_group_count"], 1
+            metrics[
+                "normalized_equivalence_group_count"
+            ],
+            1,
+        )
+        # The overlap is scoped to attachment body vs candidate
+        # content, not an item-level memory duplication claim.
+        self.assertEqual(
+            artifact["overlap_scope"],
+            "frontend_attachment_body"
+            "_vs_ob_candidate_content",
         )
 
     def test_normalized_overlap_only(self):
         artifact = self._artifact(
             frontend_segments=(
-                FrontendMemorySegment(
-                    placement="current",
-                    source_message_index=0,
-                    source_block_index=0,
-                    body="Same   Memory",
+                _segment(
+                    "current", "Same   Memory"
                 ),
             ),
             ob_memories=[
@@ -552,13 +695,23 @@ class ArbitrationBuilderTests(
         metrics = artifact["metrics"]
 
         self.assertEqual(
-            metrics["exact_overlap_count"], 0
+            metrics[
+                "frontend_bundle_ob_exact_pair_count"
+            ],
+            0,
         )
         self.assertEqual(
-            metrics["normalized_overlap_count"], 1
+            metrics[
+                "frontend_bundle_ob"
+                "_normalized_pair_count"
+            ],
+            1,
         )
         self.assertEqual(
-            metrics["duplicate_group_count"], 1
+            metrics[
+                "normalized_equivalence_group_count"
+            ],
+            1,
         )
 
     def test_same_content_twice_is_one_group(
@@ -574,10 +727,16 @@ class ArbitrationBuilderTests(
         metrics = artifact["metrics"]
 
         self.assertEqual(
-            metrics["duplicate_group_count"], 1
+            metrics[
+                "normalized_equivalence_group_count"
+            ],
+            1,
         )
         self.assertEqual(
-            metrics["exact_overlap_count"], 0
+            metrics[
+                "frontend_bundle_ob_exact_pair_count"
+            ],
+            0,
         )
 
     def test_same_frontend_content_twice_is_one_group(
@@ -585,35 +744,35 @@ class ArbitrationBuilderTests(
     ):
         artifact = self._artifact(
             frontend_segments=(
-                FrontendMemorySegment(
-                    placement="current",
-                    source_message_index=0,
-                    source_block_index=0,
-                    body="DUP",
-                ),
-                FrontendMemorySegment(
-                    placement="history",
-                    source_message_index=0,
-                    source_block_index=0,
-                    body="DUP",
-                ),
+                _segment("current", "DUP"),
+                _segment("history", "DUP"),
             ),
         )
 
         metrics = artifact["metrics"]
 
         self.assertEqual(
-            metrics["frontend_candidate_count"], 2
+            metrics["frontend_attachment_count"], 2
         )
         self.assertEqual(
-            metrics["duplicate_group_count"], 1
+            metrics[
+                "normalized_equivalence_group_count"
+            ],
+            1,
         )
         # No OB side, so there is no cross-source overlap.
         self.assertEqual(
-            metrics["exact_overlap_count"], 0
+            metrics[
+                "frontend_bundle_ob_exact_pair_count"
+            ],
+            0,
         )
         self.assertEqual(
-            metrics["normalized_overlap_count"], 0
+            metrics[
+                "frontend_bundle_ob"
+                "_normalized_pair_count"
+            ],
+            0,
         )
 
     def test_same_id_different_content_not_collapsed(
@@ -628,7 +787,7 @@ class ArbitrationBuilderTests(
 
         self.assertEqual(
             artifact["metrics"][
-                "duplicate_group_count"
+                "normalized_equivalence_group_count"
             ],
             0,
         )
@@ -638,27 +797,37 @@ class ArbitrationBuilderTests(
         )
 
     def test_metrics_only_no_raw_text(self):
-        artifact = self._artifact(
-            frontend_segments=(
-                FrontendMemorySegment(
-                    placement="current",
-                    source_message_index=0,
-                    source_block_index=0,
-                    body="SECRET-FRONTEND",
+        serialized = json.dumps(
+            self._artifact(
+                frontend_segments=(
+                    _segment(
+                        "current",
+                        "SECRET-FRONTEND",
+                    ),
                 ),
-            ),
-            ob_memories=[
-                _memory("m1", "SECRET-OB")
-            ],
+                ob_memories=[
+                    _memory("m1", "SECRET-OB")
+                ],
+            )
         )
-
-        serialized = json.dumps(artifact)
 
         self.assertNotIn(
             "SECRET-FRONTEND", serialized
         )
         self.assertNotIn("SECRET-OB", serialized)
         self.assertNotIn("m1", serialized)
+        # The raw envelope is transient in memory only: neither its
+        # text, its metadata nor a raw field is persisted.
+        self.assertNotIn(
+            "raw_attachment", serialized
+        )
+        self.assertNotIn("<attachment", serialized)
+        self.assertNotIn(
+            "filename=", serialized
+        )
+        self.assertNotIn(
+            "front_seg", serialized
+        )
 
 
 # ---------------------------------------------------------------------
@@ -703,6 +872,14 @@ class ArbitrationPersistenceTests(
                 _arbitration_dir(root)
             )
 
+            raw_text = (
+                next(
+                    _arbitration_dir(root)
+                    .iterdir()
+                )
+                .read_text(encoding="utf-8")
+            )
+
         self.assertEqual(len(artifacts), 1)
 
         artifact = artifacts[0]
@@ -715,13 +892,22 @@ class ArbitrationPersistenceTests(
         )
         self.assertEqual(
             artifact["metrics"][
-                "frontend_candidate_count"
+                "frontend_attachment_count"
             ],
             1,
         )
         self.assertEqual(
             artifact["metrics"]["ob_candidate_count"],
             1,
+        )
+
+        # No raw Frontend text / envelope is persisted.
+        self.assertNotIn("MEM-A", raw_text)
+        self.assertNotIn(
+            "relevant_memories.txt", raw_text
+        )
+        self.assertNotIn(
+            "raw_attachment", raw_text
         )
 
     def test_malformed_body_is_fail_safe(self):
@@ -910,7 +1096,7 @@ class ArbitrationPersistenceTests(
             # Frontend side is still observed truthfully.
             self.assertEqual(
                 report["metrics"][
-                    "frontend_candidate_count"
+                    "frontend_attachment_count"
                 ],
                 1,
             )
@@ -1079,7 +1265,7 @@ class ArbitrationPersistenceTests(
             1,
         )
         self.assertEqual(
-            first["metrics"]["frontend_chars"],
+            first["metrics"]["frontend_body_chars"],
             len("FRONT-A"),
         )
         self.assertEqual(
@@ -1087,7 +1273,7 @@ class ArbitrationPersistenceTests(
             2,
         )
         self.assertEqual(
-            second["metrics"]["frontend_chars"],
+            second["metrics"]["frontend_body_chars"],
             len("FRONT-B"),
         )
 
@@ -1220,9 +1406,27 @@ class ArbitrationCoordinatorTests(
         )
         self.assertEqual(
             artifact["metrics"][
-                "frontend_currently_model_visible_count"
+                "frontend_model_visible"
+                "_attachment_count"
             ],
             1,
+        )
+        # The model-visible footprint is measured from the exact
+        # envelope that is really in the request.
+        self.assertEqual(
+            artifact["metrics"][
+                "frontend_model_visible_chars"
+            ],
+            len(_current_raw("MEM-A")),
+        )
+        self.assertGreaterEqual(
+            artifact["metrics"][
+                "frontend_model_visible"
+                "_estimated_tokens"
+            ],
+            artifact["metrics"][
+                "frontend_body_estimated_tokens"
+            ],
         )
 
         self.assertEqual(
@@ -1297,7 +1501,7 @@ class ArbitrationCoordinatorTests(
         self.assertEqual(len(artifacts), 2)
 
         by_chars = sorted(
-            artifact["metrics"]["frontend_chars"]
+            artifact["metrics"]["frontend_body_chars"]
             for artifact in artifacts
         )
 
@@ -1340,10 +1544,114 @@ class ArbitrationCoordinatorTests(
         self.assertEqual(len(artifacts), 1)
         self.assertEqual(
             artifacts[0]["metrics"][
-                "frontend_candidate_count"
+                "frontend_attachment_count"
             ],
             0,
         )
+
+    async def test_persistence_failure_is_fail_open(
+        self,
+    ):
+        body = _frontend_current_body("MEM-A")
+
+        def _boom(*args, **kwargs):
+            raise OSError("disk full")
+
+        with tempfile.TemporaryDirectory() as root:
+            with patch.object(
+                arbitration,
+                "atomic_write",
+                _boom,
+            ):
+                selected = await self._run_pipeline(
+                    body,
+                    root=root,
+                    arbitration_on=True,
+                    snapshot=_snapshot(
+                        [_memory("m1", "OB-A")]
+                    ),
+                )
+
+            leftover = (
+                _arbitration_dir(root).exists()
+            )
+
+        # A persistence failure must not fail the request, must not
+        # change the provider bytes and must not become a live
+        # availability dependency.
+        self.assertEqual(selected, body)
+        self.assertFalse(leftover)
+
+    async def test_arbitration_failure_does_not_block_downstream(
+        self,
+    ):
+        body = _frontend_current_body("MEM-A")
+
+        def _boom(*args, **kwargs):
+            raise OSError("disk full")
+
+        observed = {"preview": False}
+
+        with tempfile.TemporaryDirectory() as root:
+            environ = {
+                **_ISOLATED_ENV,
+                _ARBITRATION_ENV: "1",
+                "OMBRE_GATEWAY_CONTEXT_INJECTION_PREVIEW_SHADOW":
+                    "1",
+                "OMBRE_CONTEXT_STATE_DIR": root,
+            }
+
+            with patch.dict(
+                os.environ,
+                environ,
+                clear=False,
+            ), patch.object(
+                coordinator,
+                "observe_context_sources",
+                Mock(return_value=CID),
+            ), patch.object(
+                coordinator,
+                "update_unified_context_candidate_from_runtime",
+                AsyncMock(
+                    return_value={
+                        "stored": True,
+                        "revision": 5,
+                        "memory_shadow_snapshot":
+                            _snapshot(
+                                [
+                                    _memory(
+                                        "m1", "OB-A"
+                                    )
+                                ]
+                            ),
+                    }
+                ),
+            ), patch.object(
+                arbitration,
+                "atomic_write",
+                _boom,
+            ), patch.object(
+                coordinator,
+                "update_context_injection_preview",
+                Mock(
+                    side_effect=lambda *a, **k: (
+                        observed.__setitem__(
+                            "preview", True
+                        )
+                        or {"stored": True}
+                    )
+                ),
+            ):
+                selected = await (
+                    coordinator.run_context_pipeline(
+                        body
+                    )
+                )
+
+        self.assertEqual(selected, body)
+        # The downstream preview stage still ran even though the
+        # arbitration shadow failed to persist.
+        self.assertTrue(observed["preview"])
 
 
 if __name__ == "__main__":

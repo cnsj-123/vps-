@@ -360,29 +360,35 @@ def observe_memory_source_arbitration(
     Shadow-only and fail-open. It measures an asymmetry that already
     exists in the baseline and changes nothing about it:
 
-      Frontend Memory (``relevant_memories.txt``) full content is
-      already model-visible in the live request, preserved by cache
-      rewriting and excluded from Conversation Snapshot USER_TEXT-
-      derived semantic state;
+      Frontend Memory (``relevant_memories.txt``) full attachment
+      content is already model-visible in the request, preserved by
+      cache rewriting and excluded from Conversation Snapshot
+      USER_TEXT-derived semantic state;
       OB / cognitive memory only reaches the model through a bounded
       Memory Flash cue and an explicit Recall.
+
+    The two sides are measured as different units -- a Frontend
+    *attachment* versus an OB *candidate* -- because no proven
+    item-level Frontend Memory schema exists yet.
 
     Being present in the request is NOT recalled / used / reinforced:
     those later stages are never modelled and are never fabricated
     here.
 
-    It consumes request-local evidence only: THIS request's forwarded
-    body (Frontend candidates) and THIS request's own Unified memory
-    shadow snapshot (OB candidates + the exact Unified revision). It
-    never re-reads the shared conversation-level Unified file, so two
-    concurrent same-conversation requests cannot cross-contaminate,
-    and it never re-runs retrieval, re-embeds, re-ranks or calls a
-    model / external API.
+    It consumes request-local evidence only: THIS request's
+    cache-stabilized forwarded body (Frontend attachments) and THIS
+    request's own Unified memory shadow snapshot (OB candidates + the
+    exact Unified revision). It never re-reads the shared
+    conversation-level Unified file, so two concurrent
+    same-conversation requests cannot cross-contaminate, and it never
+    re-runs retrieval, re-embeds, re-ranks or calls a model / external
+    API.
 
     Only privacy-safe telemetry is logged (mode, stored, decision,
-    reason, counts, estimated tokens, revisions, shares). No Frontend
-    Memory text, OB memory text, cue, user text, memref, useref, raw
-    memory id, conversation id or cognitive request id is logged.
+    reason, counts, estimated tokens, revisions). No Frontend Memory
+    text, raw attachment envelope, OB memory text, cue, user text,
+    memref, useref, raw memory id, conversation id or cognitive
+    request id is logged.
     """
 
     if not _truthy(
@@ -872,9 +878,14 @@ async def observe_unified_preview_gate(
     used only by the Memory Flash / Exposure Ledger observers. It is
     never added to the body, a header, a cache key or a log.
 
-    ``forward_body`` is the exact bytes this request will forward. It
-    is only read (never mutated) by the Frontend Memory Arbitration
-    Shadow observer, which analyses the same bytes the model sees.
+    ``forward_body`` is the cache-stabilized, pre-Context-mutation body
+    for this request. It is only read (never mutated) by the Frontend
+    Memory Arbitration Shadow observer. It is NOT guaranteed to be
+    byte-identical to the final provider request: Real Context
+    Injection and Live Memory Flash Exposure can still add content
+    later. It remains a truthful place to observe Frontend Memory,
+    because those later stages must preserve the existing request
+    content (including preserved Frontend attachments).
     """
 
     unified_enabled = _truthy(

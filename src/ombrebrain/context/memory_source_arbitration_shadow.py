@@ -33,7 +33,7 @@ from ombrebrain.gateway.operit_adapter import OperitAdapter
 # baseline; it does NOT change it:
 #
 #   Frontend Memory  (relevant_memories.txt)
-#       full content is already model-visible in the live request,
+#       full content is already model-visible in the request,
 #       preserved by cache rewriting, excluded from Conversation
 #       Snapshot USER_TEXT-derived semantic state;
 #
@@ -41,11 +41,28 @@ from ombrebrain.gateway.operit_adapter import OperitAdapter
 #       retrieved -> eligibility -> Memory Flash cue -> model decides
 #       Recall -> full memory loaded only on an explicit Recall.
 #
-# It answers, from REAL requests: how many Frontend Memory
-# candidates exist, how much model-visible context they occupy,
-# whether they are current or historical, how many OB candidates the
-# same request produced, how much the two sources overlap, and how
-# much of the request's memory footprint comes from Frontend Memory.
+# Observation shape != future canonical memory contract. v1 measures
+# two DIFFERENT units and never pretends they are the same thing:
+#
+#   frontend: one explicit relevant_memories.txt ATTACHMENT (bundle).
+#       The repository has no proven item-level schema for the inner
+#       body, so an attachment is never called one memory candidate.
+#   ob: one Unified-admitted memory CANDIDATE (retrieved side).
+#
+# It answers, from REAL requests: how many Frontend attachments exist,
+# how much model-visible context they occupy, whether they are current
+# or historical, how many OB candidates the same request produced, how
+# much the two sources overlap, and how much of the request's
+# model-visible memory footprint comes from Frontend Memory.
+#
+# Two size concepts are kept strictly separate and are never collapsed:
+#
+#   body content size      -- the extracted inner attachment text or an
+#                             OB candidate's content;
+#   model-visible size     -- the exact raw Frontend attachment envelope
+#                             (metadata + body) that is present in the
+#                             request. OB candidate content is normally
+#                             NOT model-visible, so that is 0.
 #
 # It is observation-only and fail-open. It never removes, rewrites or
 # converts Frontend Memory, never starts a Flash, never performs or
@@ -58,14 +75,16 @@ from ombrebrain.gateway.operit_adapter import OperitAdapter
 #   - exact content equivalence after safe extraction;
 #   - normalized-text equivalence (whitespace collapse + casefold).
 # No embedding, no LLM judge, no reranker, no learned score and no
-# semantic threshold is used. "exact" and "normalized" are distinct
-# evidence types and neither is a claim of semantic equivalence.
+# semantic threshold is used. The overlap compares an extracted
+# Frontend attachment BODY against an OB candidate's content; it does
+# NOT prove the Frontend system holds exactly one memory or that the
+# memories are semantically the same, and it never authorises an
+# automatic merge / delete.
 #
 # Privacy: the persisted artifact and any log line contain only
-# counts, booleans, enums, revisions, shares, bounded numeric metrics
-# and sha256 digests. No Frontend Memory text, OB memory text, cue,
-# user text, attachment contents, memref, useref or raw memory id is
-# ever emitted.
+# counts, booleans, enums, revisions and sha256 digests. No Frontend
+# Memory text, raw attachment envelope, OB memory text, cue, user
+# text, memref, useref or raw memory id is ever emitted.
 
 _VERSION = "memory-source-arbitration-shadow.v1"
 _MODE = "shadow_only"
@@ -76,13 +95,16 @@ _SNAPSHOT_VERSION = "memory-shadow-snapshot.v1"
 _SOURCE_FRONTEND = "frontend"
 _SOURCE_OB = "ob"
 
+_KIND_FRONTEND_ATTACHMENT = "frontend_attachment"
+_KIND_OB_CANDIDATE = "ob_candidate"
+
 _PLACEMENT_CURRENT = "current"
 _PLACEMENT_HISTORY = "history"
 
-# Bound the persisted per-candidate evidence. The candidate pool is
+# Bound the persisted per-observation evidence. The observation pool is
 # small (<=6 OB candidates by Unified budget plus the Frontend
 # attachments), but this keeps the artifact size hard-bounded anyway.
-_MAX_PERSISTED_CANDIDATES = 64
+_MAX_PERSISTED_OBSERVATIONS = 64
 
 
 def _path(
@@ -98,22 +120,31 @@ def _path(
 
 
 @dataclass(frozen=True)
-class _Candidate:
-    """One source-neutral shadow candidate.
+class _Observation:
+    """One source-neutral shadow observation.
 
-    Only information needed for arbitration analysis is kept. All
-    observed stage flags reflect real evidence: ``currently_model_visible``
-    and ``retrieved`` are set from what this request actually shows,
-    and no later stage is ever inferred.
+    ``content_*`` describes extractable body content (comparable
+    across sources). ``model_visible_*`` describes the exact text that
+    the provider request actually carries: for a Frontend attachment
+    that is the raw envelope, for an OB candidate it is 0 because OB
+    content is not model-visible.
+
+    All observed stage flags reflect real evidence: the frontend
+    observation is ``currently_model_visible`` but not ``retrieved``;
+    the OB observation is ``retrieved`` but not ``currently_model_visible``.
+    No later stage is ever inferred.
     """
 
     source: str
+    kind: str
     placement: str
     index: int
     content_digest: str
     normalized_digest: str
-    char_count: int
-    estimated_tokens: int
+    content_chars: int
+    content_estimated_tokens: int
+    model_visible_chars: int
+    model_visible_estimated_tokens: int
     currently_model_visible: bool
     retrieved: bool
 
@@ -130,13 +161,13 @@ def _normalized_digest(text: str) -> str:
     ).hexdigest()
 
 
-def _frontend_candidates(
+def _frontend_observations(
     segments: Any,
-) -> list[_Candidate]:
-    candidates: list[_Candidate] = []
+) -> list[_Observation]:
+    observations: list[_Observation] = []
 
     if not isinstance(segments, (list, tuple)):
-        return candidates
+        return observations
 
     for index, segment in enumerate(segments):
         body = getattr(segment, "body", None)
@@ -147,15 +178,33 @@ def _frontend_candidates(
         ):
             continue
 
+        # The exact raw canonical attachment text. It is only used in
+        # memory to measure the real model-visible footprint; it is
+        # never persisted or logged. If a caller supplied no raw text
+        # the body is used as a conservative lower bound -- no tags are
+        # ever reconstructed.
+        raw_attachment = getattr(
+            segment,
+            "raw_attachment",
+            None,
+        )
+
+        if (
+            not isinstance(raw_attachment, str)
+            or not raw_attachment
+        ):
+            raw_attachment = body
+
         placement = getattr(
             segment,
             "placement",
             _PLACEMENT_HISTORY,
         )
 
-        candidates.append(
-            _Candidate(
+        observations.append(
+            _Observation(
                 source=_SOURCE_FRONTEND,
+                kind=_KIND_FRONTEND_ATTACHMENT,
                 placement=(
                     _PLACEMENT_CURRENT
                     if placement == _PLACEMENT_CURRENT
@@ -166,11 +215,17 @@ def _frontend_candidates(
                 normalized_digest=(
                     _normalized_digest(body)
                 ),
-                char_count=len(body),
-                estimated_tokens=estimate_tokens(
-                    body
+                content_chars=len(body),
+                content_estimated_tokens=(
+                    estimate_tokens(body)
                 ),
-                # Frontend Memory full content is already in the
+                model_visible_chars=len(
+                    raw_attachment
+                ),
+                model_visible_estimated_tokens=(
+                    estimate_tokens(raw_attachment)
+                ),
+                # Frontend attachment content is already in the
                 # model-visible request.
                 currently_model_visible=True,
                 # It was attached by the frontend, not retrieved by
@@ -179,16 +234,16 @@ def _frontend_candidates(
             )
         )
 
-    return candidates
+    return observations
 
 
-def _ob_candidates(
+def _ob_observations(
     memories: Any,
-) -> list[_Candidate]:
-    candidates: list[_Candidate] = []
+) -> list[_Observation]:
+    observations: list[_Observation] = []
 
     if not isinstance(memories, list):
-        return candidates
+        return observations
 
     for index, item in enumerate(memories):
         content = candidate_text(item)
@@ -196,147 +251,140 @@ def _ob_candidates(
         if not content:
             continue
 
-        candidates.append(
-            _Candidate(
+        observations.append(
+            _Observation(
                 source=_SOURCE_OB,
+                kind=_KIND_OB_CANDIDATE,
                 placement=_PLACEMENT_HISTORY,
                 index=index,
                 content_digest=_digest(content),
                 normalized_digest=(
                     _normalized_digest(content)
                 ),
-                char_count=len(content),
-                estimated_tokens=estimate_tokens(
-                    content
+                content_chars=len(content),
+                content_estimated_tokens=(
+                    estimate_tokens(content)
                 ),
-                # OB full content is NOT in the live request; only a
-                # future bounded cue / Recall may expose it.
+                # OB candidate content is NOT in the live request;
+                # only a future bounded cue / Recall may expose it.
+                model_visible_chars=0,
+                model_visible_estimated_tokens=0,
                 currently_model_visible=False,
                 # It came from THIS request's retrieval observation.
                 retrieved=True,
             )
         )
 
-    return candidates
+    return observations
 
 
 def _build_metrics(
-    candidates: list[_Candidate],
+    observations: list[_Observation],
 ) -> dict[str, Any]:
     frontend = [
-        c
-        for c in candidates
-        if c.source == _SOURCE_FRONTEND
+        o
+        for o in observations
+        if o.source == _SOURCE_FRONTEND
     ]
     ob = [
-        c
-        for c in candidates
-        if c.source == _SOURCE_OB
+        o
+        for o in observations
+        if o.source == _SOURCE_OB
     ]
 
-    frontend_chars = sum(
-        c.char_count for c in frontend
-    )
-    frontend_tokens = sum(
-        c.estimated_tokens for c in frontend
-    )
-
-    ob_chars = sum(c.char_count for c in ob)
-    ob_tokens = sum(
-        c.estimated_tokens for c in ob
-    )
-
-    visible = [
-        c
-        for c in frontend
-        if c.currently_model_visible
+    frontend_visible = [
+        o
+        for o in frontend
+        if o.currently_model_visible
     ]
-    visible_tokens = sum(
-        c.estimated_tokens for c in visible
-    )
 
     # Cross-source exact / normalized overlap, counted as ordered
-    # (frontend, ob) pairs. exact is a subset of normalized by
-    # construction (byte equality implies normalized equality).
+    # (frontend attachment, ob candidate) pairs. exact is a subset of
+    # normalized by construction (byte equality implies normalized
+    # equality). This compares an attachment BODY against OB candidate
+    # content only -- it is not an item-level memory duplication claim.
     ob_by_exact = Counter(
-        c.content_digest for c in ob
+        o.content_digest for o in ob
     )
     ob_by_normalized = Counter(
-        c.normalized_digest for c in ob
+        o.normalized_digest for o in ob
     )
 
-    exact_overlap = sum(
-        ob_by_exact.get(c.content_digest, 0)
-        for c in frontend
+    exact_pairs = sum(
+        ob_by_exact.get(o.content_digest, 0)
+        for o in frontend
     )
-    normalized_overlap = sum(
+    normalized_pairs = sum(
         ob_by_normalized.get(
-            c.normalized_digest, 0
+            o.normalized_digest, 0
         )
-        for c in frontend
+        for o in frontend
     )
 
-    # Groups of normalized-equivalent candidates in the combined
-    # pool (size >= 2). This is how "same content twice" and
-    # "Frontend == OB" become visible without collapsing identities.
+    # Groups of normalized-equivalent content in the combined pool
+    # (size >= 2). Normalized-text equivalence only; this is not a
+    # semantic-duplication count.
     normalized_counts = Counter(
-        c.normalized_digest for c in candidates
+        o.normalized_digest for o in observations
     )
-    duplicate_group_count = sum(
+    normalized_groups = sum(
         1
         for count in normalized_counts.values()
         if count >= 2
     )
 
-    combined_count = len(candidates)
-    combined_tokens = (
-        frontend_tokens + ob_tokens
-    )
-
-    if combined_tokens > 0:
-        frontend_share = round(
-            frontend_tokens / combined_tokens, 6
-        )
-        ob_share = round(
-            ob_tokens / combined_tokens, 6
-        )
-    else:
-        frontend_share = 0.0
-        ob_share = 0.0
-
     return {
-        "frontend_candidate_count": len(frontend),
-        "frontend_current_count": sum(
+        "frontend_attachment_count": len(frontend),
+        "frontend_current_attachment_count": sum(
             1
-            for c in frontend
-            if c.placement == _PLACEMENT_CURRENT
+            for o in frontend
+            if o.placement == _PLACEMENT_CURRENT
         ),
-        "frontend_history_count": sum(
+        "frontend_history_attachment_count": sum(
             1
-            for c in frontend
-            if c.placement == _PLACEMENT_HISTORY
+            for o in frontend
+            if o.placement == _PLACEMENT_HISTORY
         ),
-        "frontend_chars": frontend_chars,
-        "frontend_estimated_tokens":
-            frontend_tokens,
+        # Frontend body content size (the extracted inner text).
+        "frontend_body_chars": sum(
+            o.content_chars for o in frontend
+        ),
+        "frontend_body_estimated_tokens": sum(
+            o.content_estimated_tokens
+            for o in frontend
+        ),
+        # Frontend actual model-visible footprint (exact raw
+        # attachment envelope present in the request).
+        "frontend_model_visible_attachment_count":
+            len(frontend_visible),
+        "frontend_model_visible_chars": sum(
+            o.model_visible_chars
+            for o in frontend_visible
+        ),
+        "frontend_model_visible_estimated_tokens":
+            sum(
+                o.model_visible_estimated_tokens
+                for o in frontend_visible
+            ),
+        # OB retrieved candidate content size. This is NOT
+        # model-visible today.
         "ob_candidate_count": len(ob),
-        "ob_chars": ob_chars,
-        "ob_estimated_tokens": ob_tokens,
-        "frontend_currently_model_visible_count":
-            len(visible),
-        "frontend_currently_model_visible_tokens":
-            visible_tokens,
-        "exact_overlap_count": exact_overlap,
-        "normalized_overlap_count":
-            normalized_overlap,
-        "duplicate_group_count":
-            duplicate_group_count,
-        "combined_memory_candidate_count":
-            combined_count,
-        "combined_estimated_tokens":
-            combined_tokens,
-        "frontend_token_share": frontend_share,
-        "ob_token_share": ob_share,
+        "ob_retrieved_candidate_content_chars":
+            sum(o.content_chars for o in ob),
+        "ob_retrieved_candidate_content_estimated_tokens":
+            sum(
+                o.content_estimated_tokens
+                for o in ob
+            ),
+        # Overlap evidence, precise about what was compared.
+        "frontend_bundle_ob_exact_pair_count":
+            exact_pairs,
+        "frontend_bundle_ob_normalized_pair_count":
+            normalized_pairs,
+        "normalized_equivalence_group_count":
+            normalized_groups,
+        "combined_observation_count":
+            len(observations),
         "source_counts": {
             _SOURCE_FRONTEND: len(frontend),
             _SOURCE_OB: len(ob),
@@ -355,40 +403,48 @@ def build_arbitration_artifact(
 ) -> dict[str, Any]:
     """Pure builder for one privacy-safe arbitration artifact.
 
-    No IO, no logging, deterministic. Frontend candidates come from
-    the canonical forwarded request; OB candidates come from THIS
+    No IO, no logging, deterministic. Frontend observations come from
+    the canonical forwarded request; OB observations come from THIS
     request's own Unified memory section. Nothing is inferred beyond
-    those two real inputs.
+    those two real inputs. The two sides are different observation
+    units (attachment vs candidate) and the artifact says so instead of
+    pretending a shared candidate contract already exists.
     """
 
-    candidates = _frontend_candidates(
-        frontend_segments
-    ) + _ob_candidates(ob_memories)
+    observations = (
+        _frontend_observations(frontend_segments)
+        + _ob_observations(ob_memories)
+    )
 
-    metrics = _build_metrics(candidates)
+    metrics = _build_metrics(observations)
 
     persisted: list[dict[str, Any]] = []
 
-    for candidate in (
-        candidates[:_MAX_PERSISTED_CANDIDATES]
+    for observation in (
+        observations[:_MAX_PERSISTED_OBSERVATIONS]
     ):
         persisted.append(
             {
-                "source": candidate.source,
-                "placement": candidate.placement,
-                "index": candidate.index,
-                "candidate": True,
+                "source": observation.source,
+                "kind": observation.kind,
+                "placement": observation.placement,
+                "index": observation.index,
                 "content_digest":
-                    candidate.content_digest,
+                    observation.content_digest,
                 "normalized_digest":
-                    candidate.normalized_digest,
-                "char_count":
-                    candidate.char_count,
-                "estimated_tokens":
-                    candidate.estimated_tokens,
+                    observation.normalized_digest,
+                "content_chars":
+                    observation.content_chars,
+                "content_estimated_tokens":
+                    observation.content_estimated_tokens,
+                "model_visible_chars":
+                    observation.model_visible_chars,
+                "model_visible_estimated_tokens":
+                    observation
+                    .model_visible_estimated_tokens,
                 "currently_model_visible":
-                    candidate.currently_model_visible,
-                "retrieved": candidate.retrieved,
+                    observation.currently_model_visible,
+                "retrieved": observation.retrieved,
             }
         )
 
@@ -404,15 +460,25 @@ def build_arbitration_artifact(
             bool(ob_observation_available),
         "decision": "observed",
         "reason": "arbitration_observed",
+        # The two sides are NOT the same unit and this v1 does not
+        # claim a shared candidate contract.
+        "observation_units": {
+            _SOURCE_FRONTEND: "attachment",
+            _SOURCE_OB: "candidate",
+        },
+        "overlap_scope": (
+            "frontend_attachment_body"
+            "_vs_ob_candidate_content"
+        ),
         "overlap_method":
             "exact_then_normalized_text.v1",
         "normalization":
             "whitespace_collapse_casefold",
         "metrics": metrics,
-        "candidates": persisted,
-        "candidates_truncated": (
-            len(candidates)
-            > _MAX_PERSISTED_CANDIDATES
+        "observations": persisted,
+        "observations_truncated": (
+            len(observations)
+            > _MAX_PERSISTED_OBSERVATIONS
         ),
     }
 

@@ -215,19 +215,28 @@ def split_operit_text(
 
 @dataclass(frozen=True)
 class FrontendMemorySegment:
-    """One explicitly identified Frontend Memory attachment body.
+    """One explicitly identified Frontend Memory attachment.
 
     Only an ``<attachment filename="relevant_memories.txt">`` envelope
-    produces a segment. ``body`` is the exact inner text of the
-    attachment (no trimming, no normalization). ``placement`` is the
-    canonical position in the request: ``"current"`` for the current
-    user message, ``"history"`` otherwise.
+    produces a segment. This is an *attachment-level* view: the
+    repository has no proven item-level schema for the inner body, so
+    one attachment must never be assumed to be one memory.
+
+    ``body`` is the exact inner text (no trimming, no normalization).
+    ``raw_attachment`` is the exact canonical attachment text as it
+    appears in the request -- envelope, metadata and body -- so callers
+    can measure the real model-visible footprint without reconstructing
+    tags. It exists for in-memory measurement only and must never be
+    persisted or logged by callers. ``placement`` is the canonical
+    position in the request: ``"current"`` for the current user
+    message, ``"history"`` otherwise.
     """
 
     placement: str
     source_message_index: int
     source_block_index: int
     body: str
+    raw_attachment: str
 
 
 def _parse_single_attachment(
@@ -276,6 +285,11 @@ def extract_frontend_memory_segments(
     AND the envelope's own filename is exactly
     ``relevant_memories.txt``.
 
+    It returns one entry per explicit attachment. It does NOT parse,
+    split or interpret the inner body: no proven item-level Frontend
+    Memory schema exists, so nothing here claims an attachment equals
+    one memory.
+
     Malformed / unknown / self-closing / empty attachments are
     skipped, so a broken attachment can never be treated as trusted
     Frontend Memory.
@@ -321,6 +335,13 @@ def extract_frontend_memory_segments(
             if not body.strip():
                 continue
 
+            # ``block.text`` is the exact canonical attachment text;
+            # it is only read if it is a real string.
+            raw_attachment = block.text
+
+            if not isinstance(raw_attachment, str):
+                continue
+
             segments.append(
                 FrontendMemorySegment(
                     placement=placement,
@@ -331,6 +352,7 @@ def extract_frontend_memory_segments(
                         block.source_block_index
                     ),
                     body=body,
+                    raw_attachment=raw_attachment,
                 )
             )
 
