@@ -194,11 +194,21 @@ def candidate(memory_id, content=None, *, metadata=None):
     }
 
 
-def eligible_policy(eligible, *, decision="allow_shadow"):
+def eligible_policy(
+    eligible,
+    *,
+    decision="allow_shadow",
+    conversation_id=CID,
+    source_unified_revision=5,
+    version="memory-surfacing-policy.v1",
+    mode="shadow_only",
+):
     return {
-        "version": "memory-surfacing-policy.v1",
-        "mode": "shadow_only",
-        "conversation_id": CID,
+        "version": version,
+        "mode": mode,
+        "conversation_id": conversation_id,
+        "source_unified_revision":
+            source_unified_revision,
         "decision": decision,
         "reason": "surfacing_eligible",
         "eligible": list(eligible),
@@ -612,13 +622,13 @@ class BuilderTests(_EngineBoundTestCase):
         # candidate is neutral, never suppressed.
         self.assertEqual(
             rows[0]["cognitive"][
-                "effective_gate_decision"
+                "counterfactual_gate_decision"
             ],
             "primary_preserved",
         )
         self.assertEqual(
             rows[1]["cognitive"][
-                "effective_gate_decision"
+                "counterfactual_gate_decision"
             ],
             "neutral_unobserved",
         )
@@ -632,7 +642,9 @@ class BuilderTests(_EngineBoundTestCase):
             2,
         )
         self.assertEqual(
-            metrics["cognitive_effective_suppress_count"],
+            metrics[
+                "cognitive_counterfactual_gate_suppress_count"
+            ],
             0,
         )
         self.assertEqual(
@@ -685,7 +697,7 @@ class BuilderTests(_EngineBoundTestCase):
         )
         self.assertEqual(
             rows[1]["cognitive"][
-                "effective_gate_decision"
+                "counterfactual_gate_decision"
             ],
             "would_suppress",
         )
@@ -729,7 +741,7 @@ class BuilderTests(_EngineBoundTestCase):
         # ... but the effective gate preserves the primary.
         self.assertEqual(
             row["cognitive"][
-                "effective_gate_decision"
+                "counterfactual_gate_decision"
             ],
             "primary_preserved",
         )
@@ -1463,11 +1475,12 @@ class StaticSafetyTests(unittest.TestCase):
 
 def _report_row(category, **overrides):
     row = {
-        "memory_key": "k" * 64,
+        "memory_key": "a" * 64,
         "candidate_fingerprint": "f" * 64,
         "retrieval_index": 0,
         "binding": {
             "unified_admitted": True,
+            "base_policy_available": True,
             "base_surfacing_eligible": True,
             "base_eligible_rank": 0,
         },
@@ -1486,6 +1499,7 @@ def _report_row(category, **overrides):
             "nominal_archive_candidate": False,
         },
         "cognitive": {
+            "available": True,
             "observed": True,
             "use_count": 2,
             "strength": 0.4,
@@ -1496,7 +1510,8 @@ def _report_row(category, **overrides):
             "min_salience": 0.25,
             "would_suppress_if_supplementary": False,
             "would_keep_if_supplementary": True,
-            "effective_gate_decision": "would_keep",
+            "counterfactual_gate_decision": "would_keep",
+            "effective_live_gate_decision": "gate_disabled",
             "invalid_event_count": 0,
         },
         "comparison": {"category": category},
@@ -1508,11 +1523,26 @@ def _report_row(category, **overrides):
     return row
 
 
-def _artifact(rows, *, truncated=0):
+def _artifact(
+    rows,
+    *,
+    truncated=0,
+    conversation_id=CID,
+    request_id=RID,
+    revision=5,
+    live_gate_active=False,
+):
     return {
         "version": VERSION,
         "mode": MODE,
+        "conversation_id": conversation_id,
+        "cognitive_request_id": request_id,
+        "source_unified_revision": revision,
+        "created_at": iso(T0),
+        "live_lifecycle_gate_active": live_gate_active,
+        "observation_truncated": truncated > 0,
         "observation_truncated_count": truncated,
+        "metrics": {},
         "candidates": rows,
     }
 
@@ -1555,7 +1585,9 @@ class ReporterTests(unittest.TestCase):
                                 )["cognitive"],
                                 "would_suppress_if_supplementary":
                                     True,
-                                "effective_gate_decision":
+                                "would_keep_if_supplementary":
+                                    False,
+                                "counterfactual_gate_decision":
                                     "would_suppress",
                             },
                         ),
@@ -1766,7 +1798,7 @@ class ReporterTests(unittest.TestCase):
         for secret in (
             CID,
             RID,
-            "k" * 64,
+            "a" * 64,
             "f" * 64,
         ):
             with self.subTest(secret=secret):

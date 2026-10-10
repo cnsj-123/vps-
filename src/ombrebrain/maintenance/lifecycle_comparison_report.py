@@ -7,6 +7,14 @@ import os
 from pathlib import Path
 from typing import Any
 
+from ombrebrain.context.memory_lifecycle_comparison_shadow import (
+    _KNOWN_COMPARISON_CATEGORIES,
+    _KNOWN_COUNTERFACTUAL_DECISIONS,
+    _KNOWN_LIVE_GATE_DECISIONS,
+    _auto_resolve_direction,
+    is_valid_lifecycle_comparison_artifact,
+)
+
 
 # Lifecycle Comparison Aggregate Report — READ ONLY.
 #
@@ -28,8 +36,11 @@ from typing import Any
 #   - it prints only aggregate statistics and finite numbers, never a
 #     conversation id, cognitive request id, memory key, candidate
 #     fingerprint, raw memory id, memory text, name, query or cue;
-#   - a malformed artifact only increments the invalid count and is
-#     skipped from numeric analysis; it never crashes the report.
+#   - it validates each artifact with the SAME authoritative v1
+#     validator the writer uses. An artifact that fails validation is
+#     counted as INVALID and contributes ZERO to every statistic --
+#     a malformed row is never silently skipped inside a "valid"
+#     artifact.
 #
 # It reads BOTH lifecycle planes only to count where their current
 # semantics differ. A disagreement here does NOT prove which lifecycle
@@ -45,44 +56,6 @@ DEFAULT_LIMIT = 500
 _COMPARISON_DIRNAME = "memory_lifecycle_comparison"
 
 _CAT_BINDING_UNAVAILABLE = "binding_unavailable"
-_CAT_LEGACY_UNAVAILABLE = "legacy_unavailable"
-_CAT_LEGACY_NOT_APPLICABLE = "legacy_not_applicable"
-_CAT_COGNITIVE_UNAVAILABLE = (
-    "cognitive_evidence_unavailable"
-)
-
-# The deterministic comparison categories the runtime observer may
-# emit. Unknown / future categories are still counted (see
-# ``category_counts``) so an artifact from a newer version is never
-# silently dropped, but zero-filled here for a stable report shape.
-_KNOWN_CATEGORIES = (
-    _CAT_BINDING_UNAVAILABLE,
-    _CAT_LEGACY_UNAVAILABLE,
-    _CAT_LEGACY_NOT_APPLICABLE,
-    _CAT_COGNITIVE_UNAVAILABLE,
-    "legacy_archive_cognitive_unobserved",
-    "legacy_archive_cognitive_suppress",
-    "legacy_archive_cognitive_keep",
-    "legacy_keep_cognitive_unobserved",
-    "legacy_keep_cognitive_suppress",
-    "legacy_keep_cognitive_keep",
-)
-
-_GATE_PRIMARY = "primary_preserved"
-_GATE_NEUTRAL = "neutral_unobserved"
-_GATE_KEEP = "would_keep"
-_GATE_SUPPRESS = "would_suppress"
-_GATE_NOT_BASE_ELIGIBLE = "not_base_eligible"
-_GATE_BINDING_UNAVAILABLE = "binding_unavailable"
-
-_KNOWN_GATE_DECISIONS = (
-    _GATE_PRIMARY,
-    _GATE_NEUTRAL,
-    _GATE_KEEP,
-    _GATE_SUPPRESS,
-    _GATE_NOT_BASE_ELIGIBLE,
-    _GATE_BINDING_UNAVAILABLE,
-)
 
 _DEFAULT_STATE_ROOT = "/app/buckets/.context"
 
@@ -132,12 +105,28 @@ def _as_count(value: Any) -> int:
     return 0
 
 
+def _reject_constant(name: str) -> Any:
+    """Reject NaN / Infinity / -Infinity anywhere in an artifact.
+
+    ``json.loads`` accepts these by default; an experiment that guides
+    lifecycle migration must never treat such an artifact as valid, so
+    the parse itself fails and the artifact is counted invalid.
+    """
+
+    raise ValueError(
+        "non-finite JSON constant: %s" % name
+    )
+
+
 def _artifact_paths(
     root: Path,
     *,
     limit: int,
 ) -> list[Path]:
     """Deterministic, bounded list of artifact files (read-only)."""
+
+    if limit < 0:
+        return []
 
     base = root / _COMPARISON_DIRNAME
 
@@ -154,16 +143,18 @@ def _artifact_paths(
         key=lambda item: item.as_posix()
     )
 
-    if limit >= 0:
-        return paths[:limit]
-
-    return paths
+    return paths[:limit]
 
 
 def _load_artifact(
     path: Path,
 ) -> dict[str, Any] | None:
-    """Read one artifact, or None when it is malformed / unreadable."""
+    """Parse one artifact, or None when it is unreadable / malformed.
+
+    The full v1 contract is checked by
+    ``is_valid_lifecycle_comparison_artifact``; here we only reject
+    files that cannot even be parsed (including non-finite numbers).
+    """
 
     try:
         raw = path.read_text(
@@ -176,58 +167,17 @@ def _load_artifact(
         return None
 
     try:
-        artifact = json.loads(raw)
+        artifact = json.loads(
+            raw,
+            parse_constant=_reject_constant,
+        )
     except (ValueError, TypeError):
         return None
 
     if not isinstance(artifact, dict):
         return None
 
-    if (
-        artifact.get("version") != VERSION
-        or artifact.get("mode") != MODE
-    ):
-        return None
-
-    candidates = artifact.get("candidates")
-
-    if not isinstance(candidates, list):
-        return None
-
     return artifact
-
-
-def _valid_row(
-    row: Any,
-) -> bool:
-    """Structural check of one persisted candidate row."""
-
-    if not isinstance(row, dict):
-        return False
-
-    if not isinstance(
-        row.get("binding"), dict
-    ):
-        return False
-
-    if not isinstance(
-        row.get("legacy"), dict
-    ):
-        return False
-
-    if not isinstance(
-        row.get("cognitive"), dict
-    ):
-        return False
-
-    comparison = row.get("comparison")
-
-    if not isinstance(comparison, dict):
-        return False
-
-    return isinstance(
-        comparison.get("category"), str
-    )
 
 
 def _percentile(
@@ -293,10 +243,12 @@ def build_report(
     root: str | Path | None = None,
     limit: int = DEFAULT_LIMIT,
 ) -> dict[str, Any]:
-    """Aggregate the persisted comparison artifacts. Pure / read-only.
+    """Aggregate the persisted comparison artifacts. Read-only.
 
-    Never writes, creates or deletes anything. Malformed artifacts only
-    increment ``invalid_artifact_count``.
+    Never writes, creates or deletes anything. A negative limit is
+    clamped to ``0`` (never "scan everything"), so the read stays
+    bounded even for programmatic callers. Malformed / invalid
+    artifacts only increment ``invalid_artifact_count``.
     """
 
     resolved_root = (
@@ -306,7 +258,8 @@ def build_report(
     )
 
     paths = _artifact_paths(
-        resolved_root, limit=limit
+        resolved_root,
+        limit=max(0, int(limit)),
     )
 
     artifact_count = 0
@@ -317,23 +270,39 @@ def build_report(
     observation_truncated_count = 0
 
     category_counts: dict[str, int] = {
-        name: 0 for name in _KNOWN_CATEGORIES
+        name: 0
+        for name in _KNOWN_COMPARISON_CATEGORIES
     }
 
-    gate_counts: dict[str, int] = {
-        name: 0 for name in _KNOWN_GATE_DECISIONS
+    counterfactual_gate_counts: dict[str, int] = {
+        name: 0
+        for name in _KNOWN_COUNTERFACTUAL_DECISIONS
+    }
+
+    live_gate_counts: dict[str, int] = {
+        name: 0
+        for name in _KNOWN_LIVE_GATE_DECISIONS
     }
 
     legacy_available_count = 0
     legacy_applicable_count = 0
     legacy_auto_resolve_candidate_count = 0
     legacy_nominal_archive_candidate_count = 0
+    legacy_auto_resolve_changed_archive_outcome_count = 0
+    legacy_auto_resolve_created_archive_candidate_count = 0
+    legacy_auto_resolve_removed_archive_candidate_count = 0
 
+    cognitive_available_count = 0
     cognitive_observed_count = 0
     cognitive_neutral_unobserved_count = 0
+    cognitive_evidence_unavailable_count = 0
+    cognitive_represented_count = 0
     cognitive_counterfactual_suppress_count = 0
+    cognitive_counterfactual_gate_suppress_count = 0
+    cognitive_live_gate_suppress_count = 0
     primary_preserved_count = 0
 
+    base_policy_unavailable_count = 0
     both_archive_and_suppress_count = 0
     binding_unavailable_count = 0
     invalid_event_count = 0
@@ -349,7 +318,12 @@ def build_report(
 
         artifact = _load_artifact(path)
 
-        if artifact is None:
+        if artifact is None or (
+            not is_valid_lifecycle_comparison_artifact(
+                artifact
+            )
+        ):
+            # Invalid as a WHOLE: contributes zero to every statistic.
             invalid_artifact_count += 1
             continue
 
@@ -363,41 +337,26 @@ def build_report(
             )
         )
 
-        for row in artifact.get(
-            "candidates", []
-        ):
-            if not _valid_row(row):
-                # A malformed row is skipped from numeric analysis
-                # rather than crashing or being mutated in place.
-                continue
-
+        for row in artifact["candidates"]:
             candidate_count += 1
 
             legacy = row["legacy"]
             cognitive = row["cognitive"]
-            category = row[
-                "comparison"
-            ]["category"]
+            binding = row["binding"]
+            category = row["comparison"]["category"]
 
             category_counts[category] = (
-                category_counts.get(category, 0)
-                + 1
+                category_counts.get(category, 0) + 1
             )
 
-            if _as_bool(
-                legacy.get("available")
-            ):
+            if _as_bool(legacy.get("available")):
                 legacy_available_count += 1
 
-            if _as_bool(
-                legacy.get("applicable")
-            ):
+            if _as_bool(legacy.get("applicable")):
                 legacy_applicable_count += 1
 
             if _as_bool(
-                legacy.get(
-                    "auto_resolve_candidate"
-                )
+                legacy.get("auto_resolve_candidate")
             ):
                 legacy_auto_resolve_candidate_count += 1
 
@@ -410,46 +369,91 @@ def build_report(
             if nominal_archive:
                 legacy_nominal_archive_candidate_count += 1
 
+            direction = _auto_resolve_direction(legacy)
+
+            if direction == "created":
+                legacy_auto_resolve_changed_archive_outcome_count += 1
+                legacy_auto_resolve_created_archive_candidate_count += 1
+            elif direction == "removed":
+                legacy_auto_resolve_changed_archive_outcome_count += 1
+                legacy_auto_resolve_removed_archive_candidate_count += 1
+
+            available = cognitive.get("available")
             observed = cognitive.get("observed")
+
+            if available is True:
+                cognitive_available_count += 1
+
+            # binding_unavailable rows carry no usable identity and are
+            # the DOCUMENTED exclusion: they are counted as observed,
+            # neutral OR evidence_unavailable exactly zero times.
+            if category != _CAT_BINDING_UNAVAILABLE:
+                cognitive_represented_count += 1
+
+                if available is True and observed is True:
+                    cognitive_observed_count += 1
+                elif (
+                    available is True
+                    and observed is False
+                ):
+                    cognitive_neutral_unobserved_count += 1
+                elif available is False:
+                    cognitive_evidence_unavailable_count += 1
+
             suppression = _as_bool(
                 cognitive.get(
                     "would_suppress_if_supplementary"
                 )
             )
 
-            if observed is True:
-                cognitive_observed_count += 1
-            elif observed is False:
-                cognitive_neutral_unobserved_count += 1
-
             if suppression:
                 cognitive_counterfactual_suppress_count += 1
 
-            effective = cognitive.get(
-                "effective_gate_decision"
+            counterfactual = cognitive.get(
+                "counterfactual_gate_decision"
             )
 
-            if effective == _GATE_PRIMARY:
-                primary_preserved_count += 1
-
-            if isinstance(effective, str):
-                gate_counts[effective] = (
-                    gate_counts.get(
-                        effective, 0
+            if isinstance(counterfactual, str):
+                counterfactual_gate_counts[
+                    counterfactual
+                ] = (
+                    counterfactual_gate_counts.get(
+                        counterfactual, 0
                     )
                     + 1
                 )
 
-            if (
-                nominal_archive
-                and suppression
-            ):
-                both_archive_and_suppress_count += 1
+            if counterfactual == "would_suppress":
+                cognitive_counterfactual_gate_suppress_count += 1
+
+            if counterfactual == "primary_preserved":
+                primary_preserved_count += 1
+
+            live = cognitive.get(
+                "effective_live_gate_decision"
+            )
+
+            if isinstance(live, str):
+                live_gate_counts[live] = (
+                    live_gate_counts.get(live, 0)
+                    + 1
+                )
+
+            if live == "would_suppress":
+                cognitive_live_gate_suppress_count += 1
 
             if (
-                category
-                == _CAT_BINDING_UNAVAILABLE
+                binding.get(
+                    "base_policy_available"
+                )
+                is False
             ):
+                base_policy_unavailable_count += 1
+
+            if nominal_archive and suppression:
+                both_archive_and_suppress_count += 1
+
+            if category == _CAT_BINDING_UNAVAILABLE:
                 binding_unavailable_count += 1
 
             invalid_event_count += _as_count(
@@ -463,9 +467,7 @@ def build_report(
             )
 
             if score is not None:
-                legacy_score_values.append(
-                    score
-                )
+                legacy_score_values.append(score)
 
             if observed is True:
                 use_count = _finite(
@@ -487,9 +489,7 @@ def build_report(
                     )
 
                 accessibility = _finite(
-                    cognitive.get(
-                        "accessibility"
-                    )
+                    cognitive.get("accessibility")
                 )
 
                 if accessibility is not None:
@@ -502,28 +502,25 @@ def build_report(
                 )
 
                 if salience is not None:
-                    salience_values.append(
-                        salience
-                    )
+                    salience_values.append(salience)
 
     return {
         "version": VERSION,
         "mode": MODE,
         "report": "aggregate_only",
         "artifact_count": artifact_count,
-        "valid_artifact_count": (
-            valid_artifact_count
-        ),
-        "invalid_artifact_count": (
-            invalid_artifact_count
-        ),
+        "valid_artifact_count": valid_artifact_count,
+        "invalid_artifact_count": invalid_artifact_count,
         "candidate_count": candidate_count,
         "observation_truncated_count": (
             observation_truncated_count
         ),
         "category_counts": category_counts,
-        "effective_gate_decision_counts": (
-            gate_counts
+        "counterfactual_gate_decision_counts": (
+            counterfactual_gate_counts
+        ),
+        "live_gate_decision_counts": (
+            live_gate_counts
         ),
         "legacy_available_count": (
             legacy_available_count
@@ -537,17 +534,44 @@ def build_report(
         "legacy_nominal_archive_candidate_count": (
             legacy_nominal_archive_candidate_count
         ),
+        "legacy_auto_resolve_changed_archive_outcome_count": (
+            legacy_auto_resolve_changed_archive_outcome_count
+        ),
+        "legacy_auto_resolve_created_archive_candidate_count": (
+            legacy_auto_resolve_created_archive_candidate_count
+        ),
+        "legacy_auto_resolve_removed_archive_candidate_count": (
+            legacy_auto_resolve_removed_archive_candidate_count
+        ),
+        "cognitive_available_count": (
+            cognitive_available_count
+        ),
         "cognitive_observed_count": (
             cognitive_observed_count
         ),
         "cognitive_neutral_unobserved_count": (
             cognitive_neutral_unobserved_count
         ),
+        "cognitive_evidence_unavailable_count": (
+            cognitive_evidence_unavailable_count
+        ),
+        "cognitive_represented_count": (
+            cognitive_represented_count
+        ),
         "cognitive_counterfactual_suppress_count": (
             cognitive_counterfactual_suppress_count
         ),
+        "cognitive_counterfactual_gate_suppress_count": (
+            cognitive_counterfactual_gate_suppress_count
+        ),
+        "cognitive_live_gate_suppress_count": (
+            cognitive_live_gate_suppress_count
+        ),
         "primary_preserved_count": (
             primary_preserved_count
+        ),
+        "base_policy_unavailable_count": (
+            base_policy_unavailable_count
         ),
         "both_archive_and_suppress_count": (
             both_archive_and_suppress_count
@@ -555,9 +579,7 @@ def build_report(
         "binding_unavailable_count": (
             binding_unavailable_count
         ),
-        "invalid_event_count": (
-            invalid_event_count
-        ),
+        "invalid_event_count": invalid_event_count,
         "legacy_archive_cognitive_unobserved_count":
             category_counts.get(
                 "legacy_archive_cognitive_unobserved",
@@ -630,10 +652,12 @@ def _render_text(
         )
 
     lines.append("")
-    lines.append("effective gate decisions:")
+    lines.append(
+        "counterfactual gate decisions:"
+    )
     for name in sorted(
         report[
-            "effective_gate_decision_counts"
+            "counterfactual_gate_decision_counts"
         ]
     ):
         lines.append(
@@ -641,7 +665,22 @@ def _render_text(
             % (
                 name,
                 report[
-                    "effective_gate_decision_counts"
+                    "counterfactual_gate_decision_counts"
+                ][name],
+            )
+        )
+
+    lines.append("")
+    lines.append("live gate decisions:")
+    for name in sorted(
+        report["live_gate_decision_counts"]
+    ):
+        lines.append(
+            "  %-42s %s"
+            % (
+                name,
+                report[
+                    "live_gate_decision_counts"
                 ][name],
             )
         )
@@ -653,10 +692,19 @@ def _render_text(
         "legacy_applicable_count",
         "legacy_auto_resolve_candidate_count",
         "legacy_nominal_archive_candidate_count",
+        "legacy_auto_resolve_changed_archive_outcome_count",
+        "legacy_auto_resolve_created_archive_candidate_count",
+        "legacy_auto_resolve_removed_archive_candidate_count",
+        "cognitive_available_count",
         "cognitive_observed_count",
         "cognitive_neutral_unobserved_count",
+        "cognitive_evidence_unavailable_count",
+        "cognitive_represented_count",
         "cognitive_counterfactual_suppress_count",
+        "cognitive_counterfactual_gate_suppress_count",
+        "cognitive_live_gate_suppress_count",
         "primary_preserved_count",
+        "base_policy_unavailable_count",
         "both_archive_and_suppress_count",
         "binding_unavailable_count",
         "invalid_event_count",

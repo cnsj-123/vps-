@@ -1271,11 +1271,18 @@ def _metrics(
             )
             is True,
         ),
+        # The three Cognitive representation counts partition the rows
+        # for which a Cognitive evaluation was attempted and
+        # represented. binding_unavailable rows are the DOCUMENTED
+        # exclusion: they carry no usable identity, so they are never
+        # counted as observed, neutral OR evidence_unavailable (an
+        # unknown identity must not inflate "evidence unavailable"
+        # either).
         "cognitive_observed_count": _count(
             rows,
-            lambda r: cognitive(r).get(
-                "available"
-            )
+            lambda r: category(r)
+            != _CAT_BINDING_UNAVAILABLE
+            and cognitive(r).get("available")
             is True
             and cognitive(r).get("observed")
             is True,
@@ -1283,7 +1290,9 @@ def _metrics(
         "cognitive_neutral_unobserved_count":
             _count(
                 rows,
-                lambda r: cognitive(r).get(
+                lambda r: category(r)
+                != _CAT_BINDING_UNAVAILABLE
+                and cognitive(r).get(
                     "available"
                 )
                 is True
@@ -1295,11 +1304,18 @@ def _metrics(
         "cognitive_evidence_unavailable_count":
             _count(
                 rows,
-                lambda r: cognitive(r).get(
+                lambda r: category(r)
+                != _CAT_BINDING_UNAVAILABLE
+                and cognitive(r).get(
                     "available"
                 )
                 is False,
             ),
+        "cognitive_represented_count": _count(
+            rows,
+            lambda r: category(r)
+            != _CAT_BINDING_UNAVAILABLE,
+        ),
         "cognitive_counterfactual_suppress_count":
             _count(
                 rows,
@@ -1899,15 +1915,20 @@ def update_memory_lifecycle_comparison(
         not isinstance(unified, dict)
         or unified.get("version")
         != _UNIFIED_VERSION
+        or unified.get("conversation_id")
+        != conversation_id
         or unified.get("revision")
         != expected_unified_revision
     ):
+        # A foreign Unified -- even one carrying the SAME numeric
+        # revision -- is never request-local authority. Fail closed
+        # for EVIDENCE only (never for the live request) and never
+        # fall back to a shared latest file.
         return {
             "stored": False,
             "mode": MODE,
             "decision": "no_record",
-            "reason":
-                "unified_observation_unavailable",
+            "reason": "unified_binding_invalid",
         }
 
     artifact = build_lifecycle_comparison_artifact(
@@ -1928,6 +1949,25 @@ def update_memory_lifecycle_comparison(
         ),
         as_of=as_of,
     )
+
+    # Never persist malformed evidence: validate with the SAME v1
+    # validator the reporter uses. Failure stays fail-open relative to
+    # the live request.
+    if not is_valid_lifecycle_comparison_artifact(
+        artifact
+    ):
+        logger.warning(
+            "[gateway.context_memory_lifecycle_comparison] "
+            "reason=invalid_comparison_artifact "
+            "fail_open=true"
+        )
+
+        return {
+            "stored": False,
+            "mode": MODE,
+            "decision": "no_record",
+            "reason": "invalid_comparison_artifact",
+        }
 
     try:
         atomic_write(
