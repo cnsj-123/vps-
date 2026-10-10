@@ -197,21 +197,27 @@ def _apply_lifecycle_surfacing(
 def _lifecycle_surfacing_gate_active(
     *,
     flash_enabled: bool,
+    policy: Any,
 ) -> bool:
     """Whether the LIVE lifecycle Surfacing gate actually participated.
 
     The coordinator owns request execution reality: the lifecycle gate
-    is only ever applied inside ``if flash_enabled:`` (see below), and
-    ``apply_lifecycle_surfacing_gate`` itself is a no-op unless the
-    integration AND the lifecycle shadow are both enabled. This mirrors
-    that exact condition -- reusing the real helpers, never re-parsing
-    flags -- so the comparison records a truthful orchestration fact. It
-    is deliberately independent of the COUNTERFACTUAL analysis, which
-    the comparison still computes while Flash is OFF.
+    is only ever applied inside ``if flash_enabled:`` AND only when a
+    usable request-local policy object exists (``isinstance(policy,
+    dict)``), and ``apply_lifecycle_surfacing_gate`` itself is a no-op
+    unless the integration AND the lifecycle shadow are both enabled.
+    This mirrors that exact condition -- reusing the real helpers and
+    the ACTUAL request-local policy, never re-parsing flags and never
+    re-reading persisted policy state -- so the comparison records a
+    truthful orchestration fact. It proves the live gate PATH
+    participated, not that it changed eligibility. It is deliberately
+    independent of the COUNTERFACTUAL analysis, which the comparison
+    still computes while Flash is OFF.
     """
 
     return bool(
         flash_enabled
+        and isinstance(policy, dict)
         and lifecycle_surfacing_enabled()
         and lifecycle_shadow_enabled()
     )
@@ -711,6 +717,7 @@ def observe_memory_exposure_shadow(
                     live_lifecycle_gate_active=(
                         _lifecycle_surfacing_gate_active(
                             flash_enabled=flash_enabled,
+                            policy=policy,
                         )
                     ),
                 )

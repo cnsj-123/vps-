@@ -107,7 +107,7 @@ Per candidate it records:
 - `min_accessibility`, `min_salience`
 - `would_suppress_if_supplementary`, `would_keep_if_supplementary`
 - `counterfactual_gate_decision` (what the gate policy *would* decide)
-- `effective_live_gate_decision` (the actual current participation)
+- `effective_live_gate_decision` (the actual current gate-path participation)
 - `invalid_event_count`
 
 If valid `used` events exist, values come from the real derived-state helpers
@@ -224,8 +224,18 @@ revision, or its `decision` / `eligible` shape is not a valid policy shape, then
   `not_base_eligible`).
 
 A **missing** policy is therefore **not** the same as a policy that evaluated and
-decided `no_surface`. Only a genuinely bound `no_surface` policy means "not
-eligible" (`base_policy_available = true`,
+decided `no_surface`. The closed v1 decision enum is `allow_shadow` /
+`no_surface`, and each decision has an exact eligible shape:
+
+- `allow_shadow` **must** carry an `eligible` list;
+- `no_surface` **must** carry an `eligible` list that is **empty** (the real v1
+  report always owns an explicit `"eligible": []` from construction onward).
+
+A `no_surface` whose `eligible` field is missing, `null`, or non-empty is
+malformed / contradictory evidence, so it is **UNKNOWN**
+(`base_policy_available = false`), never "not eligible" and never silently
+rewritten to an empty list. Only a genuinely bound `no_surface` policy means
+"not eligible" (`base_policy_available = true`,
 `base_surfacing_eligible = false`, `base_eligible_rank = null`,
 `counterfactual_gate_decision = not_base_eligible`).
 
@@ -300,13 +310,17 @@ not_base_eligible | base_policy_unavailable | binding_unavailable |
 cognitive_evidence_unavailable
 ```
 
-`effective_live_gate_decision` — the actual current participation. When the live
-Lifecycle Surfacing gate is **not** active under its required flags, this is
-`gate_disabled`; when it is active, it equals the counterfactual decision. The
-artifact also records the artifact-level boolean `live_lifecycle_gate_active`
-(`lifecycle_surfacing_enabled() AND lifecycle_shadow_enabled()`), so a
-counterfactual suppression is **never** labelled an actual live effect while the
-gate is disabled.
+`effective_live_gate_decision` — the actual current gate-path participation. It
+proves that the live gate *path* ran, **not** that it changed live eligibility
+(the gate is fail-neutral and may return the base policy on an internal runtime
+failure), so this field is never presented as a proven live eligibility change.
+When the live Lifecycle Surfacing gate is **not** active under its required
+conditions, this is `gate_disabled`; when it is, the recorded decision mirrors
+the counterfactual decision. The artifact also records the artifact-level
+boolean `live_lifecycle_gate_active` — Flash running **AND** a usable
+request-local Surfacing policy object **AND** `lifecycle_surfacing_enabled()`
+**AND** `lifecycle_shadow_enabled()` — so a counterfactual suppression is
+**never** labelled a live effect while the gate is disabled.
 
 The existing Lifecycle Surfacing gate **never suppresses the first base-eligible
 candidate**. So a primary candidate may show

@@ -2333,6 +2333,72 @@ class PipelineCompositionTests(
                 ],
             )
 
+    async def _unusable_policy_case(self, policy_mock):
+        memories = [memory(_A), memory(_B)]
+
+        with tempfile.TemporaryDirectory() as root:
+            record_use(root, _A, used_at=T0 - hours(500))
+            record_use(root, _B, used_at=T0 - hours(500))
+
+            await self._run(
+                root=root,
+                comparison_on=True,
+                flash_on=True,
+                memories=memories,
+                policy_mock=policy_mock,
+                integration_on=True,
+                lifecycle_shadow_on=True,
+            )
+
+            return self._comparison_artifact(root)
+
+    def _assert_no_fabricated_participation(
+        self, artifact
+    ):
+        # Flash + integration + shadow are ALL ON, but the gate never
+        # ran because no usable policy object existed, so the
+        # comparison must NOT fabricate live participation.
+        self.assertIs(
+            artifact["live_lifecycle_gate_active"],
+            False,
+        )
+
+        for row in artifact["candidates"]:
+            self.assertEqual(
+                row["cognitive"][
+                    "counterfactual_gate_decision"
+                ],
+                "base_policy_unavailable",
+            )
+            self.assertEqual(
+                row["cognitive"][
+                    "effective_live_gate_decision"
+                ],
+                "gate_disabled",
+            )
+
+    async def test_live_gate_inactive_when_policy_raises(
+        self,
+    ):
+        artifact = await self._unusable_policy_case(
+            Mock(side_effect=RuntimeError("boom"))
+        )
+
+        self._assert_no_fabricated_participation(
+            artifact
+        )
+
+    async def test_live_gate_inactive_when_policy_none(
+        self,
+    ):
+        artifact = await self._unusable_policy_case(
+            Mock(return_value=None)
+        )
+
+        self._assert_no_fabricated_participation(
+            artifact
+        )
+
 
 # ------------------------------------------------------------------
 # Review fixes: base-policy / unified binding, tri-state, validator,
@@ -2552,6 +2618,28 @@ class BasePolicyBindingTests(_EngineBoundTestCase):
                 )
             )
         )
+
+    def test_no_surface_missing_eligible_is_unknown(self):
+        # The real v1 report ALWAYS owns an explicit ``"eligible": []``
+        # field, so a ``no_surface`` with the field MISSING is
+        # malformed evidence -- never silently fabricated as an empty
+        # list.
+        policy = eligible_policy(
+            [], decision="no_surface"
+        )
+        del policy["eligible"]
+
+        self._assert_unknown(self._row(policy))
+
+    def test_no_surface_none_eligible_is_unknown(self):
+        # ``eligible=None`` is not the real v1 shape either: only an
+        # explicit empty list is a genuine ``no_surface``.
+        policy = eligible_policy(
+            [], decision="no_surface"
+        )
+        policy["eligible"] = None
+
+        self._assert_unknown(self._row(policy))
 
     def test_valid_bound_no_surface_is_not_eligible(self):
         row = self._row(
@@ -3670,6 +3758,103 @@ class AdversarialValidatorMatrixTests(_EngineBoundTestCase):
 
         self._assert_whole_invalid_and_zeroed(
             artifact
+        )
+
+
+class RetrievalCountInvariantTests(unittest.TestCase):
+    """Review Fix #3 §2: the persisted rows plus the truncated count
+    must reconstruct the retrieval candidate total EXACTLY.
+
+    ``max(0, total - persisted)`` would silently accept an impossible
+    total smaller than the persisted rows, so the count invariant
+    itself must reject it even when the persisted metrics were
+    recomputed to match the false total.
+    """
+
+    def _rows(self, count):
+        return [
+            _report_row("legacy_keep_cognitive_keep")
+            for _ in range(count)
+        ]
+
+    def _recompute(self, rows, *, total, truncated):
+        return _metrics(
+            rows,
+            retrieval_candidate_count=total,
+            persisted_count=len(rows),
+            truncated_count=truncated,
+        )
+
+    def test_a_total_smaller_than_persisted_is_invalid(self):
+        rows = self._rows(1)
+        artifact = _artifact(rows)
+
+        # Falsify the total to 0 AND recompute the metrics so the ONLY
+        # remaining inconsistency is the impossible count invariant
+        # (metrics equality would otherwise pass).
+        artifact["observation_truncated"] = False
+        artifact["observation_truncated_count"] = 0
+        artifact["metrics"] = self._recompute(
+            rows, total=0, truncated=0
+        )
+
+        self.assertEqual(
+            artifact["metrics"][
+                "retrieval_candidate_count"
+            ],
+            0,
+        )
+        self.assertEqual(
+            artifact["metrics"][
+                "observed_candidate_count"
+            ],
+            1,
+        )
+        self.assertFalse(
+            is_valid_lifecycle_comparison_artifact(
+                artifact
+            )
+        )
+
+    def test_b_exact_bookkeeping_is_valid(self):
+        artifact = _artifact(self._rows(1))
+
+        self.assertTrue(
+            is_valid_lifecycle_comparison_artifact(
+                artifact
+            )
+        )
+
+    def test_c_truncated_bookkeeping_is_valid(self):
+        artifact = _artifact(
+            self._rows(64), truncated=6
+        )
+
+        self.assertEqual(
+            artifact["metrics"][
+                "retrieval_candidate_count"
+            ],
+            70,
+        )
+        self.assertTrue(
+            is_valid_lifecycle_comparison_artifact(
+                artifact
+            )
+        )
+
+    def test_d_short_truncation_bookkeeping_is_invalid(self):
+        rows = self._rows(64)
+        artifact = _artifact(rows, truncated=6)
+        artifact["observation_truncated"] = True
+        artifact["observation_truncated_count"] = 5
+        artifact["metrics"] = self._recompute(
+            rows, total=70, truncated=5
+        )
+
+        self.assertFalse(
+            is_valid_lifecycle_comparison_artifact(
+                artifact
+            )
         )
 
 

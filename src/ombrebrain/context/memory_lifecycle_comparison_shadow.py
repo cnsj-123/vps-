@@ -393,13 +393,14 @@ def _base_policy_binding(
 
     Returns ``(available, eligible_list)``. ``available`` is False
     whenever the policy is missing, malformed, from another
-    conversation, bound to another Unified revision, or carries a
-    decision OUTSIDE the closed v1 enum -- in which case eligibility is
-    UNKNOWN (``eligible_list`` is None) and must never be inferred as
+    conversation, bound to another Unified revision, carries a decision
+    OUTSIDE the closed v1 enum, or carries an eligible shape that does
+    not match its decision -- in which case eligibility is UNKNOWN
+    (``eligible_list`` is None) and must never be inferred as
     ``not eligible``. When the policy IS validly bound, ``eligible_list``
-    is the real eligible list (an empty list when the policy decided the
-    real ``no_surface``), so a genuine ``no_surface`` correctly means
-    "not eligible".
+    is the real eligible list: a list for ``allow_shadow``, and an
+    EXACTLY empty list for ``no_surface``, so only a genuine
+    ``no_surface`` means "not eligible".
     """
 
     if not isinstance(base_policy, dict):
@@ -444,17 +445,17 @@ def _base_policy_binding(
 
         return True, eligible
 
-    # decision == no_surface: the real v1 contract carries an EMPTY
-    # eligible set. A contradictory ``no_surface`` that still lists
-    # eligible candidates is malformed evidence, not a trustworthy
-    # "not eligible".
-    if eligible is None:
-        return True, []
+    # decision == no_surface: the real memory-surfacing-policy.v1
+    # report ALWAYS owns an explicit ``"eligible": []`` field from
+    # construction onward, so a genuine ``no_surface`` MUST carry a
+    # list AND it MUST be empty. A missing / None / non-empty eligible
+    # set is malformed evidence (or a contradictory decision), never a
+    # trustworthy "not eligible"; an empty list is never fabricated
+    # for it.
+    if not isinstance(eligible, list) or eligible:
+        return False, None
 
-    if isinstance(eligible, list) and not eligible:
-        return True, []
-
-    return False, None
+    return True, []
 
 
 def _legacy_view(
@@ -692,8 +693,9 @@ def _counterfactual_gate_decision(
     """What the CURRENT lifecycle gate would decide IF applied.
 
     This is a COUNTERFACTUAL: it is computed regardless of whether the
-    live Lifecycle Surfacing gate is enabled. It is never labelled an
-    actual live effect (see ``effective_live_gate_decision``).
+    live Lifecycle Surfacing gate is enabled. It is never presented as
+    a proven live eligibility change (see
+    ``effective_live_gate_decision``).
 
     The primary (rank 0) base-eligible candidate is ALWAYS preserved,
     so ``would_suppress_if_supplementary`` and this decision are
@@ -731,12 +733,14 @@ def _effective_live_gate_decision(
     *,
     live_gate_active: bool,
 ) -> str:
-    """The actual current lifecycle gate participation.
+    """The actual current lifecycle gate PATH participation.
 
-    When the live gate cannot change anything under its current flags,
-    no counterfactual suppression is an actual live effect, so this is
-    ``gate_disabled``. Otherwise the real gate would apply the
-    counterfactual decision.
+    This proves whether the live gate path ran, NOT that it changed
+    live eligibility: the gate is fail-neutral, so it may return the
+    base policy even on an internal runtime failure. When the gate did
+    not participate, a counterfactual suppression is not a live effect,
+    so this is ``gate_disabled``. When it did participate, the live
+    decision just mirrors the counterfactual.
     """
 
     if not live_gate_active:
@@ -2021,9 +2025,14 @@ def is_valid_lifecycle_comparison_artifact(
     if not _is_nonneg_int(total):
         return False
 
-    if persisted_truncated != max(
-        0, total - len(candidates)
-    ):
+    # v1 builder semantics: the persisted row count plus the truncated
+    # count must reconstruct the retrieval candidate total EXACTLY. A
+    # total smaller than the persisted rows (e.g. total=0 with one
+    # persisted row) or a bookkeeping count that fails to account for
+    # every candidate is impossible evidence and invalidates the whole
+    # artifact. ``max(0, total - persisted)`` would silently accept the
+    # impossible total < persisted case, so it is NOT used.
+    if total != len(candidates) + persisted_truncated:
         return False
 
     # These artifacts are research evidence: a hand-falsified counter is
