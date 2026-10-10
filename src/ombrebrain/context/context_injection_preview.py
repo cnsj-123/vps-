@@ -343,35 +343,29 @@ def render_context_injection_preview(
     }
 
 
-def update_context_injection_preview(
+def _persist_context_injection_preview(
     conversation_id: str,
-) -> dict[str, Any]:
+    unified: dict[str, Any],
+) -> tuple[
+    dict[str, Any],
+    dict[str, Any] | None,
+]:
+    """Render + persist a Preview from an explicit Unified artifact.
 
-    _validate_conversation_id(
-        conversation_id
-    )
+    Returns ``(report, evidence)``:
 
-    unified_path = (
-        _root()
-        / "unified_context_candidate"
-        / (conversation_id + ".json")
-    )
+      - ``report`` is the existing privacy-safe summary (the only shape
+        the public API has ever returned; it never carries rendered
+        text) and stays safe to log;
+      - ``evidence`` is the exact persisted Preview artifact THIS call
+        produced, including the rendered text. It is the request-local
+        runtime authority for the same request's Gate / Mutation / Real
+        Injection and must never be logged, persisted elsewhere or
+        placed into a request.
 
-    unified = _read_json(
-        unified_path
-    )
-
-    if unified is None:
-        return {
-            "stored":
-                False,
-            "eligible":
-                False,
-            "reason":
-                "unified_candidate_not_found",
-            "conversation_id":
-                conversation_id,
-        }
+    The persistence layout, revision ordering, duplicate detection,
+    budgets, hashes and fail-open semantics are unchanged.
+    """
 
     preview = (
         render_context_injection_preview(
@@ -427,6 +421,13 @@ def update_context_injection_preview(
                 "render_sha256"
             )
         ):
+            evidence = dict(
+                previous
+            )
+
+            evidence["stored"] = True
+            evidence["duplicate"] = True
+
             return {
                 "stored":
                     True,
@@ -468,7 +469,7 @@ def update_context_injection_preview(
                     previous.get(
                         "render_sha256"
                     ),
-            }
+            }, evidence
 
         previous_revision = 0
 
@@ -553,6 +554,13 @@ def update_context_injection_preview(
             payload,
         )
 
+    evidence = dict(
+        payload
+    )
+
+    evidence["stored"] = True
+    evidence["duplicate"] = False
+
     return {
         "stored":
             True,
@@ -590,4 +598,104 @@ def update_context_injection_preview(
             payload[
                 "render_sha256"
             ],
-    }
+    }, evidence
+
+
+def update_context_injection_preview(
+    conversation_id: str,
+) -> dict[str, Any]:
+    """Refresh the conversation-scoped Preview for THIS request.
+
+    Compatibility entry point: it reads the conversation-scoped Unified
+    file, then delegates to the same persistence path. Callers that
+    already hold THIS request's exact Unified artifact use
+    ``update_context_injection_preview_from_unified`` instead, so no
+    concurrent request's "latest" Unified can be mistaken for theirs.
+    """
+
+    _validate_conversation_id(
+        conversation_id
+    )
+
+    unified_path = (
+        _root()
+        / "unified_context_candidate"
+        / (conversation_id + ".json")
+    )
+
+    unified = _read_json(
+        unified_path
+    )
+
+    if unified is None:
+        return {
+            "stored":
+                False,
+            "eligible":
+                False,
+            "reason":
+                "unified_candidate_not_found",
+            "conversation_id":
+                conversation_id,
+        }
+
+    report, _evidence = (
+        _persist_context_injection_preview(
+            conversation_id,
+            unified,
+        )
+    )
+
+    return report
+
+
+def update_context_injection_preview_from_unified(
+    conversation_id: str,
+    *,
+    unified: dict[str, Any],
+) -> tuple[
+    dict[str, Any],
+    dict[str, Any] | None,
+]:
+    """Render + persist THIS request's Preview from ITS OWN Unified.
+
+    Returns ``(privacy_safe_report, request_local_evidence)``. The
+    evidence is the exact Preview artifact this request produced and is
+    the runtime authority for the same request's Gate / Mutation / Real
+    Injection. It is never logged.
+
+    Persistence (``injection_preview/{conversation_id}.json``) still
+    happens for observability / compatibility; it is just no longer the
+    runtime identity authority for this request.
+    """
+
+    _validate_conversation_id(
+        conversation_id
+    )
+
+    if (
+        not isinstance(
+            unified,
+            dict,
+        )
+        or unified.get("version")
+        != "unified-context-candidate.v1"
+    ):
+        return {
+            "stored":
+                False,
+            "eligible":
+                False,
+            "reason":
+                "invalid_unified_candidate",
+            "conversation_id":
+                conversation_id,
+        }, None
+
+    return (
+        _persist_context_injection_preview(
+            conversation_id,
+            unified,
+        )
+    )
+

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from ombrebrain.context.context_request_mutation_shadow import (
+    build_context_request_mutation_shadow,
     build_context_request_mutation_shadow_from_runtime,
 )
 from ombrebrain.context.validators.freshness import (
@@ -312,6 +313,8 @@ def select_context_injected_body(
     forward_body: bytes,
     *,
     conversation_id: str,
+    request_local_preview: dict[str, Any] | None = None,
+    request_local_gate: dict[str, Any] | None = None,
 ) -> tuple[bytes, dict[str, Any]]:
     """Phase 4A-3D limited real injection selector.
 
@@ -329,6 +332,27 @@ def select_context_injected_body(
       - this function never raises for request-borne input and never
         returns an HTTP error;
       - the report never contains rendered Context text.
+
+    Request-local authority:
+      when the caller supplies THIS request's exact
+      ``request_local_preview`` / ``request_local_gate``, the selector
+      validates and injects that exact pair instead of re-reading
+      conversation-scoped "latest" files a concurrent request on the
+      same conversation may already have overwritten. Request-local
+      identity is an ADDITIONAL guarantee: every content-integrity
+      check below still runs unchanged and a malformed / mismatched
+      binding is denied (fail-open to the exact input body).
+
+      The three cases are distinguished explicitly:
+
+        - NEITHER artifact supplied: the legacy conversation-scoped
+          compatibility path is used;
+        - BOTH supplied as conversation-bound dicts: the exact
+          request-local pair is used;
+        - exactly one supplied, or either supplied but malformed:
+          a partial / malformed request-local binding FAILS CLOSED
+          (exact input body, reason ``invalid_request_local_binding``)
+          and never reads conversation-scoped files.
     """
 
     if not _truthy(
@@ -358,6 +382,12 @@ def select_context_injected_body(
             forward_body,
             conversation_id=conversation_id,
             report=report,
+            request_local_preview=(
+                request_local_preview
+            ),
+            request_local_gate=(
+                request_local_gate
+            ),
         )
     except Exception:
         # Absolute fail-open: any unexpected error keeps the
@@ -376,6 +406,8 @@ def _select_enabled(
     *,
     conversation_id: Any,
     report: dict[str, Any],
+    request_local_preview: Any = None,
+    request_local_gate: Any = None,
 ) -> tuple[bytes, dict[str, Any]]:
 
     # --------------------------------------------------
@@ -412,14 +444,77 @@ def _select_enabled(
         )
 
     # --------------------------------------------------
-    # 2. Preview
+    # 2. Request-local authority vs legacy compatibility
     # --------------------------------------------------
 
-    preview = _read_json_file(
-        _root()
-        / "injection_preview"
-        / (conversation_id + ".json")
+    # Three cases, distinguished explicitly:
+    #   1. NEITHER request-local artifact supplied
+    #        -> legacy compatibility path MAY read conversation-scoped
+    #           "latest" files;
+    #   2. BOTH supplied as conversation-bound dicts
+    #        -> use the exact request-local pair;
+    #   3. ANY incomplete/malformed mixture (exactly one supplied, or
+    #      either supplied but malformed / non-dict)
+    #        -> malformed / partial request-local binding: FAIL CLOSED
+    #           (return the exact forward_body), never read a
+    #           conversation-scoped Preview/Gate.
+    # A caller that supplies only one artifact, or a malformed one, has
+    # already declared a request-local authority path; that is NOT the
+    # same as supplying no request-local evidence at all.
+    request_local_supplied = (
+        request_local_preview is not None
+        or request_local_gate is not None
     )
+
+    if request_local_supplied:
+        if (
+            not isinstance(
+                request_local_preview,
+                dict,
+            )
+            or not isinstance(
+                request_local_gate,
+                dict,
+            )
+        ):
+            return (
+                forward_body,
+                _denied(
+                    report,
+                    "invalid_request_local_binding",
+                ),
+            )
+
+        preview = request_local_preview
+
+        # Request-local identity is only trustworthy when the pair is
+        # bound to THIS conversation. A foreign / malformed binding is
+        # denied (the exact forward_body is returned).
+        if (
+            preview.get("conversation_id")
+            != conversation_id
+            or request_local_gate.get(
+                "conversation_id"
+            )
+            != conversation_id
+        ):
+            return (
+                forward_body,
+                _denied(
+                    report,
+                    "request_local_conversation_mismatch",
+                ),
+            )
+
+        use_request_local = True
+    else:
+        use_request_local = False
+
+        preview = _read_json_file(
+            _root()
+            / "injection_preview"
+            / (conversation_id + ".json")
+        )
 
     if preview is None:
         return (
@@ -510,11 +605,14 @@ def _select_enabled(
     # 3. Gate
     # --------------------------------------------------
 
-    gate = _read_json_file(
-        _root()
-        / "injection_gate"
-        / (conversation_id + ".json")
-    )
+    if use_request_local:
+        gate = request_local_gate
+    else:
+        gate = _read_json_file(
+            _root()
+            / "injection_gate"
+            / (conversation_id + ".json")
+        )
 
     if gate is None:
         return (
@@ -748,13 +846,26 @@ def _select_enabled(
     # --------------------------------------------------
 
     try:
-        mutated_body, mutation = (
-            build_context_request_mutation_shadow_from_runtime(
-                forward_body,
-                conversation_id=
-                    conversation_id,
+        if use_request_local:
+            # Exact-input boundary: mutate from THIS request's Preview
+            # / Gate only, so a concurrent request that already
+            # overwrote the conversation-scoped files cannot change
+            # what this request injects.
+            mutated_body, mutation = (
+                build_context_request_mutation_shadow(
+                    forward_body,
+                    preview=preview,
+                    gate=gate,
+                )
             )
-        )
+        else:
+            mutated_body, mutation = (
+                build_context_request_mutation_shadow_from_runtime(
+                    forward_body,
+                    conversation_id=
+                        conversation_id,
+                )
+            )
     except Exception:
         return (
             forward_body,

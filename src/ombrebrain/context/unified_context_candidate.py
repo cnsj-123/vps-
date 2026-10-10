@@ -260,6 +260,51 @@ async def update_unified_context_candidate_from_runtime(
         # Observation must remain fail-open.
         result["memory_shadow_snapshot"] = None
 
+    # Request-local cognitive workspace evidence.
+    #
+    # The exact Conversation Candidate captured BEFORE the retrieval
+    # await above, together with the exact Unified artifact this pass
+    # produced. It is the in-memory runtime authority for the
+    # downstream Preview / Gate / Mutation / Real Injection stages of
+    # THIS request, so those stages do not have to re-read a
+    # conversation-scoped "latest" file a concurrent request may
+    # already have overwritten.
+    #
+    # Like ``memory_shadow_snapshot`` it is never persisted, never
+    # logged and never part of any on-disk artifact. It is deliberately
+    # absent whenever this pass did not produce its own Candidate +
+    # Unified, so a request that did not refresh the chain can never be
+    # mistaken for one that did.
+    try:
+        unified_artifact = (
+            shadow_observation.get(
+                "unified_artifact"
+            )
+        )
+
+        if (
+            isinstance(
+                conversation_candidate,
+                dict,
+            )
+            and isinstance(
+                unified_artifact,
+                dict,
+            )
+        ):
+            result["request_local_chain"] = {
+                "conversation_id":
+                    conversation_id,
+                "conversation_candidate":
+                    conversation_candidate,
+                "unified":
+                    unified_artifact,
+            }
+
+    except Exception:
+        # Evidence emission must remain fail-open.
+        pass
+
     # Privacy-safe rolling metrics only.
     # This is observation-only and must never affect retrieval,
     # Unified candidate assembly or upstream forwarding.

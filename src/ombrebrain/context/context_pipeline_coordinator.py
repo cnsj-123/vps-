@@ -35,9 +35,11 @@ from ombrebrain.context.memory_surfacing_policy import (
 )
 from ombrebrain.context.context_injection_gate import (
     update_context_injection_gate,
+    update_context_injection_gate_from_request_local,
 )
 from ombrebrain.context.context_injection_preview import (
     update_context_injection_preview,
+    update_context_injection_preview_from_unified,
 )
 from ombrebrain.context.context_observation_pipeline import (
     observe_context_sources,
@@ -46,7 +48,12 @@ from ombrebrain.context.context_real_injection import (
     select_context_injected_body,
 )
 from ombrebrain.context.context_request_mutation_shadow import (
+    build_context_request_mutation_shadow,
     build_context_request_mutation_shadow_from_runtime,
+)
+from ombrebrain.context.context_request_workspace import (
+    ContextRequestWorkspace,
+    extract_request_local_chain,
 )
 from ombrebrain.context.pipeline_events import (
     build_context_chain_event,
@@ -859,6 +866,7 @@ async def observe_unified_preview_gate(
     *,
     cognitive_request_id: str | None = None,
     forward_body: bytes | None = None,
+    workspace: ContextRequestWorkspace | None = None,
 ) -> bool:
     """Refresh the Unified -> Preview -> Gate chain for this request.
 
@@ -886,7 +894,24 @@ async def observe_unified_preview_gate(
     later. It remains a truthful place to observe Frontend Memory,
     because those later stages must preserve the existing request
     content (including preserved Frontend attachments).
+
+    ``workspace`` is the request-local Cognitive Workspace for THIS
+    request. When supplied it is populated with the exact artifacts
+    this request produced (Conversation Candidate, Unified, Memory
+    snapshot, Confidence report, Preview, Gate, freshness) and every
+    downstream stage prefers those over re-reading conversation-scoped
+    "latest" files. When it is not supplied, or when this request did
+    not produce its own Candidate + Unified, the existing
+    conversation-scoped behaviour is preserved unchanged.
     """
+
+    if workspace is not None:
+        workspace.conversation_id = (
+            conversation_id
+        )
+        workspace.cognitive_request_id = (
+            cognitive_request_id
+        )
 
     unified_enabled = _truthy(
         os.environ.get(
@@ -1117,6 +1142,40 @@ async def observe_unified_preview_gate(
         ),
     )
 
+    # Bind THIS request's exact artifacts into its request-local
+    # workspace. ``extract_request_local_chain`` only returns evidence
+    # for a pass that produced its own Candidate + Unified, so a
+    # request that did not refresh the chain never claims one.
+    if workspace is not None:
+        chain = extract_request_local_chain(
+            unified
+        )
+
+        if isinstance(
+            chain,
+            dict,
+        ):
+            workspace.conversation_candidate = (
+                chain.get(
+                    "conversation_candidate"
+                )
+            )
+            workspace.unified = (
+                chain.get("unified")
+            )
+
+        snapshot = unified.get(
+            "memory_shadow_snapshot"
+        )
+
+        if isinstance(
+            snapshot,
+            dict,
+        ):
+            workspace.memory_shadow_snapshot = (
+                snapshot
+            )
+
     # Confidence Gate shadow observer. It sits right after Unified and
     # before Preview, but it is an observer only: its decision never
     # gates the Preview, the Injection Gate, the Mutation Shadow or
@@ -1137,6 +1196,17 @@ async def observe_unified_preview_gate(
                     unified.get("revision")
                 ),
             )
+        )
+
+    if (
+        workspace is not None
+        and isinstance(
+            confidence_report,
+            dict,
+        )
+    ):
+        workspace.confidence_report = (
+            confidence_report
         )
 
     # Memory Surfacing Policy -> Memory Flash -> Exposure Ledger.
@@ -1226,11 +1296,33 @@ async def observe_unified_preview_gate(
         return False
 
     try:
-        preview = (
-            update_context_injection_preview(
-                conversation_id
+        if (
+            workspace is not None
+            and workspace.has_request_local_chain
+        ):
+            # Render THIS request's Preview from ITS OWN Unified, so a
+            # concurrent request on the same conversation cannot become
+            # this request's Preview identity.
+            (
+                preview,
+                request_local_preview,
+            ) = (
+                update_context_injection_preview_from_unified(
+                    conversation_id,
+                    unified=workspace.unified,
+                )
             )
-        )
+
+            if request_local_preview is not None:
+                workspace.preview = (
+                    request_local_preview
+                )
+        else:
+            preview = (
+                update_context_injection_preview(
+                    conversation_id
+                )
+            )
     except Exception as exc:
         logger.warning(
             "[gateway.context_injection_preview] "
@@ -1307,11 +1399,47 @@ async def observe_unified_preview_gate(
         return False
 
     try:
-        gate = (
-            update_context_injection_gate(
-                conversation_id
+        if (
+            workspace is not None
+            and workspace.has_request_local_chain
+            and isinstance(
+                workspace.preview,
+                dict,
             )
-        )
+        ):
+            # Evaluate THIS request's Gate from ITS OWN Candidate /
+            # Unified / Preview, so a concurrent request on the same
+            # conversation cannot become this request's Gate identity.
+            gate = (
+                update_context_injection_gate_from_request_local(
+                    conversation_id,
+                    conversation_candidate=(
+                        workspace.conversation_candidate
+                    ),
+                    unified=(
+                        workspace.unified
+                    ),
+                    preview=(
+                        workspace.preview
+                    ),
+                )
+            )
+
+            if isinstance(
+                gate,
+                dict,
+            ):
+                # Keep THIS request's Gate decision (allow or deny) as
+                # its request-local evidence. A deny is still evidence
+                # that must not be replaced by a concurrent request's
+                # allow.
+                workspace.gate = gate
+        else:
+            gate = (
+                update_context_injection_gate(
+                    conversation_id
+                )
+            )
     except Exception as exc:
         logger.warning(
             "[gateway.context_injection_gate] "
@@ -1420,14 +1548,27 @@ async def observe_unified_preview_gate(
 
     # This request refreshed the whole chain. A fresh deny is still
     # fresh; the selector decides whether injection is allowed.
+    if workspace is not None:
+        workspace.context_chain_fresh = True
+
     return True
 
 
 def observe_request_mutation(
     conversation_id: str | None,
     forward_body: bytes,
+    *,
+    workspace: ContextRequestWorkspace | None = None,
 ) -> None:
-    """Build a hypothetical injected request without sending it."""
+    """Build a hypothetical injected request without sending it.
+
+    ``workspace`` carries THIS request's exact Preview/Gate when the
+    request-local chain is available; the shadow then mutates from that
+    exact pair instead of re-reading conversation-scoped "latest"
+    files. Otherwise the existing runtime-reading path is used
+    unchanged (it remains the compatibility entry point for callers
+    that only hold a conversation id).
+    """
 
     if not _truthy(
         os.environ.get(
@@ -1448,14 +1589,67 @@ def observe_request_mutation(
     ):
         return
 
-    try:
-        _mutated_body, report = (
-            build_context_request_mutation_shadow_from_runtime(
-                forward_body,
-                conversation_id=
-                    conversation_id,
-            )
+    request_local_preview, request_local_gate = (
+        None,
+        None,
+    )
+
+    has_request_local_evidence = (
+        workspace is not None
+        and workspace.has_any_preview_gate_evidence
+    )
+
+    if has_request_local_evidence:
+        (
+            request_local_preview,
+            request_local_gate,
+        ) = (
+            workspace.request_local_preview_gate()
         )
+
+        if (
+            request_local_preview is None
+            or request_local_gate is None
+        ):
+            # THIS request carries some Preview/Gate evidence, but the
+            # pair is incomplete (only one side), malformed or bound to
+            # another conversation. Fail closed: build no shadow from
+            # foreign evidence and never fall back to a
+            # conversation-scoped "latest" pair.
+            logger.warning(
+                "[gateway.context_request_mutation_shadow] "
+                "request_local_binding_invalid "
+                "mutation_skipped=true"
+            )
+            return
+
+    try:
+        if (
+            request_local_preview is not None
+            and request_local_gate is not None
+        ):
+            # Exact-input boundary: mutate from THIS request's own
+            # Preview/Gate, never from a conversation-scoped "latest"
+            # pair a concurrent request may have written.
+            _mutated_body, report = (
+                build_context_request_mutation_shadow(
+                    forward_body,
+                    preview=(
+                        request_local_preview
+                    ),
+                    gate=(
+                        request_local_gate
+                    ),
+                )
+            )
+        else:
+            _mutated_body, report = (
+                build_context_request_mutation_shadow_from_runtime(
+                    forward_body,
+                    conversation_id=
+                        conversation_id,
+                )
+            )
     except Exception as exc:
         logger.warning(
             "[gateway.context_request_mutation_shadow] "
@@ -1486,6 +1680,7 @@ def select_real_injection(
     forward_body: bytes,
     *,
     context_chain_fresh: bool,
+    workspace: ContextRequestWorkspace | None = None,
 ) -> bytes:
     """Phase 4A-3D limited real injection.
 
@@ -1509,6 +1704,14 @@ def select_real_injection(
         have refreshed Unified -> Preview -> Gate. Otherwise any
         Preview/Gate on disk belongs to an earlier request and must
         not be injected, so the selector is not even called.
+
+    Request-local authority:
+      - when ``workspace`` carries THIS request's exact, conversation-
+        bound Preview/Gate pair, the selector validates and injects
+        that exact pair instead of re-reading conversation-scoped
+        "latest" files. Every content-integrity check inside the
+        selector still runs unchanged, so request-local identity is an
+        ADDITIONAL guarantee, never a replacement.
     """
 
     if not _truthy(
@@ -1549,14 +1752,73 @@ def select_real_injection(
         )
         return forward_body
 
-    try:
-        selected_body, report = (
-            select_context_injected_body(
-                forward_body,
-                conversation_id=
-                    conversation_id,
+    request_local_preview = None
+    request_local_gate = None
+
+    if (
+        workspace is not None
+        and workspace.has_any_preview_gate_evidence
+    ):
+        (
+            request_local_preview,
+            request_local_gate,
+        ) = workspace.request_local_preview_gate()
+
+        if (
+            request_local_preview is None
+            or request_local_gate is None
+        ):
+            # THIS request carries some Preview/Gate evidence, but the
+            # pair is incomplete (only one side), malformed or belongs
+            # to another conversation. Fail open for forwarding: keep
+            # the exact input body and never inject a conversation-
+            # scoped "latest" pair that is not this request's own.
+            logger.info(
+                "[gateway.context_real_injection] %s",
+                json.dumps(
+                    {
+                        "enabled": True,
+                        "applied": False,
+                        "reason":
+                            "request_local_binding_invalid",
+                        "conversation_id":
+                            conversation_id,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
             )
-        )
+            return forward_body
+
+    try:
+        if (
+            request_local_preview is not None
+            and request_local_gate is not None
+        ):
+            # Exact request-local identity authority for THIS request.
+            selected_body, report = (
+                select_context_injected_body(
+                    forward_body,
+                    conversation_id=
+                        conversation_id,
+                    request_local_preview=(
+                        request_local_preview
+                    ),
+                    request_local_gate=(
+                        request_local_gate
+                    ),
+                )
+            )
+        else:
+            # No request-local evidence (or flags OFF): keep the exact
+            # existing call shape so the default path is unchanged.
+            selected_body, report = (
+                select_context_injected_body(
+                    forward_body,
+                    conversation_id=
+                        conversation_id,
+                )
+            )
     except Exception as exc:
         logger.warning(
             "[gateway.context_real_injection] "
@@ -1970,6 +2232,18 @@ async def _run_context_pipeline_selection(
             )
         )
 
+        # Request-local Cognitive Workspace for THIS request. It holds
+        # only the exact artifacts this pass produces and is the
+        # runtime authority for the downstream Preview / Gate /
+        # Mutation / Real Injection stages below. It is in-memory
+        # only: never persisted, logged, cached or given to the model.
+        workspace = ContextRequestWorkspace(
+            conversation_id=conversation_id,
+            cognitive_request_id=(
+                cognitive_request_id
+            ),
+        )
+
         context_chain_fresh = (
             await observe_unified_preview_gate(
                 conversation_id,
@@ -1977,6 +2251,7 @@ async def _run_context_pipeline_selection(
                     cognitive_request_id
                 ),
                 forward_body=forward_body,
+                workspace=workspace,
             )
         )
 
@@ -1984,6 +2259,7 @@ async def _run_context_pipeline_selection(
             observe_request_mutation(
                 conversation_id,
                 forward_body,
+                workspace=workspace,
             )
 
         selected_body = select_real_injection(
@@ -1991,6 +2267,7 @@ async def _run_context_pipeline_selection(
             forward_body,
             context_chain_fresh=
                 context_chain_fresh,
+            workspace=workspace,
         )
 
         # Strictly post-Real-Injection, fail-open relative to its own

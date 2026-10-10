@@ -841,6 +841,7 @@ class CognitiveRequestIdTests(
             *,
             cognitive_request_id=None,
             forward_body=None,
+            workspace=None,
         ):
             captured.append(
                 cognitive_request_id
