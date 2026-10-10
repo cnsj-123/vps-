@@ -16,12 +16,34 @@ and the code disagree, the code is correct and this document is wrong.
   updated for the Request-local Cognitive Workspace Foundation v0 task
   (branch `trae/request-local-cognitive-workspace-v0`), then updated for the
   Memory Lifecycle Authority Map + Dual-Authority Guardrails v0 task
-  (branch `trae/lifecycle-authority-audit-v0`).
+  (branch `trae/lifecycle-authority-audit-v0`), then updated for the
+  Legacy vs Cognitive Lifecycle Shadow Comparison v0 task
+  (branch `trae/lifecycle-shadow-comparison-v0`, base
+  `01b5948ab1b14c2a65ddebea31611f2e5321aa74`).
 
-Companion document: **`docs/cognitive-memory/LIFECYCLE_AUTHORITY_MAP.md`** is the
-exact call-site / authority matrix for the legacy and cognitive lifecycle planes
-(referenced from §2.19, §2.20, §2.21 and §8). It is itself a WORKING DRAFT /
-REALITY MAP, not an ADR or specification.
+Companion documents:
+
+- **`docs/cognitive-memory/LIFECYCLE_AUTHORITY_MAP.md`** is the exact call-site /
+  authority matrix for the legacy and cognitive lifecycle planes (referenced from
+  §2.19, §2.20, §2.21 and §8). It is itself a WORKING DRAFT / REALITY MAP, not an
+  ADR or specification.
+- **`docs/cognitive-memory/LIFECYCLE_SHADOW_COMPARISON.md`** documents the
+  Legacy vs Cognitive Lifecycle Shadow Comparison v0 — an `OBSERVATION_ONLY`
+  experiment that reads both planes to record where their current semantics
+  differ. It is also a WORKING EXPERIMENT / SHADOW OBSERVATION, not an ADR or a
+  frozen specification.
+
+Current experiment status:
+
+```
+Lifecycle Authority Map
+    ↓
+Lifecycle Shadow Comparison
+```
+
+The comparison **adds comparison evidence only**. It does **not** unify lifecycle
+authority, does **not** decide which lifecycle policy wins, and does **not**
+resolve OA-2. `comparison evidence exists` — **not** `migration solved`.
 
 Everything below is derived by reading the real modules listed next to each
 stage. Where a claim could not be verified from code it is explicitly marked
@@ -648,6 +670,35 @@ fixed here):
 The Frontend-Memory-observation path (`forward_body`) is intentionally passed as
 this request's own bytes; it is not a conversation-global read.
 
+### 2.24 Legacy vs Cognitive Lifecycle Shadow Comparison (v0)
+
+| Field | Value |
+| --- | --- |
+| Owner | `src/ombrebrain/context/memory_lifecycle_comparison_shadow.py` (+ read-only reporter `src/ombrebrain/maintenance/lifecycle_comparison_report.py`) |
+| Input | **this request's** `memory_shadow_snapshot` (raw retrieval candidates + Unified) + the base Surfacing Policy for this request |
+| Output | one privacy-safe, request-scoped comparison artifact (categories, per-candidate Legacy/Cognitive views, aggregate metrics); **no** live effect |
+| Persisted | `memory_lifecycle_comparison/{conversation_id}/{cognitive_request_id}.json` |
+| Shadow/Live | **OBSERVATION_ONLY**, default OFF |
+| Flag | `OMBRE_GATEWAY_CONTEXT_LIFECYCLE_COMPARISON_SHADOW` |
+| Mutates provider request | no |
+| Mutates canonical memory | no |
+| Lifecycle effect | none — reads both planes for comparison only |
+| Downstream | none (evidence for later analysis; pure fail-open) |
+
+It records where the **existing** Legacy policy (via the side-effect-free
+`DecayEngine.preview_decay_cycle_decision` read surface) and the **existing**
+Cognitive policy (via the shared
+`memory_surfacing_lifecycle.evaluate_lifecycle_surfacing_candidate` evaluator)
+would differ on the same real retrieval candidates. It never archives, resolves,
+touches, deletes, fabricates `used` evidence, or changes any live body. See
+[LIFECYCLE_SHADOW_COMPARISON.md](LIFECYCLE_SHADOW_COMPARISON.md).
+
+Like the other Memory observers it consumes this request's own snapshot, so
+enabling it alone refreshes the upstream Conversation→Unified chain for the
+request (it is part of `memory_observer_enabled`). It works while the Flash /
+Ledger / Surface stages are OFF, and when it is enabled **without** Flash it
+writes only the comparison artifact.
+
 ---
 
 ## 3. What the cache rewriters do to attachments (relevant to Frontend Memory)
@@ -726,7 +777,8 @@ implicitly drives the upstream chain it consumes.
 
 - `OMBRE_GATEWAY_CONTEXT_CONFIDENCE_GATE_SHADOW`,
   `..._MEMORY_FLASH_SHADOW`, `..._EXPOSURE_LEDGER_SHADOW`,
-  `..._MEMORY_RECALL_SURFACE_SHADOW`, and
+  `..._MEMORY_RECALL_SURFACE_SHADOW`,
+  `..._LIFECYCLE_COMPARISON_SHADOW`, and
   `..._MEMORY_SOURCE_ARBITRATION_SHADOW` all cause
   `observe_context_sources` / `observe_unified_preview_gate` to run the
   upstream Conversation→Unified chain for this request (they are consumers, not
@@ -742,6 +794,9 @@ implicitly drives the upstream chain it consumes.
   flag; it is strictly post-Real-Injection.
 - `..._MEMORY_SURFACING_LIFECYCLE` is only consulted while the Flash stage is
   already running; it never starts the pipeline.
+- `..._LIFECYCLE_COMPARISON_SHADOW` is the exception among Memory observers: it
+  works while Flash / Ledger / Surface are OFF (it evaluates the base Surfacing
+  Policy purely for observation), and it writes only its own comparison artifact.
 - `..._USAGE_LIFECYCLE_INTEGRATION` requires `..._USAGE_ATTRIBUTION` and
   `OMBRE_GATEWAY_MEMORY_LIFECYCLE_SHADOW`.
 
@@ -750,6 +805,7 @@ Shadow flags that never mutate the provider request:
 `..._INJECTION_GATE_SHADOW`, `..._REQUEST_MUTATION_SHADOW`,
 `..._CONFIDENCE_GATE_SHADOW`, `..._MEMORY_FLASH_SHADOW`,
 `..._EXPOSURE_LEDGER_SHADOW`, `..._MEMORY_RECALL_SURFACE_SHADOW`,
+`..._LIFECYCLE_COMPARISON_SHADOW`,
 `..._MEMORY_SOURCE_ARBITRATION_SHADOW`,
 `OMBRE_GATEWAY_MEMORY_LIFECYCLE_SHADOW`.
 
@@ -792,7 +848,11 @@ demonstrated correctness / data-integrity / authority violations.
   **supplementary Memory Flash surfacing authority when its gates are ON** and
   owns cognitive `used`/reinforcement/`strength`-`accessibility`-`salience`. The
   two planes **do not currently mutate each other's state**. Migration to a single
-  owner is **unresolved** and is not attempted by the audit.
+  owner is **unresolved** and is not attempted by the audit. The Legacy vs
+  Cognitive Lifecycle Shadow Comparison v0 (§2.24) now **adds comparison
+  evidence** about where the two planes' current semantics differ, but it makes
+  **no** decision: `comparison evidence exists` — **not** `migration solved`.
+  OA-2 remains unresolved.
 
 ### P1 — architecture debt likely to hurt the next stages
 
@@ -873,6 +933,19 @@ demonstrated correctness / data-integrity / authority violations.
   layout change. Authority separation only (see §0.2).
 - No change to Frontend Memory liveness; no change to any default (Real
   Injection and Live Memory Flash Exposure remain default OFF).
+
+### Explicitly NOT done in the Legacy vs Cognitive Lifecycle Shadow Comparison v0 task
+
+- No change to live memory lifecycle behaviour; the comparison is default OFF and
+  observation-only, and never mutates any memory state.
+- No change to the decay formula, archive threshold, auto-resolve threshold,
+  `activation_count` / `last_active` semantics, Memory Surfacing thresholds,
+  retrieval ranking, or Dream ranking.
+- No bridging of the Legacy and Cognitive planes; no `UseMemory` → `touch` bridge
+  and no `trace(reinforce=True)` → `used` bridge.
+- No ArchiveCandidate behaviour; no consolidation; no migration or unification of
+  lifecycle authority; OA-2 remains unresolved.
+- No conversation-global "latest comparison" file; no new live body mutation.
 
 ---
 
@@ -963,6 +1036,12 @@ The correct framing is therefore **parallel lifecycle authorities with different
 scopes**, not "one lifecycle implementation with a legacy duplicate".
 **Migration remains unresolved**; the audit changes no live behaviour and adds
 only guardrail tests.
+
+The Legacy vs Cognitive Lifecycle Shadow Comparison v0 (§2.24) is the current
+follow-on experiment: it **observes** where the two planes' current semantics
+differ on the same real candidates and **adds comparison evidence only**. It does
+not unify authority, does not decide which plane wins, and leaves OA-2 unresolved.
+`comparison evidence exists` — **not** `migration solved`.
 
 ### Explicitly NOT done in the Memory Lifecycle Authority Map + Dual-Authority Guardrails v0 task
 

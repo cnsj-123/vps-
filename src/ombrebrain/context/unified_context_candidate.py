@@ -12,6 +12,10 @@ from typing import Any
 from ombrebrain.context.retrieval_decision_shadow import (
     build_candidate_evidence,
 )
+from ombrebrain.context.memory_lifecycle_comparison_shadow import (
+    capture_legacy_lifecycle_observations,
+    lifecycle_comparison_enabled,
+)
 from ombrebrain.context.retrieval_shadow_metrics import (
     record_retrieval_shadow_metrics,
 )
@@ -200,6 +204,34 @@ async def update_unified_context_candidate_from_runtime(
         query=query
     )
 
+    # Request-local Legacy lifecycle preview evidence. Captured HERE,
+    # while the raw retrieval candidates still carry the canonical
+    # metadata the Legacy plane needs (Unified strips it later).
+    # Shadow-only and default OFF: when the flag is OFF this is a true
+    # no-op and the request-local snapshot contract is unchanged. It
+    # never mutates anything and never crosses into the Cognitive plane.
+    legacy_lifecycle_observations: (
+        list[dict[str, Any]] | None
+    ) = None
+
+    if lifecycle_comparison_enabled():
+        try:
+            legacy_lifecycle_observations = (
+                capture_legacy_lifecycle_observations(
+                    context_candidates.get(
+                        "memories"
+                    )
+                    if isinstance(
+                        context_candidates,
+                        dict,
+                    )
+                    else []
+                )
+            )
+        except Exception:
+            # Observation must remain fail-open.
+            legacy_lifecycle_observations = None
+
     shadow_observation: dict[str, Any] = {}
 
     result = update_unified_context_candidate(
@@ -252,6 +284,9 @@ async def update_unified_context_candidate_from_runtime(
                         dict,
                     )
                     else []
+                ),
+                legacy_lifecycle_observations=(
+                    legacy_lifecycle_observations
                 ),
             )
         )
@@ -1767,6 +1802,7 @@ def build_memory_shadow_snapshot(
     conversation_id: str,
     unified: Any,
     retrieval_memories: Any,
+    legacy_lifecycle_observations: Any = None,
 ) -> dict[str, Any] | None:
     """Request-local, shadow-only Memory observation snapshot.
 
@@ -1782,6 +1818,13 @@ def build_memory_shadow_snapshot(
     sections, Preview, Real Injection, a header or a cache key, and
     it never changes retrieval candidate selection. Returns None when
     no valid Unified artifact was produced for this request.
+
+    ``legacy_lifecycle_observations`` is an optional request-local
+    Legacy preview evidence list produced by the caller while the raw
+    retrieval candidates still carried their canonical metadata. It is
+    added only when supplied (comparison flag ON), so the snapshot
+    contract is behaviourally unchanged when the flag is OFF. It never
+    reaches Unified, Preview, Real Injection or disk.
     """
 
     if (
@@ -1801,7 +1844,7 @@ def build_memory_shadow_snapshot(
         else []
     )
 
-    return {
+    snapshot: dict[str, Any] = {
         "version":
             "memory-shadow-snapshot.v1",
         "mode":
@@ -1817,6 +1860,16 @@ def build_memory_shadow_snapshot(
                 memories
             ),
     }
+
+    if isinstance(
+        legacy_lifecycle_observations,
+        list,
+    ):
+        snapshot[
+            "legacy_lifecycle_observations"
+        ] = legacy_lifecycle_observations
+
+    return snapshot
 
 
 def unified_context_candidate_status(

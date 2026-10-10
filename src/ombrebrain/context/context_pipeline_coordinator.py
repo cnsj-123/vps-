@@ -27,8 +27,15 @@ from ombrebrain.context.memory_flash_live_exposure import (
 from ombrebrain.context.memory_source_arbitration_shadow import (
     update_memory_source_arbitration,
 )
+from ombrebrain.context.memory_lifecycle_comparison_shadow import (
+    lifecycle_comparison_enabled,
+    log_lifecycle_comparison_report,
+    update_memory_lifecycle_comparison,
+)
 from ombrebrain.context.memory_surfacing_lifecycle import (
     apply_lifecycle_surfacing_gate,
+    lifecycle_shadow_enabled,
+    lifecycle_surfacing_enabled,
 )
 from ombrebrain.context.memory_surfacing_policy import (
     evaluate_surfacing_policy,
@@ -185,6 +192,35 @@ def _apply_lifecycle_surfacing(
         )
 
         return policy
+
+
+def _lifecycle_surfacing_gate_active(
+    *,
+    flash_enabled: bool,
+    policy: Any,
+) -> bool:
+    """Whether the LIVE lifecycle Surfacing gate actually participated.
+
+    The coordinator owns request execution reality: the lifecycle gate
+    is only ever applied inside ``if flash_enabled:`` AND only when a
+    usable request-local policy object exists (``isinstance(policy,
+    dict)``), and ``apply_lifecycle_surfacing_gate`` itself is a no-op
+    unless the integration AND the lifecycle shadow are both enabled.
+    This mirrors that exact condition -- reusing the real helpers and
+    the ACTUAL request-local policy, never re-parsing flags and never
+    re-reading persisted policy state -- so the comparison records a
+    truthful orchestration fact. It proves the live gate PATH
+    participated, not that it changed eligibility. It is deliberately
+    independent of the COUNTERFACTUAL analysis, which the comparison
+    still computes while Flash is OFF.
+    """
+
+    return bool(
+        flash_enabled
+        and isinstance(policy, dict)
+        and lifecycle_surfacing_enabled()
+        and lifecycle_shadow_enabled()
+    )
 
 
 def observe_context_confidence(
@@ -531,10 +567,20 @@ def observe_memory_exposure_shadow(
         )
     )
 
+    # Legacy vs Cognitive Lifecycle Comparison Shadow. Default OFF.
+    # It is observation-only and counterfactual: it compares the BASE
+    # Surfacing Policy against the lifecycle formulas WITHOUT applying
+    # any lifecycle decision to live eligibility. It works even while
+    # the Flash / Ledger / Surface stages are OFF (it may evaluate the
+    # base policy purely for observation), but it never creates a
+    # Flash artifact, a Recall Surface or a provider mutation.
+    comparison_enabled = lifecycle_comparison_enabled()
+
     if not (
         flash_enabled
         or ledger_enabled
         or surface_enabled
+        or comparison_enabled
     ):
         return
 
@@ -606,14 +652,20 @@ def observe_memory_exposure_shadow(
         return
 
     # --------------------------------------------------
-    # 1. Surfacing Policy -> Memory Flash
+    # 1. Surfacing Policy -> (comparison observation) -> Memory Flash
+    #
+    # The deterministic base policy is computed ONCE for this request
+    # and reused by BOTH the lifecycle comparison observer and the
+    # Flash chain (which applies the optional lifecycle gate on top).
+    # Computing it here keeps all Surfacing rules owned by
+    # memory_surfacing_policy; this coordinator only composes.
     # --------------------------------------------------
 
     flash_output = None
 
-    if flash_enabled:
-        policy = None
+    policy = None
 
+    if flash_enabled or comparison_enabled:
         # Surfacing Policy: deterministic, rule-based, canonical
         # order, and fed the real request-local evidence.
         try:
@@ -639,6 +691,49 @@ def observe_memory_exposure_shadow(
                 type(exc).__name__,
             )
 
+    # --------------------------------------------------
+    # 1a. Lifecycle Comparison Shadow (observation only)
+    #
+    # It observes the BASE policy BEFORE the optional lifecycle gate
+    # changes supplementary eligibility, so it records what base
+    # policy allowed versus what the Cognitive lifecycle WOULD
+    # suppress -- without itself changing the policy. Fail-open: a
+    # comparison fault is missing comparison data and nothing else.
+    # --------------------------------------------------
+
+    if comparison_enabled:
+        try:
+            comparison_report = (
+                update_memory_lifecycle_comparison(
+                    conversation_id=conversation_id,
+                    cognitive_request_id=(
+                        cognitive_request_id
+                    ),
+                    snapshot=snapshot,
+                    expected_unified_revision=(
+                        expected_unified_revision
+                    ),
+                    base_policy=policy,
+                    live_lifecycle_gate_active=(
+                        _lifecycle_surfacing_gate_active(
+                            flash_enabled=flash_enabled,
+                            policy=policy,
+                        )
+                    ),
+                )
+            )
+
+            log_lifecycle_comparison_report(
+                comparison_report
+            )
+        except Exception as exc:
+            logger.warning(
+                "[gateway.context_memory_lifecycle_comparison] "
+                "observer_failed=%s fail_open=true",
+                type(exc).__name__,
+            )
+
+    if flash_enabled:
         if isinstance(policy, dict):
             # Lifecycle Surfacing integration (default OFF). It only
             # further constrains an already eligible set, keeps the
@@ -976,10 +1071,19 @@ async def observe_unified_preview_gate(
         )
     )
 
+    # Legacy vs Cognitive Lifecycle Comparison Shadow. Default OFF and
+    # observation-only. Like the other Memory observers it consumes
+    # THIS request's own snapshot, so when it is on it refreshes the
+    # Unified chain for this request. It works while Flash is OFF.
+    lifecycle_comparison_observer_enabled = (
+        lifecycle_comparison_enabled()
+    )
+
     memory_observer_enabled = (
         memory_flash_enabled
         or exposure_ledger_enabled
         or recall_surface_enabled
+        or lifecycle_comparison_observer_enabled
     )
 
     # Frontend Memory Arbitration Shadow (default OFF). Like the other

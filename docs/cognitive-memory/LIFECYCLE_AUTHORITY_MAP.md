@@ -13,6 +13,10 @@ disagree, **the code is correct and this document is wrong**.
   (merge of PR#2, `trae/request-local-cognitive-workspace-v0`)
 - Audit scope: **authority audit + guardrails only.** This task changes **no**
   live memory lifecycle behaviour.
+- Later addition (still on the same branch, base
+  `01b5948ab1b14c2a65ddebea31611f2e5321aa74`): the **Lifecycle Shadow
+  Comparison** (§4.5) was added as an `OBSERVATION_ONLY` experiment. It changes
+  **no** lifecycle authority; it only reads both planes for comparison.
 
 Every claim below was checked against the real modules. Where a claim could not
 be verified from code it is marked `UNVERIFIED` rather than assumed. Where a code
@@ -321,6 +325,47 @@ OMBRE_CONTEXT_STATE_DIR/
 ```
 
 All of it is `MODE = "shadow_only"`. Default OFF flags (§9).
+
+### 4.5 Legacy vs Cognitive Lifecycle Shadow Comparison — `OBSERVATION_ONLY`
+
+Owner: [memory_lifecycle_comparison_shadow.py](../../src/ombrebrain/context/memory_lifecycle_comparison_shadow.py),
+with a read-only aggregate reporter at
+[lifecycle_comparison_report.py](../../src/ombrebrain/maintenance/lifecycle_comparison_report.py).
+
+This experiment measures where the two planes' **current** semantics differ on
+the same real, request-local retrieval candidates. It is `OBSERVATION_ONLY` in
+the strictest sense of §1: it writes one privacy-safe, request-scoped artifact
+under `memory_lifecycle_comparison/{conversation_id}/{cognitive_request_id}.json`
+and feeds back into **nothing** live.
+
+It has **no** authority of any kind:
+
+- **no** canonical metadata write authority;
+- **no** cognitive usage-evidence authority;
+- **no** reinforcement authority;
+- **no** surfacing authority;
+- **no** archive authority;
+- **no** delete authority;
+- **no** restore authority;
+- **no** background scheduler authority.
+
+It **reads BOTH planes for comparison only**:
+
+- the Legacy plane, exclusively through the side-effect-free
+  `DecayEngine.preview_decay_cycle_decision(metadata)` read surface (the same
+  predicates and score math as the live cycle), never through any mutation /
+  lifecycle / scheduler API;
+- the Cognitive plane, exclusively through the real derived-state helpers and the
+  shared `memory_surfacing_lifecycle.evaluate_lifecycle_surfacing_candidate`
+  evaluator, never writing any `used` event / state snapshot / reinforcement
+  receipt.
+
+It never bridges the planes: `trace(reinforce=True) != UseMemory` and no
+`used` ↔ `touch` bridge is added. It does not decide which lifecycle policy wins
+(OA-2 remains unresolved).
+
+Default OFF flag: `OMBRE_GATEWAY_CONTEXT_LIFECYCLE_COMPARISON_SHADOW`
+(see [LIFECYCLE_SHADOW_COMPARISON.md](LIFECYCLE_SHADOW_COMPARISON.md)).
 
 ---
 

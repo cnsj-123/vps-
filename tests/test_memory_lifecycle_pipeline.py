@@ -636,6 +636,20 @@ class ShadowCompositionTests(unittest.TestCase):
         )
 
     def test_lifecycle_modules_are_unwired(self):
+        # The lifecycle EVENT / STATE / REINFORCEMENT plane must stay
+        # unwired from the recall / gateway path. The Lifecycle
+        # Comparison Shadow is a SEPARATE, observation-only module
+        # that is deliberately composed by the coordinator: it reads
+        # BOTH planes for comparison but has no mutation authority. So
+        # the check targets the lifecycle event / state / reinforcement
+        # modules by name instead of the broad "memory_lifecycle"
+        # prefix (which would also match the allowed comparison module).
+        forbidden_tokens = (
+            "memory_lifecycle_event",
+            "memory_lifecycle_state",
+            "memory_reinforcement",
+        )
+
         for relative in _UNWIRED_SOURCES:
             path = _REPO_ROOT / relative
 
@@ -648,13 +662,8 @@ class ShadowCompositionTests(unittest.TestCase):
                     encoding="utf-8"
                 )
 
-                self.assertNotIn(
-                    "memory_lifecycle", source
-                )
-
-                self.assertNotIn(
-                    "memory_reinforcement", source
-                )
+                for token in forbidden_tokens:
+                    self.assertNotIn(token, source)
 
     def test_lifecycle_code_has_no_legacy_mutation(
         self,
