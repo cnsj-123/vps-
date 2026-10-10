@@ -840,6 +840,7 @@ class CognitiveRequestIdTests(
             conversation_id,
             *,
             cognitive_request_id=None,
+            forward_body=None,
         ):
             captured.append(
                 cognitive_request_id

@@ -152,10 +152,20 @@ def observe_context_sources(body: bytes) -> str | None:
         )
     )
 
+    # Frontend Memory Arbitration Shadow. It consumes THIS request's
+    # Unified memory shadow snapshot, so enabling it must drive the
+    # same upstream chain instead of silently doing nothing.
+    memory_arbitration_enabled = _truthy(
+        os.environ.get(
+            "OMBRE_GATEWAY_CONTEXT_MEMORY_SOURCE_ARBITRATION_SHADOW"
+        )
+    )
+
     memory_downstream_enabled = (
         confidence_gate_enabled
         or memory_flash_enabled
         or exposure_ledger_enabled
+        or memory_arbitration_enabled
     )
 
     if not (

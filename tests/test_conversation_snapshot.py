@@ -242,6 +242,59 @@ class ConversationSnapshotTests(
             stored_text,
         )
 
+    def test_frontend_memory_is_excluded(
+        self,
+    ):
+        secret = (
+            "FRONTEND_MEMORY_SECRET"
+        )
+
+        text = (
+            "real user question\n"
+            '<attachment '
+            'id="front_1" '
+            'filename="relevant_memories.txt" '
+            'type="text/plain" '
+            'size="22">'
+            + secret
+            + "</attachment>"
+        )
+
+        update_conversation_snapshot(
+            payload([
+                text_message(
+                    "user",
+                    text,
+                ),
+            ]),
+            conversation_id=CID,
+            boundary_prefix_sha256=(
+                "abc"
+            ),
+        )
+
+        stored_text = (
+            self.snapshot_file()
+            .read_text(
+                encoding="utf-8"
+            )
+        )
+
+        self.assertIn(
+            "real user question",
+            stored_text,
+        )
+
+        self.assertNotIn(
+            secret,
+            stored_text,
+        )
+
+        self.assertNotIn(
+            "relevant_memories.txt",
+            stored_text,
+        )
+
     def test_duplicate_boundary_does_not_increment_revision(
         self,
     ):
