@@ -834,6 +834,24 @@ def build_lifecycle_comparison_artifact(
             )
         )
 
+        if binding_ok:
+            binding_row = {
+                "unified_admitted":
+                    admitted_index is not None,
+                "base_surfacing_eligible":
+                    base_eligible,
+                "base_eligible_rank":
+                    base_rank,
+            }
+        else:
+            # No truthful binding exists: never guess, never claim a
+            # candidate was "not admitted". Record it as unknown.
+            binding_row = {
+                "unified_admitted": None,
+                "base_surfacing_eligible": None,
+                "base_eligible_rank": None,
+            }
+
         rows.append(
             {
                 "memory_key": memory_key(
@@ -845,15 +863,7 @@ def build_lifecycle_comparison_artifact(
                     observation.get(
                         "retrieval_index"
                     ),
-                "binding": {
-                    "unified_admitted":
-                        admitted_index
-                        is not None,
-                    "base_surfacing_eligible":
-                        base_eligible,
-                    "base_eligible_rank":
-                        base_rank,
-                },
+                "binding": binding_row,
                 "legacy": legacy_row,
                 "cognitive": cognitive_row,
                 "comparison": {

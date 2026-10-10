@@ -1,0 +1,2131 @@
+from __future__ import annotations
+
+import ast
+import contextlib
+import io
+import json
+import math
+import os
+import tempfile
+import unittest
+from datetime import datetime, timezone
+from pathlib import Path
+from unittest.mock import AsyncMock, Mock, patch
+
+from _lifecycle_fixtures import (
+    CID,
+    RID,
+    T0,
+    hours,
+    iso,
+    lifecycle_env,
+    tree,
+    usage_artifact,
+    write_usage,
+)
+from _recall_fixtures import RID_B, memory
+
+from ombrebrain.context import (
+    context_pipeline_coordinator as coordinator,
+)
+from ombrebrain.context.memory_lifecycle_comparison_shadow import (
+    COMPARISON_SHADOW_ENV,
+    MAX_COMPARISON_ROWS,
+    MODE,
+    VERSION,
+    bind_legacy_lifecycle_comparison_engine,
+    build_lifecycle_comparison_artifact,
+    capture_legacy_lifecycle_observations,
+    legacy_comparison_engine_bound,
+    lifecycle_comparison_enabled,
+    log_lifecycle_comparison_report,
+    update_memory_lifecycle_comparison,
+)
+from ombrebrain.context.memory_lifecycle_event import (
+    memory_key,
+    record_lifecycle_event_from_usage,
+)
+from ombrebrain.context.memory_lifecycle_state import (
+    resolve_lifecycle_config,
+)
+from ombrebrain.context.memory_surfacing_lifecycle import (
+    INTEGRATION_ENV,
+    apply_lifecycle_surfacing_gate,
+    evaluate_lifecycle_surfacing_candidate,
+    resolve_surfacing_lifecycle_config,
+)
+from ombrebrain.context.retrieval_decision_shadow import (
+    candidate_fingerprint,
+)
+from ombrebrain.context.unified_context_candidate import (
+    build_memory_shadow_snapshot,
+)
+from ombrebrain.maintenance import (
+    lifecycle_comparison_report as reporter,
+)
+from decay_engine import DecayEngine
+
+
+# Guardrail / integration / concurrency / privacy tests for the Legacy
+# vs Cognitive Lifecycle Shadow Comparison v0.
+#
+# The comparison is OBSERVATION ONLY: it must never mutate any memory
+# state, never change live behaviour, default OFF, and only ever
+# produce a privacy-safe request-scoped artifact. These tests freeze
+# those boundaries behaviourally AND as source contracts, and exercise
+# real composition (raw candidates -> snapshot -> base policy ->
+# observer -> persisted artifact) rather than only pure builders.
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+
+_COMPARISON_MODULE = (
+    "src/ombrebrain/context/"
+    "memory_lifecycle_comparison_shadow.py"
+)
+
+_REPORTER_MODULE = (
+    "src/ombrebrain/maintenance/"
+    "lifecycle_comparison_report.py"
+)
+
+# Spec §41: the comparison path may call the side-effect-free Legacy
+# preview API and NOTHING else on the engine / canonical store.
+_FORBIDDEN_LEGACY_CALLS = {
+    "touch",
+    "touch_many",
+    "update",
+    "archive",
+    "delete",
+    "restore_archived",
+    "hard_delete_test_bucket",
+    "run_decay_cycle",
+    "start",
+    "ensure_started",
+    "stop",
+}
+
+# Spec §42: the comparison must never write cognitive lifecycle
+# evidence.
+_FORBIDDEN_COGNITIVE_CALLS = {
+    "record_usage",
+    "record_lifecycle_event_from_usage",
+    "observe_memory_usage_lifecycle",
+    "process_completed_usage_for_lifecycle",
+    "persist_lifecycle_state",
+    "derive_memory_lifecycle_state",
+}
+
+_A = "mem-alpha"
+_B = "mem-beta"
+_C = "mem-gamma"
+_D = "mem-delta"
+
+_COUNTER = {"n": 0}
+
+
+def _next_recall_id() -> str:
+    _COUNTER["n"] += 1
+    return "recall_" + format(_COUNTER["n"], "032x")
+
+
+def record_use(root, memory_id, *, used_at) -> None:
+    """Persist one real ``used`` lifecycle event through the real path."""
+
+    recall_id = _next_recall_id()
+
+    write_usage(
+        root,
+        usage_artifact(
+            recall_id=recall_id,
+            loaded_memory_ids=(memory_id,),
+            used_memory_ids=(memory_id,),
+            at=iso(used_at),
+        ),
+    )
+
+    with lifecycle_env(root, enabled=True):
+        result = record_lifecycle_event_from_usage(
+            CID, RID, recall_id, 2
+        )
+
+    if not result.get("stored"):
+        raise AssertionError(result)
+
+
+@contextlib.contextmanager
+def state_env(root):
+    with patch.dict(
+        os.environ,
+        {"OMBRE_CONTEXT_STATE_DIR": str(root)},
+        clear=False,
+    ):
+        yield
+
+
+@contextlib.contextmanager
+def comparison_env(root, *, enabled=True):
+    with patch.dict(
+        os.environ,
+        {
+            "OMBRE_CONTEXT_STATE_DIR": str(root),
+            COMPARISON_SHADOW_ENV: (
+                "1" if enabled else "0"
+            ),
+        },
+        clear=False,
+    ):
+        yield
+
+
+def candidate(memory_id, content=None, *, metadata=None):
+    return {
+        "id": memory_id,
+        "content": (
+            content
+            if content is not None
+            else ("cue for " + memory_id)
+        ),
+        "context_relevance": 0.9,
+        "metadata": (
+            metadata
+            if metadata is not None
+            else {"last_active": "2020-01-01T00:00:00Z"}
+        ),
+    }
+
+
+def eligible_policy(eligible, *, decision="allow_shadow"):
+    return {
+        "version": "memory-surfacing-policy.v1",
+        "mode": "shadow_only",
+        "conversation_id": CID,
+        "decision": decision,
+        "reason": "surfacing_eligible",
+        "eligible": list(eligible),
+        "ineligible": [],
+    }
+
+
+def _preview(
+    *,
+    applicable=True,
+    skip_reason=None,
+    nominal_archive=False,
+    score_current=1.5,
+    score_after=None,
+    auto_resolve=False,
+    current_resolved=False,
+):
+    return {
+        "applicable": applicable,
+        "skip_reason": skip_reason,
+        "current_resolved": current_resolved,
+        "auto_resolve_candidate": auto_resolve,
+        "score_current": score_current,
+        "score_if_auto_resolve_succeeds": score_after,
+        "threshold": 0.3,
+        "archive_candidate_current": nominal_archive,
+        "archive_candidate_after_auto_resolve_if_successful":
+            nominal_archive,
+        "nominal_archive_candidate": nominal_archive,
+    }
+
+
+class SpyDecayEngine:
+    """Read-only Legacy engine stand-in.
+
+    Implements ONLY the side-effect-free preview surface. Any access to
+    a legacy mutation / lifecycle API raises, so a regression that
+    starts bridging the planes fails here instead of silently
+    mutating state.
+    """
+
+    def __init__(self, previews=None):
+        self.calls: list = []
+        self._previews = list(previews or [])
+        self._index = 0
+
+    def preview_decay_cycle_decision(self, metadata):
+        self.calls.append(
+            dict(metadata)
+            if isinstance(metadata, dict)
+            else metadata
+        )
+
+        if self._previews:
+            index = min(
+                self._index,
+                len(self._previews) - 1,
+            )
+
+            self._index += 1
+
+            return dict(self._previews[index])
+
+        return _preview()
+
+    def __getattr__(self, name):
+        if name in (
+            _FORBIDDEN_LEGACY_CALLS
+            | _FORBIDDEN_COGNITIVE_CALLS
+        ):
+            raise AssertionError(
+                "comparison touched engine." + name
+            )
+
+        raise AttributeError(name)
+
+
+class SpyBucketManager:
+    """Records every mutation call. The comparison must make none."""
+
+    def __init__(self):
+        self.updates = []
+        self.archives = []
+        self.deletes = []
+        self.touches = []
+        self.list_all_calls = 0
+
+    async def list_all(self, *, include_archive=False):
+        self.list_all_calls += 1
+        return []
+
+    async def update(self, memory_id, **kwargs):
+        self.updates.append((memory_id, kwargs))
+        return True
+
+    async def archive(self, memory_id):
+        self.archives.append(memory_id)
+        return True
+
+    async def delete(self, memory_id):
+        self.deletes.append(memory_id)
+        return True
+
+    async def touch(self, memory_id, **kwargs):
+        self.touches.append((memory_id, kwargs))
+        return True
+
+
+class _EngineBoundTestCase(unittest.TestCase):
+    def tearDown(self):
+        bind_legacy_lifecycle_comparison_engine(None)
+
+
+def _ast(relative):
+    return ast.parse(
+        (_REPO_ROOT / relative).read_text(
+            encoding="utf-8"
+        )
+    )
+
+
+def _call_attr_names(tree_ast):
+    names = set()
+
+    for node in ast.walk(tree_ast):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+        ):
+            names.add(node.func.attr)
+
+    return names
+
+
+# ------------------------------------------------------------------
+# 1. Flag + binding
+# ------------------------------------------------------------------
+
+
+class FlagAndBindingTests(_EngineBoundTestCase):
+
+    def test_default_off(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(COMPARISON_SHADOW_ENV, None)
+
+            self.assertFalse(
+                lifecycle_comparison_enabled()
+            )
+
+    def test_truthy_on(self):
+        for value in ("1", "true", "yes", "on", "ON"):
+            with self.subTest(value=value):
+                with patch.dict(
+                    os.environ,
+                    {COMPARISON_SHADOW_ENV: value},
+                    clear=False,
+                ):
+                    self.assertTrue(
+                        lifecycle_comparison_enabled()
+                    )
+
+    def test_binding_is_reference_only(self):
+        engine = SpyDecayEngine()
+
+        self.assertFalse(
+            legacy_comparison_engine_bound()
+        )
+
+        bind_legacy_lifecycle_comparison_engine(engine)
+
+        self.assertTrue(
+            legacy_comparison_engine_bound()
+        )
+
+        # Storing the reference must not invoke anything on it.
+        self.assertEqual(engine.calls, [])
+
+    def test_binding_none_disables_legacy(self):
+        bind_legacy_lifecycle_comparison_engine(None)
+
+        observations = (
+            capture_legacy_lifecycle_observations(
+                [candidate(_A)]
+            )
+        )
+
+        self.assertEqual(len(observations), 1)
+        self.assertFalse(
+            observations[0]["legacy_available"]
+        )
+        self.assertIsNone(observations[0]["legacy"])
+
+    def test_snapshot_stays_compatible_without_observations(
+        self,
+    ):
+        memories = [memory(_A)]
+
+        snapshot = build_memory_shadow_snapshot(
+            conversation_id=CID,
+            unified={
+                "version":
+                    "unified-context-candidate.v1",
+                "conversation_id": CID,
+                "revision": 5,
+                "sections": {"memories": memories},
+            },
+            retrieval_memories=memories,
+        )
+
+        self.assertNotIn(
+            "legacy_lifecycle_observations", snapshot
+        )
+
+
+# ------------------------------------------------------------------
+# 2. Request-local Legacy capture
+# ------------------------------------------------------------------
+
+
+class CaptureTests(_EngineBoundTestCase):
+
+    def test_capture_uses_only_preview_and_preserves_order(
+        self,
+    ):
+        engine = SpyDecayEngine(
+            [
+                _preview(score_current=2.0),
+                _preview(nominal_archive=True),
+            ]
+        )
+
+        bind_legacy_lifecycle_comparison_engine(engine)
+
+        first = candidate(
+            _A, metadata={"importance": 5}
+        )
+        second = candidate(
+            _B, metadata={"importance": 3}
+        )
+
+        before_first = dict(first["metadata"])
+        before_second = dict(second["metadata"])
+
+        observations = (
+            capture_legacy_lifecycle_observations(
+                [first, second]
+            )
+        )
+
+        self.assertEqual(
+            [o["retrieval_index"] for o in observations],
+            [0, 1],
+        )
+        self.assertTrue(
+            all(
+                o["legacy_available"]
+                for o in observations
+            )
+        )
+        self.assertEqual(
+            observations[0]["candidate_fingerprint"],
+            candidate_fingerprint(first),
+        )
+        self.assertEqual(
+            observations[1]["legacy"][
+                "nominal_archive_candidate"
+            ],
+            True,
+        )
+
+        # Exactly one preview call per candidate, no input mutation.
+        self.assertEqual(len(engine.calls), 2)
+        self.assertEqual(first["metadata"], before_first)
+        self.assertEqual(second["metadata"], before_second)
+
+    def test_capture_never_mutates_bucket_state(self):
+        manager = SpyBucketManager()
+
+        engine = DecayEngine(
+            {"decay": {"threshold": 0.3}}, manager
+        )
+
+        bind_legacy_lifecycle_comparison_engine(engine)
+
+        capture_legacy_lifecycle_observations(
+            [
+                candidate(
+                    _A,
+                    metadata={
+                        "importance": 3,
+                        "activation_count": 1,
+                        "last_active":
+                            "2020-01-01T00:00:00Z",
+                    },
+                )
+            ]
+        )
+
+        self.assertEqual(manager.updates, [])
+        self.assertEqual(manager.archives, [])
+        self.assertEqual(manager.deletes, [])
+        self.assertEqual(manager.touches, [])
+        self.assertEqual(manager.list_all_calls, 0)
+
+    def test_preview_exception_is_fail_open(self):
+        class Exploding(SpyDecayEngine):
+            def preview_decay_cycle_decision(self, meta):
+                raise RuntimeError("boom")
+
+        bind_legacy_lifecycle_comparison_engine(
+            Exploding()
+        )
+
+        observations = (
+            capture_legacy_lifecycle_observations(
+                [candidate(_A)]
+            )
+        )
+
+        self.assertEqual(len(observations), 1)
+        self.assertFalse(
+            observations[0]["legacy_available"]
+        )
+
+
+# ------------------------------------------------------------------
+# 3. Pure builder — categories / metrics / neutrality
+# ------------------------------------------------------------------
+
+
+class BuilderTests(_EngineBoundTestCase):
+
+    def _build(
+        self,
+        *,
+        candidates,
+        eligible,
+        observations,
+        retrieval_candidate_count=None,
+    ):
+        return build_lifecycle_comparison_artifact(
+            conversation_id=CID,
+            cognitive_request_id=RID,
+            source_unified_revision=5,
+            unified={
+                "version":
+                    "unified-context-candidate.v1",
+                "conversation_id": CID,
+                "revision": 5,
+                "sections": {"memories": candidates},
+            },
+            base_policy=eligible_policy(eligible),
+            legacy_observations=observations,
+            retrieval_candidate_count=(
+                retrieval_candidate_count
+                if retrieval_candidate_count
+                is not None
+                else len(observations)
+            ),
+            as_of=T0,
+        )
+
+    def test_cold_start_is_neutral_not_suppressed(self):
+        with tempfile.TemporaryDirectory() as root:
+            engine = SpyDecayEngine(
+                [
+                    _preview(),
+                    _preview(nominal_archive=True),
+                ]
+            )
+
+            bind_legacy_lifecycle_comparison_engine(engine)
+
+            candidates = [candidate(_A), candidate(_B)]
+
+            observations = (
+                capture_legacy_lifecycle_observations(
+                    candidates
+                )
+            )
+
+            with state_env(root):
+                artifact = self._build(
+                    candidates=candidates,
+                    eligible=candidates,
+                    observations=observations,
+                )
+
+        rows = artifact["candidates"]
+
+        self.assertEqual(
+            [r["comparison"]["category"] for r in rows],
+            [
+                "legacy_keep_cognitive_unobserved",
+                "legacy_archive_cognitive_unobserved",
+            ],
+        )
+
+        for row in rows:
+            self.assertIs(
+                row["cognitive"]["observed"], False
+            )
+            self.assertIs(
+                row["cognitive"][
+                    "would_suppress_if_supplementary"
+                ],
+                False,
+            )
+
+        # Primary (rank 0) preserved; the supplementary unobserved
+        # candidate is neutral, never suppressed.
+        self.assertEqual(
+            rows[0]["cognitive"][
+                "effective_gate_decision"
+            ],
+            "primary_preserved",
+        )
+        self.assertEqual(
+            rows[1]["cognitive"][
+                "effective_gate_decision"
+            ],
+            "neutral_unobserved",
+        )
+
+        metrics = artifact["metrics"]
+
+        self.assertEqual(
+            metrics[
+                "cognitive_neutral_unobserved_count"
+            ],
+            2,
+        )
+        self.assertEqual(
+            metrics["cognitive_effective_suppress_count"],
+            0,
+        )
+        self.assertEqual(
+            metrics["cognitive_primary_preserved_count"],
+            1,
+        )
+
+    def test_dormant_history_yields_suppress_category(self):
+        with tempfile.TemporaryDirectory() as root:
+            record_use(
+                root, _B, used_at=T0 - hours(500)
+            )
+
+            engine = SpyDecayEngine(
+                [_preview(), _preview()]
+            )
+
+            bind_legacy_lifecycle_comparison_engine(engine)
+
+            candidates = [candidate(_A), candidate(_B)]
+
+            observations = (
+                capture_legacy_lifecycle_observations(
+                    candidates
+                )
+            )
+
+            with state_env(root):
+                artifact = self._build(
+                    candidates=candidates,
+                    eligible=candidates,
+                    observations=observations,
+                )
+
+        rows = artifact["candidates"]
+
+        self.assertEqual(
+            rows[0]["comparison"]["category"],
+            "legacy_keep_cognitive_unobserved",
+        )
+        self.assertEqual(
+            rows[1]["comparison"]["category"],
+            "legacy_keep_cognitive_suppress",
+        )
+        self.assertIs(
+            rows[1]["cognitive"][
+                "would_suppress_if_supplementary"
+            ],
+            True,
+        )
+        self.assertEqual(
+            rows[1]["cognitive"][
+                "effective_gate_decision"
+            ],
+            "would_suppress",
+        )
+
+    def test_primary_preservation_is_separate_from_suppression(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as root:
+            record_use(
+                root, _A, used_at=T0 - hours(500)
+            )
+
+            engine = SpyDecayEngine([_preview()])
+
+            bind_legacy_lifecycle_comparison_engine(engine)
+
+            candidates = [candidate(_A)]
+
+            observations = (
+                capture_legacy_lifecycle_observations(
+                    candidates
+                )
+            )
+
+            with state_env(root):
+                artifact = self._build(
+                    candidates=candidates,
+                    eligible=candidates,
+                    observations=observations,
+                )
+
+        row = artifact["candidates"][0]
+
+        # The cognitive counterfactual WOULD suppress it ...
+        self.assertIs(
+            row["cognitive"][
+                "would_suppress_if_supplementary"
+            ],
+            True,
+        )
+        # ... but the effective gate preserves the primary.
+        self.assertEqual(
+            row["cognitive"][
+                "effective_gate_decision"
+            ],
+            "primary_preserved",
+        )
+
+    def test_binding_unavailable_category(self):
+        engine = SpyDecayEngine([_preview()])
+        bind_legacy_lifecycle_comparison_engine(engine)
+
+        candidates = [candidate(_A)]
+        observations = (
+            capture_legacy_lifecycle_observations(
+                candidates
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as root:
+            with state_env(root):
+                artifact = build_lifecycle_comparison_artifact(
+                    conversation_id=CID,
+                    cognitive_request_id=RID,
+                    source_unified_revision=5,
+                    unified=None,
+                    base_policy=eligible_policy([]),
+                    legacy_observations=observations,
+                    retrieval_candidate_count=1,
+                    as_of=T0,
+                )
+
+        row = artifact["candidates"][0]
+
+        self.assertEqual(
+            row["comparison"]["category"],
+            "binding_unavailable",
+        )
+        self.assertIsNone(row["binding"]["unified_admitted"])
+
+    def test_legacy_not_applicable_category(self):
+        engine = SpyDecayEngine(
+            [
+                _preview(
+                    applicable=False,
+                    skip_reason="type_plan",
+                    score_current=None,
+                )
+            ]
+        )
+
+        bind_legacy_lifecycle_comparison_engine(engine)
+
+        candidates = [candidate(_A)]
+        observations = (
+            capture_legacy_lifecycle_observations(
+                candidates
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as root:
+            with state_env(root):
+                artifact = self._build(
+                    candidates=candidates,
+                    eligible=candidates,
+                    observations=observations,
+                )
+
+        self.assertEqual(
+            artifact["candidates"][0]["comparison"][
+                "category"
+            ],
+            "legacy_not_applicable",
+        )
+
+    def test_observation_cap_truncates_deterministically(self):
+        total = MAX_COMPARISON_ROWS + 6
+
+        engine = SpyDecayEngine([_preview()])
+
+        bind_legacy_lifecycle_comparison_engine(engine)
+
+        candidates = [
+            candidate("mem-%03d" % index)
+            for index in range(total)
+        ]
+
+        observations = (
+            capture_legacy_lifecycle_observations(
+                candidates
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as root:
+            with state_env(root):
+                artifact = self._build(
+                    candidates=candidates,
+                    eligible=candidates,
+                    observations=observations,
+                    retrieval_candidate_count=total,
+                )
+
+        self.assertEqual(
+            len(artifact["candidates"]),
+            MAX_COMPARISON_ROWS,
+        )
+        self.assertEqual(
+            artifact["observation_truncated_count"],
+            6,
+        )
+        self.assertTrue(
+            artifact["observation_truncated"]
+        )
+        self.assertEqual(
+            artifact["metrics"][
+                "retrieval_candidate_count"
+            ],
+            total,
+        )
+        self.assertEqual(
+            artifact["metrics"][
+                "observed_candidate_count"
+            ],
+            MAX_COMPARISON_ROWS,
+        )
+
+    def test_numeric_safety(self):
+        engine = SpyDecayEngine(
+            [
+                {
+                    "applicable": True,
+                    "skip_reason": None,
+                    "current_resolved": False,
+                    "auto_resolve_candidate": False,
+                    "score_current": float("nan"),
+                    "score_if_auto_resolve_succeeds":
+                        float("inf"),
+                    "threshold": 0.3,
+                    "archive_candidate_current": False,
+                    "archive_candidate_after_auto_resolve_if_successful":
+                        False,
+                    "nominal_archive_candidate": False,
+                }
+            ]
+        )
+
+        bind_legacy_lifecycle_comparison_engine(engine)
+
+        candidates = [candidate(_A)]
+        observations = (
+            capture_legacy_lifecycle_observations(
+                candidates
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as root:
+            with state_env(root):
+                artifact = self._build(
+                    candidates=candidates,
+                    eligible=candidates,
+                    observations=observations,
+                )
+
+        legacy = artifact["candidates"][0]["legacy"]
+
+        self.assertIsNone(legacy["score_current"])
+        self.assertIsNone(
+            legacy["score_if_auto_resolve_succeeds"]
+        )
+
+        # No NaN / Infinity may be serializable.
+        json.dumps(artifact, allow_nan=False)
+
+
+# ------------------------------------------------------------------
+# 4. Persistence: fail-open + artifact privacy
+# ------------------------------------------------------------------
+
+
+class PersistenceTests(_EngineBoundTestCase):
+
+    def _snapshot(self, candidates, observations):
+        return build_memory_shadow_snapshot(
+            conversation_id=CID,
+            unified={
+                "version":
+                    "unified-context-candidate.v1",
+                "conversation_id": CID,
+                "revision": 5,
+                "sections": {"memories": candidates},
+            },
+            retrieval_memories=candidates,
+            legacy_lifecycle_observations=observations,
+        )
+
+    def test_persist_failure_is_fail_open_and_privacy_safe(
+        self,
+    ):
+        engine = SpyDecayEngine([_preview()])
+        bind_legacy_lifecycle_comparison_engine(engine)
+
+        candidates = [candidate(_A)]
+        observations = (
+            capture_legacy_lifecycle_observations(
+                candidates
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as root:
+            with state_env(root):
+                with patch(
+                    "ombrebrain.context."
+                    "memory_lifecycle_comparison_shadow."
+                    "atomic_write",
+                    side_effect=OSError("disk full"),
+                ):
+                    with self.assertLogs(
+                        "ombre_brain.gateway",
+                        level="WARNING",
+                    ) as captured:
+                        report = (
+                            update_memory_lifecycle_comparison(
+                                conversation_id=CID,
+                                cognitive_request_id=RID,
+                                snapshot=self._snapshot(
+                                    candidates,
+                                    observations,
+                                ),
+                                expected_unified_revision=5,
+                                base_policy=eligible_policy(
+                                    candidates
+                                ),
+                            )
+                        )
+
+            logged = "\n".join(
+                record.getMessage()
+                for record in captured.records
+            )
+
+        self.assertFalse(report["stored"])
+        self.assertEqual(
+            report["reason"], "persist_failed"
+        )
+        self.assertIn("fail_open=true", logged)
+        self.assertIn("store_failed=", logged)
+
+        for secret in (CID, RID):
+            self.assertNotIn(secret, logged)
+
+        # No artifact was written.
+        comparison_dir = (
+            Path(root)
+            / "memory_lifecycle_comparison"
+        )
+
+        self.assertFalse(comparison_dir.exists())
+
+    def test_valid_ids_required(self):
+        engine = SpyDecayEngine([_preview()])
+        bind_legacy_lifecycle_comparison_engine(engine)
+
+        candidates = [candidate(_A)]
+        snapshot = self._snapshot(
+            candidates, []
+        )
+
+        for conversation_id, rid, reason in (
+            ("bad", RID, "invalid_conversation_id"),
+            (
+                CID,
+                "bad",
+                "invalid_cognitive_request_id",
+            ),
+        ):
+            with self.subTest(reason=reason):
+                with tempfile.TemporaryDirectory() as root:
+                    with state_env(root):
+                        report = (
+                            update_memory_lifecycle_comparison(
+                                conversation_id=(
+                                    conversation_id
+                                ),
+                                cognitive_request_id=rid,
+                                snapshot=snapshot,
+                                expected_unified_revision=5,
+                                base_policy=eligible_policy(
+                                    candidates
+                                ),
+                            )
+                        )
+
+                self.assertFalse(report["stored"])
+                self.assertEqual(report["reason"], reason)
+
+    def test_artifact_privacy_and_hashed_identity(self):
+        raw_id = "SECRET_RAW_ID_ALPHA_0001"
+        content = "SECRET_MEMORY_CONTENT_ALPHA"
+        name = "SECRET_MEMORY_NAME_ALPHA"
+
+        mem = memory(raw_id, content, name=name)
+
+        engine = SpyDecayEngine([_preview()])
+        bind_legacy_lifecycle_comparison_engine(engine)
+
+        observations = (
+            capture_legacy_lifecycle_observations([mem])
+        )
+
+        with tempfile.TemporaryDirectory() as root:
+            with state_env(root):
+                artifact = build_lifecycle_comparison_artifact(
+                    conversation_id=CID,
+                    cognitive_request_id=RID,
+                    source_unified_revision=5,
+                    unified={
+                        "version":
+                            "unified-context-candidate.v1",
+                        "conversation_id": CID,
+                        "revision": 5,
+                        "sections": {"memories": [mem]},
+                    },
+                    base_policy=eligible_policy([mem]),
+                    legacy_observations=observations,
+                    retrieval_candidate_count=1,
+                    as_of=T0,
+                )
+
+        rendered = json.dumps(artifact)
+
+        # Memory-derived secrets must never be persisted.
+        for secret in (
+            raw_id,
+            content,
+            name,
+        ):
+            with self.subTest(secret=secret):
+                self.assertNotIn(secret, rendered)
+
+        # Request binding ids are allowed (spec §18/§19): the
+        # artifact is explicitly bound to this request.
+        self.assertEqual(artifact["conversation_id"], CID)
+        self.assertEqual(
+            artifact["cognitive_request_id"], RID
+        )
+
+        row = artifact["candidates"][0]
+
+        # Only the cryptographic identity is persisted for memory.
+        self.assertEqual(
+            row["memory_key"], memory_key(raw_id)
+        )
+        self.assertEqual(
+            row["candidate_fingerprint"],
+            candidate_fingerprint(mem),
+        )
+
+    def test_log_report_is_privacy_safe(self):
+        report = {
+            "stored": True,
+            "mode": MODE,
+            "decision": "observed",
+            "reason": "lifecycle_comparison_observed",
+            "source_unified_revision": 5,
+            "metrics": {"observed_candidate_count": 2},
+        }
+
+        with self.assertLogs(
+            "ombre_brain.gateway", level="INFO"
+        ) as captured:
+            log_lifecycle_comparison_report(report)
+
+        logged = "\n".join(
+            record.getMessage()
+            for record in captured.records
+        )
+
+        self.assertIn(
+            "[gateway.context_memory_lifecycle_comparison]",
+            logged,
+        )
+
+        for secret in (
+            CID,
+            RID,
+            memory_key(_A),
+            candidate_fingerprint(candidate(_A)),
+        ):
+            with self.subTest(secret=secret):
+                self.assertNotIn(secret, logged)
+
+
+# ------------------------------------------------------------------
+# 5. Same-conversation isolation + no global re-read
+# ------------------------------------------------------------------
+
+
+class IsolationTests(_EngineBoundTestCase):
+
+    def _persist(self, root, rid, revision, candidates):
+        observations = (
+            capture_legacy_lifecycle_observations(
+                candidates
+            )
+        )
+
+        snapshot = build_memory_shadow_snapshot(
+            conversation_id=CID,
+            unified={
+                "version":
+                    "unified-context-candidate.v1",
+                "conversation_id": CID,
+                "revision": revision,
+                "sections": {"memories": candidates},
+            },
+            retrieval_memories=candidates,
+            legacy_lifecycle_observations=observations,
+        )
+
+        report = update_memory_lifecycle_comparison(
+            conversation_id=CID,
+            cognitive_request_id=rid,
+            snapshot=snapshot,
+            expected_unified_revision=revision,
+            base_policy=eligible_policy(candidates),
+        )
+
+        self.assertTrue(report["stored"])
+
+        path = (
+            Path(root)
+            / "memory_lifecycle_comparison"
+            / CID
+            / (rid + ".json")
+        )
+
+        return json.loads(
+            path.read_text(encoding="utf-8")
+        )
+
+    def test_same_conversation_requests_are_isolated(self):
+        with tempfile.TemporaryDirectory() as root:
+            engine = SpyDecayEngine([_preview()])
+            bind_legacy_lifecycle_comparison_engine(engine)
+
+            a_candidates = [
+                candidate(
+                    _A,
+                    "A only content",
+                    metadata={
+                        "last_active":
+                            "2020-01-01T00:00:00Z"
+                    },
+                )
+            ]
+            b_candidates = [
+                candidate(
+                    _B,
+                    "B only content",
+                    metadata={
+                        "last_active":
+                            "2020-02-02T00:00:00Z"
+                    },
+                )
+            ]
+
+            with state_env(root):
+                artifact_a = self._persist(
+                    root, RID, 5, a_candidates
+                )
+
+                # Simulate request B overwriting the shared
+                # conversation-global "latest" Unified file.
+                global_path = (
+                    Path(root)
+                    / "unified_context_candidate"
+                    / (CID + ".json")
+                )
+                global_path.parent.mkdir(
+                    parents=True, exist_ok=True
+                )
+                global_path.write_text(
+                    json.dumps(
+                        {
+                            "version":
+                                "unified-context-candidate.v1",
+                            "conversation_id": CID,
+                            "revision": 6,
+                            "sections": {
+                                "memories": b_candidates
+                            },
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+                artifact_b = self._persist(
+                    root, RID_B, 6, b_candidates
+                )
+
+        fp_a = candidate_fingerprint(a_candidates[0])
+        fp_b = candidate_fingerprint(b_candidates[0])
+
+        a_fingerprints = [
+            row["candidate_fingerprint"]
+            for row in artifact_a["candidates"]
+        ]
+        b_fingerprints = [
+            row["candidate_fingerprint"]
+            for row in artifact_b["candidates"]
+        ]
+
+        self.assertEqual(a_fingerprints, [fp_a])
+        self.assertEqual(b_fingerprints, [fp_b])
+        self.assertNotIn(fp_b, a_fingerprints)
+        self.assertNotIn(fp_a, b_fingerprints)
+
+        self.assertEqual(
+            artifact_a["source_unified_revision"], 5
+        )
+        self.assertEqual(
+            artifact_b["source_unified_revision"], 6
+        )
+
+        # A's memory_key is the hashed A identity only.
+        self.assertEqual(
+            artifact_a["candidates"][0]["memory_key"],
+            memory_key(_A),
+        )
+        self.assertEqual(
+            artifact_b["candidates"][0]["memory_key"],
+            memory_key(_B),
+        )
+
+
+# ------------------------------------------------------------------
+# 6. Cognitive gate equivalence after refactor
+# ------------------------------------------------------------------
+
+
+class EquivalenceTests(unittest.TestCase):
+
+    def test_public_evaluator_matches_live_gate(self):
+        with tempfile.TemporaryDirectory() as root:
+            record_use(root, _B, used_at=T0 - hours(500))
+            record_use(root, _C, used_at=T0)
+
+            eligible = [
+                candidate(_A),
+                candidate(_B),
+                candidate(_C),
+                candidate(_D),
+            ]
+
+            with patch.dict(
+                os.environ,
+                {
+                    "OMBRE_CONTEXT_STATE_DIR": str(root),
+                    INTEGRATION_ENV: "1",
+                    "OMBRE_GATEWAY_MEMORY_LIFECYCLE_SHADOW":
+                        "1",
+                },
+                clear=False,
+            ):
+                output = apply_lifecycle_surfacing_gate(
+                    eligible_policy(eligible),
+                    as_of=T0,
+                )
+
+                config = resolve_lifecycle_config()
+                thresholds = (
+                    resolve_surfacing_lifecycle_config()
+                )
+
+                retained_ids = [
+                    item["id"]
+                    for item in output["eligible"]
+                ]
+
+                for cand in eligible[1:]:
+                    evaluation = (
+                        evaluate_lifecycle_surfacing_candidate(
+                            candidate=cand,
+                            as_of=T0,
+                            config=config,
+                            thresholds=thresholds,
+                        )
+                    )
+
+                    expected_retained = (
+                        not evaluation["observed"]
+                        or evaluation["kept"]
+                    )
+
+                    with self.subTest(
+                        memory_id=cand["id"]
+                    ):
+                        self.assertEqual(
+                            cand["id"] in retained_ids,
+                            expected_retained,
+                        )
+
+        # Primary is always retained; dormant B is suppressed.
+        self.assertEqual(retained_ids[0], _A)
+        self.assertIn(_C, retained_ids)
+        self.assertIn(_D, retained_ids)
+        self.assertNotIn(_B, retained_ids)
+
+
+# ------------------------------------------------------------------
+# 7. Static safety / authority boundaries
+# ------------------------------------------------------------------
+
+
+class StaticSafetyTests(unittest.TestCase):
+
+    def test_comparison_module_has_no_legacy_mutation(self):
+        names = _call_attr_names(
+            _ast(_COMPARISON_MODULE)
+        )
+
+        for forbidden in (
+            _FORBIDDEN_LEGACY_CALLS
+            | _FORBIDDEN_COGNITIVE_CALLS
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, names)
+
+    def test_comparison_module_only_calls_preview_on_engine(
+        self,
+    ):
+        tree_ast = _ast(_COMPARISON_MODULE)
+
+        engine_calls = []
+
+        for node in ast.walk(tree_ast):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "_ENGINE"
+            ):
+                engine_calls.append(node.func.attr)
+
+        self.assertEqual(
+            engine_calls,
+            ["preview_decay_cycle_decision"],
+        )
+
+    def test_comparison_module_has_no_write_authority_imports(
+        self,
+    ):
+        tree_ast = _ast(_COMPARISON_MODULE)
+
+        forbidden_imports = (
+            "bucket_manager",
+            "embedding",
+            "openai",
+            "anthropic",
+            "asyncio",
+            "threading",
+            "memory_reinforcement",
+        )
+
+        for node in ast.walk(tree_ast):
+            if isinstance(node, ast.Import):
+                modules = [
+                    alias.name
+                    for alias in node.names
+                ]
+            elif isinstance(node, ast.ImportFrom):
+                modules = [node.module or ""]
+            else:
+                modules = []
+
+            for module in modules:
+                lowered = module.lower()
+
+                for forbidden in forbidden_imports:
+                    with self.subTest(
+                        module=module,
+                        forbidden=forbidden,
+                    ):
+                        self.assertNotIn(
+                            forbidden, lowered
+                        )
+
+    def test_comparison_module_never_reads_global_unified(self):
+        source = (
+            _REPO_ROOT / _COMPARISON_MODULE
+        ).read_text(encoding="utf-8")
+
+        # No import of the conversation-global Unified reader and no
+        # reference to its on-disk path token.
+        self.assertNotIn(
+            "unified_context_candidate",
+            source.replace(
+                "unified-context-candidate.v1", ""
+            ),
+        )
+
+    def test_reporter_module_is_read_only(self):
+        names = _call_attr_names(_ast(_REPORTER_MODULE))
+
+        forbidden = {
+            "write_text",
+            "write_bytes",
+            "mkdir",
+            "unlink",
+            "rmdir",
+            "remove",
+            "rename",
+            "replace",
+            "chmod",
+            "touch",
+            "open",
+        }
+
+        for name in forbidden:
+            with self.subTest(name=name):
+                self.assertNotIn(name, names)
+
+        source = (
+            _REPO_ROOT / _REPORTER_MODULE
+        ).read_text(encoding="utf-8")
+
+        self.assertNotIn("atomic_write", source)
+        self.assertNotIn("shutil", source)
+
+
+# ------------------------------------------------------------------
+# 8. Aggregate reporter
+# ------------------------------------------------------------------
+
+
+def _report_row(category, **overrides):
+    row = {
+        "memory_key": "k" * 64,
+        "candidate_fingerprint": "f" * 64,
+        "retrieval_index": 0,
+        "binding": {
+            "unified_admitted": True,
+            "base_surfacing_eligible": True,
+            "base_eligible_rank": 0,
+        },
+        "legacy": {
+            "available": True,
+            "applicable": True,
+            "skip_reason": None,
+            "current_resolved": False,
+            "auto_resolve_candidate": False,
+            "score_current": 1.5,
+            "score_if_auto_resolve_succeeds": None,
+            "threshold": 0.3,
+            "archive_candidate_current": False,
+            "archive_candidate_after_auto_resolve_if_successful":
+                False,
+            "nominal_archive_candidate": False,
+        },
+        "cognitive": {
+            "observed": True,
+            "use_count": 2,
+            "strength": 0.4,
+            "accessibility": 0.2,
+            "salience": 0.1,
+            "age_since_last_used_hours": 48.0,
+            "min_accessibility": 0.3,
+            "min_salience": 0.25,
+            "would_suppress_if_supplementary": False,
+            "would_keep_if_supplementary": True,
+            "effective_gate_decision": "would_keep",
+            "invalid_event_count": 0,
+        },
+        "comparison": {"category": category},
+    }
+
+    for key, value in overrides.items():
+        row[key] = value
+
+    return row
+
+
+def _artifact(rows, *, truncated=0):
+    return {
+        "version": VERSION,
+        "mode": MODE,
+        "observation_truncated_count": truncated,
+        "candidates": rows,
+    }
+
+
+def _write_artifact(root, conversation, request, payload):
+    path = (
+        Path(root)
+        / "memory_lifecycle_comparison"
+        / conversation
+        / (request + ".json")
+    )
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    path.write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+
+    return path
+
+
+class ReporterTests(unittest.TestCase):
+
+    def test_aggregates_deterministically(self):
+        with tempfile.TemporaryDirectory() as root:
+            _write_artifact(
+                root,
+                CID,
+                RID,
+                _artifact(
+                    [
+                        _report_row(
+                            "legacy_keep_cognitive_keep"
+                        ),
+                        _report_row(
+                            "legacy_keep_cognitive_suppress",
+                            cognitive={
+                                **_report_row(
+                                    "x"
+                                )["cognitive"],
+                                "would_suppress_if_supplementary":
+                                    True,
+                                "effective_gate_decision":
+                                    "would_suppress",
+                            },
+                        ),
+                    ]
+                ),
+            )
+
+            first = reporter.build_report(root=root)
+            second = reporter.build_report(root=root)
+
+        self.assertEqual(first, second)
+        self.assertEqual(first["artifact_count"], 1)
+        self.assertEqual(first["valid_artifact_count"], 1)
+        self.assertEqual(first["candidate_count"], 2)
+        self.assertEqual(
+            first["category_counts"][
+                "legacy_keep_cognitive_keep"
+            ],
+            1,
+        )
+        self.assertEqual(
+            first["category_counts"][
+                "legacy_keep_cognitive_suppress"
+            ],
+            1,
+        )
+        self.assertEqual(
+            first["cognitive_counterfactual_suppress_count"],
+            1,
+        )
+        self.assertEqual(
+            first["distributions"][
+                "legacy_score_current"
+            ]["count"],
+            2,
+        )
+
+    def test_malformed_artifact_counts_invalid(self):
+        with tempfile.TemporaryDirectory() as root:
+            _write_artifact(
+                root,
+                CID,
+                RID,
+                _artifact(
+                    [
+                        _report_row(
+                            "legacy_keep_cognitive_keep"
+                        )
+                    ]
+                ),
+            )
+
+            bad = (
+                Path(root)
+                / "memory_lifecycle_comparison"
+                / CID
+                / "broken.json"
+            )
+
+            bad.write_text(
+                "{not json", encoding="utf-8"
+            )
+
+            report = reporter.build_report(root=root)
+
+        self.assertEqual(report["artifact_count"], 2)
+        self.assertEqual(
+            report["valid_artifact_count"], 1
+        )
+        self.assertEqual(
+            report["invalid_artifact_count"], 1
+        )
+        self.assertEqual(report["candidate_count"], 1)
+
+    def test_limit_is_enforced(self):
+        with tempfile.TemporaryDirectory() as root:
+            for index in range(5):
+                _write_artifact(
+                    root,
+                    CID,
+                    "ctxreq_" + format(index, "032x"),
+                    _artifact(
+                        [
+                            _report_row(
+                                "legacy_keep_cognitive_keep"
+                            )
+                        ]
+                    ),
+                )
+
+            report = reporter.build_report(
+                root=root, limit=2
+            )
+
+        self.assertEqual(report["artifact_count"], 2)
+
+    def test_read_only(self):
+        with tempfile.TemporaryDirectory() as root:
+            _write_artifact(
+                root,
+                CID,
+                RID,
+                _artifact(
+                    [
+                        _report_row(
+                            "legacy_keep_cognitive_keep"
+                        )
+                    ]
+                ),
+            )
+
+            before = tree(root)
+
+            reporter.build_report(root=root)
+
+            after = tree(root)
+
+        self.assertEqual(after, before)
+
+    def test_empty_input_has_no_nan(self):
+        with tempfile.TemporaryDirectory() as root:
+            report = reporter.build_report(root=root)
+
+        self.assertEqual(report["artifact_count"], 0)
+        self.assertEqual(report["candidate_count"], 0)
+
+        for name, stats in report[
+            "distributions"
+        ].items():
+            with self.subTest(name=name):
+                self.assertEqual(stats["count"], 0)
+
+                for field in (
+                    "min",
+                    "p25",
+                    "median",
+                    "p75",
+                    "max",
+                ):
+                    self.assertIsNone(stats[field])
+
+        json.dumps(report, allow_nan=False)
+
+    def test_all_output_values_are_finite(self):
+        with tempfile.TemporaryDirectory() as root:
+            _write_artifact(
+                root,
+                CID,
+                RID,
+                _artifact(
+                    [
+                        _report_row(
+                            "legacy_keep_cognitive_keep"
+                        ),
+                        _report_row(
+                            "legacy_keep_cognitive_keep"
+                        ),
+                    ]
+                ),
+            )
+
+            report = reporter.build_report(root=root)
+
+            rendered = json.dumps(report, allow_nan=False)
+
+        self.assertNotIn("NaN", rendered)
+        self.assertNotIn("Infinity", rendered)
+
+        for name, stats in report[
+            "distributions"
+        ].items():
+            if stats["count"] == 0:
+                continue
+
+            for field in (
+                "min",
+                "p25",
+                "median",
+                "p75",
+                "max",
+            ):
+                with self.subTest(
+                    name=name, field=field
+                ):
+                    self.assertTrue(
+                        math.isfinite(stats[field])
+                    )
+
+    def test_no_identifiers_emitted(self):
+        with tempfile.TemporaryDirectory() as root:
+            _write_artifact(
+                root,
+                CID,
+                RID,
+                _artifact(
+                    [
+                        _report_row(
+                            "legacy_keep_cognitive_keep"
+                        )
+                    ]
+                ),
+            )
+
+            report = reporter.build_report(root=root)
+
+        rendered = json.dumps(report)
+
+        for secret in (
+            CID,
+            RID,
+            "k" * 64,
+            "f" * 64,
+        ):
+            with self.subTest(secret=secret):
+                self.assertNotIn(secret, rendered)
+
+    def test_cli_json_output(self):
+        with tempfile.TemporaryDirectory() as root:
+            _write_artifact(
+                root,
+                CID,
+                RID,
+                _artifact(
+                    [
+                        _report_row(
+                            "legacy_keep_cognitive_keep"
+                        )
+                    ]
+                ),
+            )
+
+            stream = io.StringIO()
+
+            with contextlib.redirect_stdout(stream):
+                code = reporter.main(
+                    ["--root", root, "--json"]
+                )
+
+        self.assertEqual(code, 0)
+
+        parsed = json.loads(stream.getvalue())
+
+        self.assertEqual(parsed["artifact_count"], 1)
+
+
+# ------------------------------------------------------------------
+# 9. Pipeline composition
+# ------------------------------------------------------------------
+
+
+_PIPE_FLAGS = (
+    "OMBRE_GATEWAY_CONTEXT_UNIFIED_CANDIDATE_SHADOW",
+    "OMBRE_GATEWAY_CONTEXT_INJECTION_PREVIEW_SHADOW",
+    "OMBRE_GATEWAY_CONTEXT_INJECTION_GATE_SHADOW",
+    "OMBRE_GATEWAY_CONTEXT_REQUEST_MUTATION_SHADOW",
+    "OMBRE_GATEWAY_CONTEXT_REAL_INJECTION",
+    "OMBRE_GATEWAY_CONTEXT_CONFIDENCE_GATE_SHADOW",
+    "OMBRE_GATEWAY_CONTEXT_MEMORY_FLASH_SHADOW",
+    "OMBRE_GATEWAY_CONTEXT_EXPOSURE_LEDGER_SHADOW",
+    "OMBRE_GATEWAY_CONTEXT_MEMORY_RECALL_SURFACE_SHADOW",
+    INTEGRATION_ENV,
+    "OMBRE_GATEWAY_MEMORY_LIFECYCLE_SHADOW",
+    COMPARISON_SHADOW_ENV,
+)
+
+_FLASH_ENV = (
+    "OMBRE_GATEWAY_CONTEXT_MEMORY_FLASH_SHADOW"
+)
+_CONFIDENCE_ENV = (
+    "OMBRE_GATEWAY_CONTEXT_CONFIDENCE_GATE_SHADOW"
+)
+
+
+def _isolated_env():
+    return {flag: "0" for flag in _PIPE_FLAGS}
+
+
+def _confidence():
+    return {
+        "version": "context-confidence-gate.v1",
+        "mode": "shadow_only",
+        "conversation_id": CID,
+        "decision": "allow_shadow",
+        "allowed": True,
+        "reason": None,
+        "reasons": [],
+        "stored": True,
+        "duplicate": False,
+        "revision": 1,
+        "source_unified_revision": 5,
+    }
+
+
+class PipelineCompositionTests(
+    unittest.IsolatedAsyncioTestCase,
+):
+    def tearDown(self):
+        bind_legacy_lifecycle_comparison_engine(None)
+
+    def _snapshot(self, memories):
+        engine = SpyDecayEngine([_preview()])
+        bind_legacy_lifecycle_comparison_engine(engine)
+
+        observations = (
+            capture_legacy_lifecycle_observations(
+                memories
+            )
+        )
+
+        return build_memory_shadow_snapshot(
+            conversation_id=CID,
+            unified={
+                "version":
+                    "unified-context-candidate.v1",
+                "conversation_id": CID,
+                "revision": 5,
+                "sections": {"memories": memories},
+                "telemetry": {
+                    "current_user_excluded": True,
+                    "memory_count": len(memories),
+                },
+            },
+            retrieval_memories=memories,
+            legacy_lifecycle_observations=observations,
+        )
+
+    async def _run(
+        self,
+        *,
+        root,
+        comparison_on,
+        flash_on,
+        memories,
+        comparison_impl=None,
+        policy_mock=None,
+    ):
+        body = b'{"messages":[]}'
+
+        environ = {
+            **_isolated_env(),
+            _CONFIDENCE_ENV: "1",
+            _FLASH_ENV: (
+                "1" if flash_on else "0"
+            ),
+            COMPARISON_SHADOW_ENV: (
+                "1" if comparison_on else "0"
+            ),
+            "OMBRE_CONTEXT_STATE_DIR": root,
+        }
+
+        patches = [
+            patch.object(
+                coordinator,
+                "observe_context_sources",
+                Mock(return_value=CID),
+            ),
+            patch.object(
+                coordinator,
+                "update_unified_context_candidate_from_runtime",
+                AsyncMock(
+                    return_value={
+                        "stored": True,
+                        "revision": 5,
+                        "memory_shadow_snapshot":
+                            self._snapshot(memories),
+                    }
+                ),
+            ),
+            patch.object(
+                coordinator,
+                "update_context_confidence_gate",
+                Mock(return_value=_confidence()),
+            ),
+        ]
+
+        if comparison_impl is not None:
+            patches.append(
+                patch.object(
+                    coordinator,
+                    "update_memory_lifecycle_comparison",
+                    comparison_impl,
+                )
+            )
+
+        if policy_mock is not None:
+            patches.append(
+                patch.object(
+                    coordinator,
+                    "evaluate_surfacing_policy",
+                    policy_mock,
+                )
+            )
+
+        with patch.dict(
+            os.environ, environ, clear=False
+        ):
+            with contextlib.ExitStack() as stack:
+                for item in patches:
+                    stack.enter_context(item)
+
+                selected = await (
+                    coordinator.run_context_pipeline(body)
+                )
+
+        self.assertEqual(selected, body)
+
+        return body
+
+    def _comparison_dir(self, root):
+        return (
+            Path(root)
+            / "memory_lifecycle_comparison"
+            / CID
+        )
+
+    def _flash_semantics(self, root):
+        """The Flash artifact minus per-request volatile fields.
+
+        ``cognitive_request_id`` and ``created_at`` are minted per
+        request independently of the comparison observer, so they are
+        dropped before comparing a fault run against the baseline.
+        """
+
+        files = sorted(
+            (
+                Path(root)
+                / "memory_flash"
+                / CID
+            ).glob("*.json")
+        )
+
+        artifact = json.loads(
+            files[0].read_text(encoding="utf-8")
+        )
+
+        for volatile in (
+            "cognitive_request_id",
+            "created_at",
+        ):
+            artifact.pop(volatile, None)
+
+        return artifact
+
+    async def test_comparison_only_writes_only_comparison(
+        self,
+    ):
+        memories = [memory(_A), memory(_B)]
+
+        with tempfile.TemporaryDirectory() as root:
+            body = await self._run(
+                root=root,
+                comparison_on=True,
+                flash_on=False,
+                memories=memories,
+            )
+
+            comparison_dir = self._comparison_dir(root)
+
+            self.assertTrue(comparison_dir.is_dir())
+
+            files = sorted(
+                comparison_dir.glob("*.json")
+            )
+
+            self.assertEqual(len(files), 1)
+
+            artifact = json.loads(
+                files[0].read_text(encoding="utf-8")
+            )
+
+            self.assertEqual(
+                artifact["version"], VERSION
+            )
+            self.assertEqual(artifact["mode"], MODE)
+            self.assertEqual(
+                len(artifact["candidates"]), 2
+            )
+            self.assertEqual(
+                artifact["source_unified_revision"], 5
+            )
+
+            # No other Memory stage fabricated an artifact.
+            self.assertFalse(
+                (Path(root) / "memory_flash").exists()
+            )
+            self.assertFalse(
+                (Path(root) / "recall_surface").exists()
+            )
+            self.assertFalse(
+                (Path(root) / "exposure_ledger").exists()
+            )
+
+        self.assertEqual(body, b'{"messages":[]}')
+
+    async def test_flag_off_writes_no_artifact(self):
+        memories = [memory(_A)]
+
+        with tempfile.TemporaryDirectory() as root:
+            await self._run(
+                root=root,
+                comparison_on=False,
+                flash_on=True,
+                memories=memories,
+            )
+
+            self.assertFalse(
+                self._comparison_dir(root).exists()
+            )
+
+    async def test_shared_base_policy_computed_once(self):
+        from ombrebrain.context.memory_surfacing_policy import (
+            evaluate_surfacing_policy,
+        )
+
+        memories = [memory(_A), memory(_B)]
+
+        spy = Mock(wraps=evaluate_surfacing_policy)
+
+        with tempfile.TemporaryDirectory() as root:
+            await self._run(
+                root=root,
+                comparison_on=True,
+                flash_on=True,
+                memories=memories,
+                policy_mock=spy,
+            )
+
+        self.assertEqual(spy.call_count, 1)
+
+    async def test_observer_failure_leaves_flash_unchanged(
+        self,
+    ):
+        memories = [memory(_A), memory(_B)]
+
+        with tempfile.TemporaryDirectory() as baseline_root:
+            await self._run(
+                root=baseline_root,
+                comparison_on=False,
+                flash_on=True,
+                memories=memories,
+            )
+
+            baseline = self._flash_semantics(
+                baseline_root
+            )
+
+        def explode(**kwargs):
+            raise RuntimeError("comparison boom")
+
+        with tempfile.TemporaryDirectory() as fault_root:
+            await self._run(
+                root=fault_root,
+                comparison_on=True,
+                flash_on=True,
+                memories=memories,
+                comparison_impl=Mock(
+                    side_effect=explode
+                ),
+            )
+
+            after = self._flash_semantics(fault_root)
+
+            # No comparison artifact was written by the failing
+            # observer, and no stale fallback was created.
+            self.assertFalse(
+                self._comparison_dir(fault_root).exists()
+            )
+
+        self.assertEqual(after, baseline)
+
+
+if __name__ == "__main__":
+    unittest.main()
