@@ -455,18 +455,50 @@ class ServerWiringContractTests(unittest.TestCase):
         )
 
     def test_K_alternate_stdio_start_is_the_documented_lazy_path(self):
-        # The only alternate stdio DecayEngine start path is the lazy
-        # tool-level ensure_started() call. Record its exact call sites.
+        # DecayEngine can only start through two legitimate paths:
+        #   A. RuntimeLifecycle.start()
+        #      -> getattr(self.decay_engine, "start", None)  (covered by J)
+        #   B. lazy `rt.decay_engine.ensure_started()` from a tool, where
+        #      DecayEngine.ensure_started() calls self.start().
+        # Scan ALL of src (not just src/tools) so that a new, unexpected
+        # DecayEngine startup authority anywhere in the tree fails here.
         found: set[str] = set()
-        for path in sorted((_SRC / "tools").rglob("*.py")):
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-            for node in _calls(tree):
-                if node.func.attr == "ensure_started":
+        for path in sorted(_SRC.rglob("*.py")):
+            try:
+                tree = ast.parse(path.read_text(encoding="utf-8"))
+            except (SyntaxError, UnicodeDecodeError):
+                continue
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                called = (
+                    func.attr
+                    if isinstance(func, ast.Attribute)
+                    else func.id
+                    if isinstance(func, ast.Name)
+                    else None
+                )
+                if called == "ensure_started":
                     found.add(
                         str(path.relative_to(_REPO_ROOT))
                     )
         self.assertEqual(
             found, _DOCUMENTED_LAZY_START_FILES
+        )
+
+    def test_K_decay_engine_ensure_started_calls_start(self):
+        # Path B: ensure_started() must actually start the background loop.
+        tree = _parse("src/decay_engine.py")
+        method = _class_method(tree, "DecayEngine", "ensure_started")
+        self.assertTrue(
+            any(
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "start"
+                for node in ast.walk(method)
+            ),
+            "DecayEngine.ensure_started must call self.start()",
         )
 
 
