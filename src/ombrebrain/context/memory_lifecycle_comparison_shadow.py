@@ -4,6 +4,7 @@ import json
 import logging
 import math
 import os
+import re
 from collections import deque
 from datetime import datetime, timezone
 from typing import Any
@@ -20,12 +21,15 @@ from ombrebrain.context.recall_types import (
 )
 from ombrebrain.context.memory_lifecycle_event import (
     memory_key,
+    parse_iso_utc,
 )
 from ombrebrain.context.memory_lifecycle_state import (
     resolve_lifecycle_config,
 )
 from ombrebrain.context.memory_surfacing_lifecycle import (
     evaluate_lifecycle_surfacing_candidate,
+    lifecycle_shadow_enabled,
+    lifecycle_surfacing_enabled,
     resolve_surfacing_lifecycle_config,
 )
 from ombrebrain.context.retrieval_decision_shadow import (
@@ -116,13 +120,56 @@ _CAT_LEGACY_UNAVAILABLE = "legacy_unavailable"
 _CAT_LEGACY_NOT_APPLICABLE = "legacy_not_applicable"
 _CAT_COGNITIVE_UNAVAILABLE = "cognitive_evidence_unavailable"
 
-# Effective gate decisions (what the ACTUAL live gate would do).
+# Counterfactual gate decisions: what the CURRENT lifecycle gate policy
+# would decide IF it were applied to this base policy. These are
+# computed regardless of whether the live gate is enabled.
 _GATE_PRIMARY = "primary_preserved"
 _GATE_NEUTRAL = "neutral_unobserved"
 _GATE_KEEP = "would_keep"
 _GATE_SUPPRESS = "would_suppress"
 _GATE_NOT_BASE_ELIGIBLE = "not_base_eligible"
 _GATE_BINDING_UNAVAILABLE = "binding_unavailable"
+_GATE_BASE_POLICY_UNAVAILABLE = "base_policy_unavailable"
+_GATE_COGNITIVE_EVIDENCE_UNAVAILABLE = (
+    "cognitive_evidence_unavailable"
+)
+
+# Actual live-gate participation. ``gate_disabled`` means the live
+# Lifecycle Surfacing gate cannot change anything under its current
+# flags, so a counterfactual suppression here is NOT a live effect.
+_GATE_DISABLED = "gate_disabled"
+
+_KNOWN_COUNTERFACTUAL_DECISIONS = (
+    _GATE_PRIMARY,
+    _GATE_NEUTRAL,
+    _GATE_KEEP,
+    _GATE_SUPPRESS,
+    _GATE_NOT_BASE_ELIGIBLE,
+    _GATE_BINDING_UNAVAILABLE,
+    _GATE_BASE_POLICY_UNAVAILABLE,
+    _GATE_COGNITIVE_EVIDENCE_UNAVAILABLE,
+)
+
+_KNOWN_LIVE_GATE_DECISIONS = (
+    _KNOWN_COUNTERFACTUAL_DECISIONS
+    + (_GATE_DISABLED,)
+)
+
+# All deterministic comparison categories the builder may emit.
+_KNOWN_COMPARISON_CATEGORIES = (
+    _CAT_BINDING_UNAVAILABLE,
+    _CAT_LEGACY_UNAVAILABLE,
+    _CAT_LEGACY_NOT_APPLICABLE,
+    _CAT_COGNITIVE_UNAVAILABLE,
+    "legacy_archive_cognitive_unobserved",
+    "legacy_archive_cognitive_suppress",
+    "legacy_archive_cognitive_keep",
+    "legacy_keep_cognitive_unobserved",
+    "legacy_keep_cognitive_suppress",
+    "legacy_keep_cognitive_keep",
+)
+
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 
 # Cognitive counterfactual bucket names.
 _COG_UNOBSERVED = "unobserved"
@@ -295,13 +342,22 @@ def _fingerprint_queues(
 def _unified_memories(
     unified: Any,
     *,
+    expected_conversation_id: Any,
     expected_revision: Any,
 ) -> list | None:
-    """THIS request's Unified admitted memories, or None if unusable."""
+    """THIS request's Unified admitted memories, or None if unusable.
+
+    A request-local Unified is valid ONLY when its contract version,
+    its ``conversation_id`` and its ``revision`` all match THIS
+    request. A foreign Unified that happens to carry the same numeric
+    revision is never accepted.
+    """
 
     if (
         not isinstance(unified, dict)
         or unified.get("version") != _UNIFIED_VERSION
+        or unified.get("conversation_id")
+        != expected_conversation_id
         or unified.get("revision") != expected_revision
     ):
         return None
@@ -319,32 +375,57 @@ def _unified_memories(
     return memories
 
 
-def _base_eligible(
+def _base_policy_binding(
     base_policy: Any,
-) -> list | None:
-    """The base policy's eligible list, or None if not a real allow."""
+    *,
+    conversation_id: Any,
+    expected_revision: Any,
+) -> tuple[bool, list | None]:
+    """Strictly bound base Surfacing Policy eligibility.
+
+    Returns ``(available, eligible_list)``. ``available`` is False
+    whenever the policy is missing, malformed, from another
+    conversation, or bound to another Unified revision -- in which case
+    eligibility is UNKNOWN (``eligible_list`` is None) and must never be
+    inferred as ``not eligible``. When the policy IS validly bound,
+    ``eligible_list`` is the real eligible list (an empty list when the
+    policy decided ``no_surface``), so a real ``no_surface`` correctly
+    means "not eligible".
+    """
 
     if not isinstance(base_policy, dict):
-        return None
+        return False, None
 
     if (
         base_policy.get("version") != _POLICY_VERSION
         or base_policy.get("mode") != _POLICY_MODE
     ):
-        return None
+        return False, None
+
+    if (
+        base_policy.get("conversation_id")
+        != conversation_id
+    ):
+        return False, None
+
+    if (
+        base_policy.get("source_unified_revision")
+        != expected_revision
+    ):
+        return False, None
 
     if (
         base_policy.get("decision")
         != _ALLOW_DECISION
     ):
-        return []
+        return True, []
 
     eligible = base_policy.get("eligible")
 
     if not isinstance(eligible, list):
-        return []
+        return True, []
 
-    return eligible
+    return True, eligible
 
 
 def _legacy_view(
@@ -439,25 +520,45 @@ def _cognitive_view(
     config: dict[str, float],
     thresholds: dict[str, float],
 ) -> tuple[dict[str, Any], bool]:
-    """Read-only cognitive evaluation of one memory, or unavailable."""
+    """Read-only cognitive evaluation of one memory.
 
-    unavailable = {
-        "observed": False,
-        "use_count": 0,
-        "strength": None,
-        "accessibility": None,
-        "salience": None,
-        "age_since_last_used_hours": None,
-        "min_accessibility": thresholds[
-            "min_accessibility"
-        ],
-        "min_salience": thresholds[
-            "min_salience"
-        ],
-        "would_suppress_if_supplementary": False,
-        "would_keep_if_supplementary": False,
-        "invalid_event_count": 0,
-    }
+    Returns ``(view, evidence_available)`` where the view carries the
+    tri-state ``available`` / ``observed`` contract:
+
+      available=True,  observed=True   valid Used history observed
+      available=True,  observed=False  evidence read, no valid Used
+                                       history -> neutral_unobserved
+      available=False, observed=None   evidence could not be evaluated
+                                       -> cognitive_evidence_unavailable
+
+    Unavailable is NEVER represented as ``observed=False``: unknown is
+    not the same as "no history".
+    """
+
+    def _unavailable() -> dict[str, Any]:
+        return {
+            "available": False,
+            "observed": None,
+            "use_count": 0,
+            "strength": None,
+            "accessibility": None,
+            "salience": None,
+            "age_since_last_used_hours": None,
+            "min_accessibility": thresholds[
+                "min_accessibility"
+            ],
+            "min_salience": thresholds[
+                "min_salience"
+            ],
+            "would_suppress_if_supplementary": False,
+            "would_keep_if_supplementary": False,
+            "invalid_event_count": 0,
+        }
+
+    # No usable identity: the evidence chain for this candidate cannot
+    # be read at all -> unavailable, not "no history".
+    if not isinstance(memory_id, str) or not memory_id:
+        return _unavailable(), False
 
     try:
         result = (
@@ -469,7 +570,10 @@ def _cognitive_view(
             )
         )
     except Exception:
-        return unavailable, False
+        return _unavailable(), False
+
+    if not isinstance(result, dict):
+        return _unavailable(), False
 
     observed = bool(result.get("observed"))
 
@@ -484,6 +588,7 @@ def _cognitive_view(
     if not observed:
         return (
             {
+                "available": True,
                 "observed": False,
                 "use_count": 0,
                 "strength": None,
@@ -510,6 +615,7 @@ def _cognitive_view(
 
     return (
         {
+            "available": True,
             "observed": True,
             "use_count": int(
                 result.get("use_count") or 0
@@ -545,29 +651,42 @@ def _cognitive_view(
     )
 
 
-def _effective_gate_decision(
+def _counterfactual_gate_decision(
     *,
-    admitted: bool,
+    binding_available: bool,
+    base_policy_available: bool,
     base_eligible: bool,
     base_rank: int | None,
-    binding_available: bool,
+    cognitive_available: bool,
     cognitive: dict[str, Any],
 ) -> str:
-    """What the ACTUAL live gate would decide for this candidate.
+    """What the CURRENT lifecycle gate would decide IF applied.
+
+    This is a COUNTERFACTUAL: it is computed regardless of whether the
+    live Lifecycle Surfacing gate is enabled. It is never labelled an
+    actual live effect (see ``effective_live_gate_decision``).
 
     The primary (rank 0) base-eligible candidate is ALWAYS preserved,
-    so ``would_suppress_if_supplementary`` and the effective gate
-    decision are deliberately represented separately.
+    so ``would_suppress_if_supplementary`` and this decision are
+    deliberately represented separately. A missing base policy or
+    missing cognitive evidence is UNKNOWN, never "suppressed" and never
+    "not eligible".
     """
 
     if not binding_available:
         return _GATE_BINDING_UNAVAILABLE
+
+    if not base_policy_available:
+        return _GATE_BASE_POLICY_UNAVAILABLE
 
     if not base_eligible:
         return _GATE_NOT_BASE_ELIGIBLE
 
     if base_rank == 0:
         return _GATE_PRIMARY
+
+    if not cognitive_available:
+        return _GATE_COGNITIVE_EVIDENCE_UNAVAILABLE
 
     if not cognitive.get("observed"):
         return _GATE_NEUTRAL
@@ -576,6 +695,25 @@ def _effective_gate_decision(
         return _GATE_KEEP
 
     return _GATE_SUPPRESS
+
+
+def _effective_live_gate_decision(
+    counterfactual: str,
+    *,
+    live_gate_active: bool,
+) -> str:
+    """The actual current lifecycle gate participation.
+
+    When the live gate cannot change anything under its current flags,
+    no counterfactual suppression is an actual live effect, so this is
+    ``gate_disabled``. Otherwise the real gate would apply the
+    counterfactual decision.
+    """
+
+    if not live_gate_active:
+        return _GATE_DISABLED
+
+    return counterfactual
 
 
 def _category(
@@ -628,6 +766,67 @@ def _round(value: float | None) -> float | None:
     return round(value, 6)
 
 
+def _index(value: Any) -> int:
+    """Nonnegative retrieval index, or 0 when the evidence is invalid."""
+
+    if (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and value >= 0
+    ):
+        return value
+
+    return 0
+
+
+def _finalize_legacy(
+    legacy: dict[str, Any],
+) -> dict[str, Any]:
+    row = dict(legacy)
+    row["score_current"] = _round(
+        legacy.get("score_current")
+    )
+    row["score_if_auto_resolve_succeeds"] = _round(
+        legacy.get(
+            "score_if_auto_resolve_succeeds"
+        )
+    )
+    return row
+
+
+def _finalize_cognitive(
+    cognitive: dict[str, Any],
+    *,
+    counterfactual: str,
+    live_gate_active: bool,
+) -> dict[str, Any]:
+    row = dict(cognitive)
+    row["strength"] = _round(
+        cognitive.get("strength")
+    )
+    row["accessibility"] = _round(
+        cognitive.get("accessibility")
+    )
+    row["salience"] = _round(
+        cognitive.get("salience")
+    )
+    row["age_since_last_used_hours"] = _round(
+        cognitive.get(
+            "age_since_last_used_hours"
+        )
+    )
+    row["counterfactual_gate_decision"] = (
+        counterfactual
+    )
+    row["effective_live_gate_decision"] = (
+        _effective_live_gate_decision(
+            counterfactual,
+            live_gate_active=live_gate_active,
+        )
+    )
+    return row
+
+
 def build_lifecycle_comparison_artifact(
     *,
     conversation_id: str,
@@ -641,9 +840,11 @@ def build_lifecycle_comparison_artifact(
 ) -> dict[str, Any]:
     """Build the privacy-safe, request-scoped comparison artifact.
 
-    Pure and read-only with respect to every memory authority: it reads
-    THIS request's Unified snapshot and the existing cognitive formulas
-    and writes nothing but the returned dict.
+    Read-only with respect to every memory authority (it reads THIS
+    request's Unified snapshot and the existing cognitive lifecycle
+    event files) but NOT mathematically pure: its Cognitive evaluation
+    performs read-only IO against immutable lifecycle events. It writes
+    nothing but the returned dict.
     """
 
     moment = as_of or datetime.now(timezone.utc)
@@ -666,6 +867,9 @@ def build_lifecycle_comparison_artifact(
 
     unified_memories = _unified_memories(
         unified,
+        expected_conversation_id=(
+            conversation_id
+        ),
         expected_revision=(
             source_unified_revision
         ),
@@ -679,12 +883,29 @@ def build_lifecycle_comparison_artifact(
         else []
     )
 
-    eligible_list = _base_eligible(base_policy)
+    (
+        base_policy_available,
+        eligible_list,
+    ) = _base_policy_binding(
+        base_policy,
+        conversation_id=conversation_id,
+        expected_revision=(
+            source_unified_revision
+        ),
+    )
 
     eligible_queue = _fingerprint_queues(
         eligible_list
         if eligible_list is not None
         else []
+    )
+
+    # Actual live-gate participation under the CURRENT flags. It only
+    # records whether the real gate could change behaviour; it never
+    # changes the counterfactual analysis.
+    live_gate_active = bool(
+        lifecycle_surfacing_enabled()
+        and lifecycle_shadow_enabled()
     )
 
     config = resolve_lifecycle_config()
@@ -702,38 +923,63 @@ def build_lifecycle_comparison_artifact(
         if len(rows) >= MAX_COMPARISON_ROWS:
             break
 
+        retrieval_index = _index(
+            observation.get("retrieval_index")
+        )
+
         fingerprint = observation.get(
             "candidate_fingerprint"
         )
 
-        if (
-            not isinstance(fingerprint, str)
-            or not fingerprint
-        ):
-            # Cannot truthfully bind this retrieval candidate.
+        valid_fingerprint = (
+            isinstance(fingerprint, str)
+            and _SHA256_HEX.match(fingerprint)
+            is not None
+        )
+
+        key = memory_key(
+            observation.get("memory_id")
+        )
+
+        if not valid_fingerprint or key is None:
+            # Cannot truthfully bind this retrieval candidate's
+            # identity, so its eligibility is UNKNOWN.
+            unavailable_cognitive, _ = (
+                _cognitive_view(
+                    None,
+                    as_of=moment,
+                    config=config,
+                    thresholds=thresholds,
+                )
+            )
+
             rows.append(
                 {
                     "memory_key": None,
                     "candidate_fingerprint": None,
                     "retrieval_index":
-                        observation.get(
-                            "retrieval_index"
-                        ),
+                        retrieval_index,
                     "binding": {
                         "unified_admitted": None,
+                        "base_policy_available":
+                            False,
                         "base_surfacing_eligible":
                             None,
                         "base_eligible_rank": None,
                     },
-                    "legacy": _legacy_view(
-                        observation
-                    )[0],
-                    "cognitive": _cognitive_view(
-                        None,
-                        as_of=moment,
-                        config=config,
-                        thresholds=thresholds,
-                    )[0],
+                    "legacy": _finalize_legacy(
+                        _legacy_view(observation)[0]
+                    ),
+                    "cognitive":
+                        _finalize_cognitive(
+                            unavailable_cognitive,
+                            counterfactual=(
+                                _GATE_BINDING_UNAVAILABLE
+                            ),
+                            live_gate_active=(
+                                live_gate_active
+                            ),
+                        ),
                     "comparison": {
                         "category":
                             _CAT_BINDING_UNAVAILABLE
@@ -761,7 +1007,17 @@ def build_lifecycle_comparison_artifact(
                 eligible_queue_for_fp.popleft()
             )
 
-        base_eligible = base_rank is not None
+        if base_policy_available:
+            base_eligible = base_rank is not None
+            base_surfacing_eligible = (
+                base_eligible
+            )
+            base_eligible_rank = base_rank
+        else:
+            # UNKNOWN base eligibility: never infer "not eligible".
+            base_eligible = False
+            base_surfacing_eligible = None
+            base_eligible_rank = None
 
         legacy, legacy_available = _legacy_view(
             observation
@@ -778,13 +1034,17 @@ def build_lifecycle_comparison_artifact(
 
         binding_ok = binding_available
 
-        effective_gate_decision = (
-            _effective_gate_decision(
-                admitted=admitted_index
-                is not None,
+        counterfactual = (
+            _counterfactual_gate_decision(
+                binding_available=binding_ok,
+                base_policy_available=(
+                    base_policy_available
+                ),
                 base_eligible=base_eligible,
                 base_rank=base_rank,
-                binding_available=binding_ok,
+                cognitive_available=(
+                    cognitive_available
+                ),
                 cognitive=cognitive,
             )
         )
@@ -799,73 +1059,38 @@ def build_lifecycle_comparison_artifact(
             cognitive=cognitive,
         )
 
-        cognitive_row = dict(cognitive)
-        cognitive_row["strength"] = _round(
-            cognitive.get("strength")
-        )
-        cognitive_row[
-            "accessibility"
-        ] = _round(
-            cognitive.get("accessibility")
-        )
-        cognitive_row["salience"] = _round(
-            cognitive.get("salience")
-        )
-        cognitive_row[
-            "age_since_last_used_hours"
-        ] = _round(
-            cognitive.get(
-                "age_since_last_used_hours"
-            )
-        )
-        cognitive_row[
-            "effective_gate_decision"
-        ] = effective_gate_decision
-
-        legacy_row = dict(legacy)
-        legacy_row["score_current"] = _round(
-            legacy.get("score_current")
-        )
-        legacy_row[
-            "score_if_auto_resolve_succeeds"
-        ] = _round(
-            legacy.get(
-                "score_if_auto_resolve_succeeds"
-            )
-        )
-
-        if binding_ok:
-            binding_row = {
-                "unified_admitted":
-                    admitted_index is not None,
-                "base_surfacing_eligible":
-                    base_eligible,
-                "base_eligible_rank":
-                    base_rank,
-            }
-        else:
-            # No truthful binding exists: never guess, never claim a
-            # candidate was "not admitted". Record it as unknown.
-            binding_row = {
-                "unified_admitted": None,
-                "base_surfacing_eligible": None,
-                "base_eligible_rank": None,
-            }
+        binding_row = {
+            "unified_admitted": (
+                (admitted_index is not None)
+                if binding_ok
+                else None
+            ),
+            "base_policy_available":
+                base_policy_available,
+            "base_surfacing_eligible":
+                base_surfacing_eligible,
+            "base_eligible_rank":
+                base_eligible_rank,
+        }
 
         rows.append(
             {
-                "memory_key": memory_key(
-                    memory_id
-                ),
+                "memory_key": key,
                 "candidate_fingerprint":
                     fingerprint,
                 "retrieval_index":
-                    observation.get(
-                        "retrieval_index"
-                    ),
+                    retrieval_index,
                 "binding": binding_row,
-                "legacy": legacy_row,
-                "cognitive": cognitive_row,
+                "legacy": _finalize_legacy(
+                    legacy
+                ),
+                "cognitive": _finalize_cognitive(
+                    cognitive,
+                    counterfactual=counterfactual,
+                    live_gate_active=(
+                        live_gate_active
+                    ),
+                ),
                 "comparison": {
                     "category": category
                 },
@@ -897,6 +1122,8 @@ def build_lifecycle_comparison_artifact(
         "source_unified_revision":
             source_unified_revision,
         "created_at": now_iso(),
+        "live_lifecycle_gate_active":
+            live_gate_active,
         "observation_truncated":
             truncated_count > 0,
         "observation_truncated_count":
@@ -916,6 +1143,40 @@ def _count(
     predicate,
 ) -> int:
     return sum(1 for row in rows if predicate(row))
+
+
+def _auto_resolve_direction(
+    legacy: dict[str, Any],
+) -> str | None:
+    """Whether a successful auto-resolve would change archive outcome.
+
+    Direction is NOT assumed: the current formula may make one direction
+    more likely, but the comparison must not encode that assumption.
+    """
+
+    if not legacy.get("auto_resolve_candidate"):
+        return None
+
+    current = bool(
+        legacy.get("archive_candidate_current")
+    )
+
+    after = bool(
+        legacy.get(
+            "archive_candidate_after_auto_resolve_if_successful"
+        )
+    )
+
+    if current == after:
+        return None
+
+    return "created" if after else "removed"
+
+
+def _auto_resolve_changed(
+    legacy: dict[str, Any],
+) -> bool:
+    return _auto_resolve_direction(legacy) is not None
 
 
 def _metrics(
@@ -980,17 +1241,62 @@ def _metrics(
                     "nominal_archive_candidate"
                 ),
             ),
+        "legacy_auto_resolve_changed_archive_outcome_count":
+            _count(
+                rows,
+                lambda r: _auto_resolve_changed(
+                    legacy(r)
+                ),
+            ),
+        "legacy_auto_resolve_created_archive_candidate_count":
+            _count(
+                rows,
+                lambda r: _auto_resolve_direction(
+                    legacy(r)
+                )
+                == "created",
+            ),
+        "legacy_auto_resolve_removed_archive_candidate_count":
+            _count(
+                rows,
+                lambda r: _auto_resolve_direction(
+                    legacy(r)
+                )
+                == "removed",
+            ),
+        "cognitive_available_count": _count(
+            rows,
+            lambda r: cognitive(r).get(
+                "available"
+            )
+            is True,
+        ),
         "cognitive_observed_count": _count(
             rows,
             lambda r: cognitive(r).get(
-                "observed"
-            ),
+                "available"
+            )
+            is True
+            and cognitive(r).get("observed")
+            is True,
         ),
         "cognitive_neutral_unobserved_count":
             _count(
                 rows,
                 lambda r: cognitive(r).get(
+                    "available"
+                )
+                is True
+                and cognitive(r).get(
                     "observed"
+                )
+                is False,
+            ),
+        "cognitive_evidence_unavailable_count":
+            _count(
+                rows,
+                lambda r: cognitive(r).get(
+                    "available"
                 )
                 is False,
             ),
@@ -1001,11 +1307,19 @@ def _metrics(
                     "would_suppress_if_supplementary"
                 ),
             ),
-        "cognitive_effective_suppress_count":
+        "cognitive_counterfactual_gate_suppress_count":
             _count(
                 rows,
                 lambda r: cognitive(r).get(
-                    "effective_gate_decision"
+                    "counterfactual_gate_decision"
+                )
+                == _GATE_SUPPRESS,
+            ),
+        "cognitive_live_gate_suppress_count":
+            _count(
+                rows,
+                lambda r: cognitive(r).get(
+                    "effective_live_gate_decision"
                 )
                 == _GATE_SUPPRESS,
             ),
@@ -1013,7 +1327,7 @@ def _metrics(
             _count(
                 rows,
                 lambda r: cognitive(r).get(
-                    "effective_gate_decision"
+                    "counterfactual_gate_decision"
                 )
                 == _GATE_PRIMARY,
             ),
@@ -1031,6 +1345,14 @@ def _metrics(
                     "base_surfacing_eligible"
                 )
                 is True,
+            ),
+        "base_policy_unavailable_count":
+            _count(
+                rows,
+                lambda r: binding(r).get(
+                    "base_policy_available"
+                )
+                is False,
             ),
         "both_archive_and_suppress_count":
             _count(
@@ -1090,6 +1412,399 @@ def _metrics(
             for r in rows
         ),
     }
+
+
+# ------------------------------------------------------------------
+# Artifact validator (single authoritative v1 contract)
+# ------------------------------------------------------------------
+
+
+def _is_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and _SHA256_HEX.match(value) is not None
+    )
+
+
+def _is_bool(value: Any) -> bool:
+    return isinstance(value, bool)
+
+
+def _is_nonneg_int(value: Any) -> bool:
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and value >= 0
+    )
+
+
+def _is_finite(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    )
+
+
+def _is_finite_or_none(value: Any) -> bool:
+    return value is None or _is_finite(value)
+
+
+def _is_unit(value: Any) -> bool:
+    return _is_finite(value) and (
+        0.0 <= float(value) <= 1.0
+    )
+
+
+def _valid_legacy_row(legacy: Any) -> bool:
+    if not isinstance(legacy, dict):
+        return False
+
+    if not _is_bool(legacy.get("available")):
+        return False
+
+    if not _is_bool(legacy.get("applicable")):
+        return False
+
+    skip_reason = legacy.get("skip_reason")
+
+    if not (
+        skip_reason is None
+        or isinstance(skip_reason, str)
+    ):
+        return False
+
+    for name in (
+        "current_resolved",
+        "auto_resolve_candidate",
+        "archive_candidate_current",
+        "archive_candidate_after_auto_resolve_if_successful",
+        "nominal_archive_candidate",
+    ):
+        if not _is_bool(legacy.get(name)):
+            return False
+
+    if not _is_finite_or_none(
+        legacy.get("score_current")
+    ):
+        return False
+
+    if not _is_finite_or_none(
+        legacy.get("score_if_auto_resolve_succeeds")
+    ):
+        return False
+
+    if not _is_finite_or_none(
+        legacy.get("threshold")
+    ):
+        return False
+
+    if legacy.get("available") is False:
+        for name in (
+            "score_current",
+            "score_if_auto_resolve_succeeds",
+            "threshold",
+        ):
+            if legacy.get(name) is not None:
+                return False
+
+    return True
+
+
+def _valid_cognitive_row(cognitive: Any) -> bool:
+    if not isinstance(cognitive, dict):
+        return False
+
+    available = cognitive.get("available")
+    observed = cognitive.get("observed")
+
+    if not _is_bool(available):
+        return False
+
+    if observed is not None and not _is_bool(
+        observed
+    ):
+        return False
+
+    # available / observed tri-state contract.
+    if available is False and observed is not None:
+        return False
+
+    if available is True and observed is None:
+        return False
+
+    if not _is_nonneg_int(
+        cognitive.get("use_count")
+    ):
+        return False
+
+    if not _is_finite_or_none(
+        cognitive.get("strength")
+    ):
+        return False
+
+    if not _is_finite_or_none(
+        cognitive.get("accessibility")
+    ):
+        return False
+
+    if not _is_finite_or_none(
+        cognitive.get("salience")
+    ):
+        return False
+
+    age = cognitive.get("age_since_last_used_hours")
+
+    if age is not None:
+        if not _is_finite(age):
+            return False
+
+        if float(age) < 0.0:
+            return False
+
+    if not _is_unit(
+        cognitive.get("min_accessibility")
+    ):
+        return False
+
+    if not _is_unit(
+        cognitive.get("min_salience")
+    ):
+        return False
+
+    if not _is_bool(
+        cognitive.get(
+            "would_suppress_if_supplementary"
+        )
+    ):
+        return False
+
+    if not _is_bool(
+        cognitive.get("would_keep_if_supplementary")
+    ):
+        return False
+
+    if not _is_nonneg_int(
+        cognitive.get("invalid_event_count")
+    ):
+        return False
+
+    if cognitive.get(
+        "counterfactual_gate_decision"
+    ) not in _KNOWN_COUNTERFACTUAL_DECISIONS:
+        return False
+
+    if cognitive.get(
+        "effective_live_gate_decision"
+    ) not in _KNOWN_LIVE_GATE_DECISIONS:
+        return False
+
+    lifecycle_numeric = (
+        "strength",
+        "accessibility",
+        "salience",
+        "age_since_last_used_hours",
+    )
+
+    if observed is False:
+        for name in lifecycle_numeric:
+            if cognitive.get(name) is not None:
+                return False
+
+        if (
+            cognitive.get(
+                "would_suppress_if_supplementary"
+            )
+            is not False
+        ):
+            return False
+
+    if observed is True:
+        if cognitive.get("use_count", 0) <= 0:
+            return False
+
+        for name in (
+            "strength",
+            "accessibility",
+            "salience",
+        ):
+            if cognitive.get(name) is None:
+                return False
+
+    return True
+
+
+def _valid_binding_row(binding: Any) -> bool:
+    if not isinstance(binding, dict):
+        return False
+
+    unified_admitted = binding.get(
+        "unified_admitted"
+    )
+
+    if (
+        unified_admitted is not None
+        and not _is_bool(unified_admitted)
+    ):
+        return False
+
+    base_policy_available = binding.get(
+        "base_policy_available"
+    )
+
+    if not _is_bool(base_policy_available):
+        return False
+
+    eligible = binding.get(
+        "base_surfacing_eligible"
+    )
+
+    if eligible is not None and not _is_bool(
+        eligible
+    ):
+        return False
+
+    rank = binding.get("base_eligible_rank")
+
+    if rank is not None and not _is_nonneg_int(rank):
+        return False
+
+    if base_policy_available is False:
+        if eligible is not None or rank is not None:
+            return False
+    else:
+        if not _is_bool(eligible):
+            return False
+
+        if eligible is False and rank is not None:
+            return False
+
+        if eligible is True and rank is None:
+            return False
+
+    return True
+
+
+def _valid_candidate_row(row: Any) -> bool:
+    if not isinstance(row, dict):
+        return False
+
+    if not _is_nonneg_int(row.get("retrieval_index")):
+        return False
+
+    comparison = row.get("comparison")
+
+    if not isinstance(comparison, dict):
+        return False
+
+    category = comparison.get("category")
+
+    if category not in _KNOWN_COMPARISON_CATEGORIES:
+        return False
+
+    fingerprint = row.get("candidate_fingerprint")
+    key = row.get("memory_key")
+
+    if fingerprint is None:
+        # Only the exact binding-unavailable shape may omit identity.
+        if key is not None:
+            return False
+
+        if category != _CAT_BINDING_UNAVAILABLE:
+            return False
+    else:
+        if not _is_sha256(fingerprint):
+            return False
+
+        if not _is_sha256(key):
+            return False
+
+    if not _valid_binding_row(row.get("binding")):
+        return False
+
+    if not _valid_legacy_row(row.get("legacy")):
+        return False
+
+    if not _valid_cognitive_row(
+        row.get("cognitive")
+    ):
+        return False
+
+    return True
+
+
+def is_valid_lifecycle_comparison_artifact(
+    artifact: Any,
+) -> bool:
+    """The single authoritative v1 comparison-artifact validator.
+
+    A complete, structurally sound ``memory-lifecycle-comparison-shadow.v1``
+    artifact is valid; anything else (wrong version / mode, malformed
+    identity, non-finite numbers, an inconsistent binding or
+    cognitive tri-state, an unknown category or gate decision, or one
+    malformed row among otherwise valid rows) is INVALID as a whole.
+    Future / newer versions are unsupported for this v1 reporter and are
+    therefore invalid -- they are never partially interpreted.
+    """
+
+    if not isinstance(artifact, dict):
+        return False
+
+    if artifact.get("version") != VERSION:
+        return False
+
+    if artifact.get("mode") != MODE:
+        return False
+
+    if not is_valid_conversation_id(
+        artifact.get("conversation_id")
+    ):
+        return False
+
+    if not is_valid_cognitive_request_id(
+        artifact.get("cognitive_request_id")
+    ):
+        return False
+
+    if not is_valid_revision(
+        artifact.get("source_unified_revision")
+    ):
+        return False
+
+    if parse_iso_utc(artifact.get("created_at")) is None:
+        return False
+
+    if not _is_bool(
+        artifact.get("live_lifecycle_gate_active")
+    ):
+        return False
+
+    if not _is_bool(
+        artifact.get("observation_truncated")
+    ):
+        return False
+
+    if not _is_nonneg_int(
+        artifact.get("observation_truncated_count")
+    ):
+        return False
+
+    if not isinstance(artifact.get("metrics"), dict):
+        return False
+
+    candidates = artifact.get("candidates")
+
+    if not isinstance(candidates, list):
+        return False
+
+    if len(candidates) > MAX_COMPARISON_ROWS:
+        return False
+
+    for row in candidates:
+        if not _valid_candidate_row(row):
+            return False
+
+    return True
 
 
 # ------------------------------------------------------------------
