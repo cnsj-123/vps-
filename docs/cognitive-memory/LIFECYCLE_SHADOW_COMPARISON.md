@@ -59,7 +59,9 @@ Each retained candidate is bound by:
 A memory id alone is **not** used to align the planes: the same id may appear
 twice. If no truthful binding to this request's Unified snapshot can be
 established, the candidate is recorded with category `binding_unavailable` and a
-**null** binding triple — the comparison never guesses.
+**null** binding quadruple — the comparison never guesses. Likewise, if the Base
+Surfacing Policy cannot be validly bound to this request (see §8.1), base
+eligibility is recorded as **UNKNOWN** (`null`), never as "not eligible".
 
 ---
 
@@ -99,12 +101,13 @@ supplementary evaluator the live gate uses
 
 Per candidate it records:
 
-- `observed`
+- `available`, `observed` (tri-state, see §5)
 - `use_count`, `strength`, `accessibility`, `salience`,
   `age_since_last_used_hours`
 - `min_accessibility`, `min_salience`
 - `would_suppress_if_supplementary`, `would_keep_if_supplementary`
-- `effective_gate_decision`
+- `counterfactual_gate_decision` (what the gate policy *would* decide)
+- `effective_live_gate_decision` (the actual current participation)
 - `invalid_event_count`
 
 If valid `used` events exist, values come from the real derived-state helpers
@@ -114,19 +117,54 @@ lifecycle event, state snapshot, reinforcement receipt or `used` evidence.
 
 ---
 
-## 5. Unobserved neutrality
+## 5. Cognitive tri-state — unobserved != evidence unavailable
 
 ```
-unobserved != forgotten
+unobserved != forgotten        (neutral, not suppressed)
+unobserved != unavailable      (neutral is not a failed read)
 ```
+
+The Cognitive side is **tri-state** and the two non-observed states are kept
+**strictly separate**:
+
+```
+available=true,  observed=true   valid Used history was observed
+available=true,  observed=false  evidence read OK, no valid Used history
+                                 => neutral_unobserved
+available=false, observed=null   evidence could not be evaluated
+                                 => cognitive_evidence_unavailable
+```
+
+An **unavailable** result is **never** represented as `observed=false`. When the
+cognitive evidence is unavailable, `strength` / `accessibility` / `salience` /
+`age_since_last_used_hours` are all `null` and
+`would_suppress_if_supplementary` is `false` (never fabricated).
 
 A memory with **no valid** `used` lifecycle event is **neutral**. The comparison
 never fabricates `strength = 0`, `accessibility = 0`, `forgotten = true` or
 `would_suppress = true` for it. Invalid lifecycle event files increment
 `invalid_event_count` and **fail neutral** — they never turn a memory into
 "suppressed". Cold start therefore never looks like a disagreement.
-`cognitive_neutral_unobserved_count` counts these candidates separately from
-genuine cognitive suppression.
+
+The request metrics and the aggregate reporter agree, and the three
+representation counts partition the rows for which a Cognitive evaluation was
+attempted and represented:
+
+```
+cognitive_observed_count
+  + cognitive_neutral_unobserved_count
+  + cognitive_evidence_unavailable_count
+  == cognitive_represented_count
+```
+
+- `cognitive_neutral_unobserved_count` counts **only**
+  `available=true AND observed=false`. It must **not** count
+  `cognitive_evidence_unavailable`, `binding_unavailable`, malformed rows or a
+  failed evaluator.
+- `cognitive_evidence_unavailable_count` counts `available=false`.
+- `binding_unavailable` rows (no usable identity) are the **documented
+  exclusion**: they are counted zero times in all three, so an unknown identity
+  never inflates `evidence_unavailable` either.
 
 ---
 
@@ -156,7 +194,7 @@ or will be archived.
 
 ---
 
-## 8. Request-local binding
+## 8. Request-local binding (strict)
 
 The artifact is **request-scoped** and bound to `conversation_id`,
 `cognitive_request_id` and `source_unified_revision`. It consumes **this
@@ -165,6 +203,33 @@ conversation-global file `unified_context_candidate/{conversation_id}.json` to
 reconstruct current-request authority, because a concurrent request on the same
 conversation may overwrite that file at any time (see `ARCHITECTURE_STATUS.md`
 §0.2).
+
+The request-local Unified binding is **strict**: the snapshot's Unified must
+carry the **same** `version`, the **same** `conversation_id` **and** the
+**same** `revision` as the request. A foreign Unified — **even one carrying the
+same numeric revision** — is never request-local authority. In that case the
+observer writes **nothing** (`reason = unified_binding_invalid`) and **never**
+falls back to a shared latest file or a global policy file. This failure is
+fail-open for the **live request** and fail-closed for **evidence** only.
+
+### 8.1 Base Surfacing Policy binding is strict too
+
+The Base Surfacing Policy passed to the comparison is validated the same way. If
+it is missing, malformed, from another conversation, bound to another Unified
+revision, or its `decision` / `eligible` shape is not a valid policy shape, then
+`base_policy_available = false` and base eligibility is **UNKNOWN**:
+
+- `binding.base_surfacing_eligible = null` and `binding.base_eligible_rank = null`;
+- the counterfactual decision is `base_policy_unavailable` (never
+  `not_base_eligible`).
+
+A **missing** policy is therefore **not** the same as a policy that evaluated and
+decided `no_surface`. Only a genuinely bound `no_surface` policy means "not
+eligible" (`base_policy_available = true`,
+`base_surfacing_eligible = false`, `base_eligible_rank = null`,
+`counterfactual_gate_decision = not_base_eligible`).
+
+A conversation-global policy file is **never** consulted as a substitute.
 
 Storage layout:
 
@@ -221,19 +286,31 @@ legacy_keep_cognitive_keep
 
 `cognitive_unobserved` is **its own concept** and is never called
 "cognitive_keep" without that qualification. Each candidate also records a
-`binding` triple (`unified_admitted`, `base_surfacing_eligible`,
-`base_eligible_rank`; all `null` when binding is unavailable) and an
-`effective_gate_decision`, which distinguishes the **counterfactual** bucket
-(`would_suppress_if_supplementary`) from the **effective current gate effect**:
+`binding` quadruple (`unified_admitted`, `base_policy_available`,
+`base_surfacing_eligible`, `base_eligible_rank`; the eligibility/rank fields are
+`null` when binding or the base policy is unavailable) and **two** gate fields
+that separate the **counterfactual** from the **actual current participation**:
+
+`counterfactual_gate_decision` — what the current gate policy **would** decide if
+applied (computed regardless of the live flag):
 
 ```
 primary_preserved | neutral_unobserved | would_keep | would_suppress |
-not_base_eligible | binding_unavailable
+not_base_eligible | base_policy_unavailable | binding_unavailable |
+cognitive_evidence_unavailable
 ```
+
+`effective_live_gate_decision` — the actual current participation. When the live
+Lifecycle Surfacing gate is **not** active under its required flags, this is
+`gate_disabled`; when it is active, it equals the counterfactual decision. The
+artifact also records the artifact-level boolean `live_lifecycle_gate_active`
+(`lifecycle_surfacing_enabled() AND lifecycle_shadow_enabled()`), so a
+counterfactual suppression is **never** labelled an actual live effect while the
+gate is disabled.
 
 The existing Lifecycle Surfacing gate **never suppresses the first base-eligible
 candidate**. So a primary candidate may show
-`would_suppress_if_supplementary = true` while its effective decision is
+`would_suppress_if_supplementary = true` while its counterfactual decision is
 `primary_preserved`. That is **not** a contradiction; it is the primary
 preservation rule made explicit.
 
@@ -268,7 +345,8 @@ A read-only aggregate reporter summarises many request-scoped artifacts:
 PYTHONPATH=src python -m ombrebrain.maintenance.lifecycle_comparison_report --limit 100 --json
 ```
 
-- `--limit N` bounds how many artifacts are scanned (default `500`).
+- `--limit N` bounds how many artifacts are scanned (default `500`); a negative
+  limit is clamped to `0` (it never becomes "scan everything").
 - `--json` prints the aggregate as JSON; without it a human-readable summary is
   printed.
 - It writes / creates / moves / deletes **nothing** — not even a malformed
@@ -276,11 +354,19 @@ PYTHONPATH=src python -m ombrebrain.maintenance.lifecycle_comparison_report --li
 - It emits **only aggregate statistics and finite numbers**: no
   `conversation_id`, `cognitive_request_id`, `memory_key`, `candidate_fingerprint`,
   raw memory id, text, name, query or cue.
-- A malformed artifact only increments `invalid_artifact_count` and is skipped
-  from numeric analysis; it never crashes the report.
-- Output is deterministically ordered and reports category counts, effective-gate
-  decision counts, bounded percentile distributions, and tolerant counts (an
-  artifact from a newer version is counted, never silently dropped).
+- It validates each artifact with the **same authoritative v1 validator** the
+  writer uses (`is_valid_lifecycle_comparison_artifact`). An artifact that fails
+  validation — wrong version/mode, malformed identity, `NaN` / `Infinity`, an
+  inconsistent binding or Cognitive tri-state, an unknown category or gate
+  decision, or **one** malformed row among otherwise valid rows — is counted as
+  **invalid as a whole** and contributes **zero** to every statistic. A malformed
+  row is never silently skipped inside a "valid" artifact.
+- Output is deterministically ordered and reports category counts, **separate**
+  `counterfactual_gate_decision_counts` and `live_gate_decision_counts`, bounded
+  percentile distributions, and the explicit
+  `legacy_auto_resolve_changed_archive_outcome_count` (with its `created` /
+  `removed` directions) alongside the counts and the representation invariant
+  from §5.
 
 The reporter is a maintenance / research tool, not a runtime authority. It creates
 no database, no rolling global aggregate and no runtime accumulator.
@@ -306,6 +392,9 @@ no database, no rolling global aggregate and no runtime accumulator.
 
 This experiment may produce evidence such as:
 
+- how often a successful Legacy auto-resolve would **change** the archive outcome
+  (`legacy_auto_resolve_changed_archive_outcome_count`, with `created` /
+  `removed` directions);
 - how often a `nominal_archive_candidate` is simultaneously a
   `would_suppress_if_supplementary` candidate (`both_archive_and_suppress_count`);
 - how often Legacy would archive while Cognitive has **no** evidence

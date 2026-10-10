@@ -414,16 +414,21 @@ def _base_policy_binding(
     ):
         return False, None
 
-    if (
-        base_policy.get("decision")
-        != _ALLOW_DECISION
-    ):
+    decision = base_policy.get("decision")
+
+    if not isinstance(decision, str):
+        # A malformed decision is UNKNOWN, never "not eligible".
+        return False, None
+
+    if decision != _ALLOW_DECISION:
         return True, []
 
     eligible = base_policy.get("eligible")
 
     if not isinstance(eligible, list):
-        return True, []
+        # A valid allow_shadow policy always carries an eligible list;
+        # anything else is malformed, so eligibility is UNKNOWN.
+        return False, None
 
     return True, eligible
 

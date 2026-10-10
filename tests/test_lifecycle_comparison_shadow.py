@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import contextlib
 import io
 import json
@@ -36,6 +37,7 @@ from ombrebrain.context.memory_lifecycle_comparison_shadow import (
     bind_legacy_lifecycle_comparison_engine,
     build_lifecycle_comparison_artifact,
     capture_legacy_lifecycle_observations,
+    is_valid_lifecycle_comparison_artifact,
     legacy_comparison_engine_bound,
     lifecycle_comparison_enabled,
     log_lifecycle_comparison_report,
@@ -2157,6 +2159,1521 @@ class PipelineCompositionTests(
             )
 
         self.assertEqual(after, baseline)
+
+
+# ------------------------------------------------------------------
+# Review fixes: base-policy / unified binding, tri-state, validator,
+# gate semantics, auto-resolve outcome metric, interleaving, bounds.
+# ------------------------------------------------------------------
+
+_UNSET = object()
+
+_OTHER_CID = "ctx_fedcba9876543210"
+
+
+def _build_artifact(
+    *,
+    candidates,
+    observations,
+    eligible=None,
+    base_policy=_UNSET,
+    revision=5,
+    unified_candidates=None,
+    unified_conversation=CID,
+    retrieval_candidate_count=None,
+):
+    if base_policy is _UNSET:
+        base_policy = eligible_policy(
+            eligible if eligible is not None else [],
+            source_unified_revision=revision,
+        )
+
+    return build_lifecycle_comparison_artifact(
+        conversation_id=CID,
+        cognitive_request_id=RID,
+        source_unified_revision=revision,
+        unified={
+            "version": "unified-context-candidate.v1",
+            "conversation_id": unified_conversation,
+            "revision": revision,
+            "sections": {
+                "memories": (
+                    unified_candidates
+                    if unified_candidates is not None
+                    else candidates
+                )
+            },
+        },
+        base_policy=base_policy,
+        legacy_observations=observations,
+        retrieval_candidate_count=(
+            retrieval_candidate_count
+            if retrieval_candidate_count is not None
+            else len(observations)
+        ),
+        as_of=T0,
+    )
+
+
+class BasePolicyBindingTests(_EngineBoundTestCase):
+    """Review §2/§13: a missing / foreign / malformed Base Policy is
+    UNKNOWN, never 'not eligible', and no conversation-global policy
+    file is ever consulted."""
+
+    def _row(
+        self, base_policy, *, revision=5
+    ):
+        candidates = [candidate(_A)]
+
+        engine = SpyDecayEngine([_preview()])
+        bind_legacy_lifecycle_comparison_engine(engine)
+
+        observations = (
+            capture_legacy_lifecycle_observations(
+                candidates
+            )
+        )
+
+        artifact = _build_artifact(
+            candidates=candidates,
+            observations=observations,
+            base_policy=base_policy,
+            revision=revision,
+        )
+
+        return artifact["candidates"][0]
+
+    def _assert_unknown(self, row):
+        binding = row["binding"]
+
+        self.assertIs(
+            binding["base_policy_available"], False
+        )
+        self.assertIsNone(
+            binding["base_surfacing_eligible"]
+        )
+        self.assertIsNone(binding["base_eligible_rank"])
+        self.assertEqual(
+            row["cognitive"][
+                "counterfactual_gate_decision"
+            ],
+            "base_policy_unavailable",
+        )
+        # Absence never overwrites the legitimate comparison category.
+        self.assertEqual(
+            row["comparison"]["category"],
+            "legacy_keep_cognitive_unobserved",
+        )
+
+    def test_absent_policy_is_unknown_not_ineligible(self):
+        self._assert_unknown(self._row(None))
+
+    def test_malformed_policy_is_unknown(self):
+        for bad in (
+            [],
+            "nope",
+            3,
+            True,
+            {"version": "memory-surfacing-policy.v1"},
+        ):
+            with self.subTest(bad=bad):
+                self._assert_unknown(self._row(bad))
+
+    def test_foreign_conversation_same_revision_is_unknown(
+        self,
+    ):
+        self._assert_unknown(
+            self._row(
+                eligible_policy(
+                    [candidate(_A)],
+                    conversation_id=_OTHER_CID,
+                )
+            )
+        )
+
+    def test_stale_revision_is_unknown(self):
+        self._assert_unknown(
+            self._row(
+                eligible_policy(
+                    [candidate(_A)],
+                    source_unified_revision=4,
+                )
+            )
+        )
+
+    def test_future_revision_is_unknown(self):
+        self._assert_unknown(
+            self._row(
+                eligible_policy(
+                    [candidate(_A)],
+                    source_unified_revision=6,
+                )
+            )
+        )
+
+    def test_wrong_version_is_unknown(self):
+        self._assert_unknown(
+            self._row(
+                eligible_policy(
+                    [candidate(_A)],
+                    version="memory-surfacing-policy.v2",
+                )
+            )
+        )
+
+    def test_wrong_mode_is_unknown(self):
+        self._assert_unknown(
+            self._row(
+                eligible_policy(
+                    [candidate(_A)], mode="live"
+                )
+            )
+        )
+
+    def test_non_dict_eligible_list_is_unknown(self):
+        policy = eligible_policy([candidate(_A)])
+        policy["eligible"] = "not-a-list"
+        self._assert_unknown(self._row(policy))
+
+    def test_valid_bound_no_surface_is_not_eligible(self):
+        row = self._row(
+            eligible_policy(
+                [candidate(_A)], decision="no_surface"
+            )
+        )
+
+        binding = row["binding"]
+
+        self.assertIs(
+            binding["base_policy_available"], True
+        )
+        self.assertIs(
+            binding["base_surfacing_eligible"], False
+        )
+        self.assertIsNone(binding["base_eligible_rank"])
+        self.assertEqual(
+            row["cognitive"][
+                "counterfactual_gate_decision"
+            ],
+            "not_base_eligible",
+        )
+
+    def test_no_conversation_global_policy_file_consulted(
+        self,
+    ):
+        candidates = [candidate(_A)]
+
+        engine = SpyDecayEngine([_preview()])
+        bind_legacy_lifecycle_comparison_engine(engine)
+
+        observations = (
+            capture_legacy_lifecycle_observations(
+                candidates
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as root:
+            with state_env(root):
+                # A conversation-global policy file exists and marks
+                # the candidate eligible -- it must be ignored.
+                global_dir = (
+                    Path(root)
+                    / "memory_surfacing_policy"
+                )
+                global_dir.mkdir(
+                    parents=True, exist_ok=True
+                )
+                (global_dir / (CID + ".json")).write_text(
+                    json.dumps(
+                        eligible_policy(candidates)
+                    ),
+                    encoding="utf-8",
+                )
+
+                artifact = _build_artifact(
+                    candidates=candidates,
+                    observations=observations,
+                    base_policy=None,
+                )
+
+        self._assert_unknown(
+            artifact["candidates"][0]
+        )
+
+
+class UnifiedBindingTests(_EngineBoundTestCase):
+    """Review §3: a foreign request-local Unified -- even with the SAME
+    numeric revision -- is never request-local authority, and no shared
+    'latest' file is ever read as a fallback."""
+
+    def test_builder_marks_foreign_unified_binding_unavailable(
+        self,
+    ):
+        candidates = [candidate(_A)]
+
+        engine = SpyDecayEngine([_preview()])
+        bind_legacy_lifecycle_comparison_engine(engine)
+
+        observations = (
+            capture_legacy_lifecycle_observations(
+                candidates
+            )
+        )
+
+        artifact = _build_artifact(
+            candidates=candidates,
+            observations=observations,
+            eligible=candidates,
+            unified_conversation=_OTHER_CID,
+        )
+
+        row = artifact["candidates"][0]
+
+        self.assertIsNone(
+            row["binding"]["unified_admitted"]
+        )
+        self.assertEqual(
+            row["comparison"]["category"],
+            "binding_unavailable",
+        )
+
+    def test_foreign_unified_same_revision_writes_nothing(
+        self,
+    ):
+        candidates = [candidate(_A)]
+
+        engine = SpyDecayEngine([_preview()])
+        bind_legacy_lifecycle_comparison_engine(engine)
+
+        observations = (
+            capture_legacy_lifecycle_observations(
+                candidates
+            )
+        )
+
+        # Hand-built snapshot: request-local conversation CID but a
+        # Unified bound to a FOREIGN conversation at the same revision.
+        snapshot = {
+            "version": "memory-shadow-snapshot.v1",
+            "mode": "shadow_only",
+            "conversation_id": CID,
+            "revision": 5,
+            "unified": {
+                "version":
+                    "unified-context-candidate.v1",
+                "conversation_id": _OTHER_CID,
+                "revision": 5,
+                "sections": {"memories": candidates},
+            },
+            "evidence": [],
+            "legacy_lifecycle_observations":
+                observations,
+        }
+
+        with tempfile.TemporaryDirectory() as root:
+            with state_env(root):
+                report = update_memory_lifecycle_comparison(
+                    conversation_id=CID,
+                    cognitive_request_id=RID,
+                    snapshot=snapshot,
+                    expected_unified_revision=5,
+                    base_policy=eligible_policy(
+                        candidates
+                    ),
+                )
+
+            self.assertFalse(report["stored"])
+            self.assertEqual(
+                report["reason"],
+                "unified_binding_invalid",
+            )
+            self.assertFalse(
+                (
+                    Path(root)
+                    / "memory_lifecycle_comparison"
+                ).exists()
+            )
+
+    def test_shared_latest_unified_file_is_ignored(
+        self,
+    ):
+        candidates = [candidate(_A)]
+
+        engine = SpyDecayEngine([_preview()])
+        bind_legacy_lifecycle_comparison_engine(engine)
+
+        observations = (
+            capture_legacy_lifecycle_observations(
+                candidates
+            )
+        )
+
+        snapshot = {
+            "version": "memory-shadow-snapshot.v1",
+            "mode": "shadow_only",
+            "conversation_id": CID,
+            "revision": 5,
+            "unified": {
+                "version":
+                    "unified-context-candidate.v1",
+                "conversation_id": _OTHER_CID,
+                "revision": 5,
+                "sections": {"memories": candidates},
+            },
+            "evidence": [],
+            "legacy_lifecycle_observations":
+                observations,
+        }
+
+        with tempfile.TemporaryDirectory() as root:
+            with state_env(root):
+                # A shared conversation-global Unified file for CID
+                # exists (as a concurrent request would have written).
+                unified_dir = (
+                    Path(root)
+                    / "unified_context_candidate"
+                )
+                unified_dir.mkdir(
+                    parents=True, exist_ok=True
+                )
+                (unified_dir / (CID + ".json")).write_text(
+                    json.dumps(
+                        snapshot["unified"]
+                    ),
+                    encoding="utf-8",
+                )
+
+                report = update_memory_lifecycle_comparison(
+                    conversation_id=CID,
+                    cognitive_request_id=RID,
+                    snapshot=snapshot,
+                    expected_unified_revision=5,
+                    base_policy=eligible_policy(
+                        candidates
+                    ),
+                )
+
+            self.assertFalse(report["stored"])
+            self.assertEqual(
+                report["reason"],
+                "unified_binding_invalid",
+            )
+
+
+class CognitiveTriStateTests(_EngineBoundTestCase):
+    """Review §4/§5: unobserved != evidence unavailable, and the three
+    representation counts partition the evaluated rows."""
+
+    def test_unavailable_is_not_neutral(self):
+        # Two candidates: the primary is preserved regardless, so the
+        # observable "evidence unavailable" counterfactual is the
+        # supplementary (rank 1) candidate.
+        candidates = [candidate(_A), candidate(_B)]
+
+        engine = SpyDecayEngine(
+            [_preview(), _preview()]
+        )
+        bind_legacy_lifecycle_comparison_engine(engine)
+
+        observations = (
+            capture_legacy_lifecycle_observations(
+                candidates
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as root:
+            with state_env(root):
+                with patch(
+                    "ombrebrain.context."
+                    "memory_lifecycle_comparison_shadow."
+                    "evaluate_lifecycle_surfacing_candidate",
+                    side_effect=RuntimeError("boom"),
+                ):
+                    artifact = _build_artifact(
+                        candidates=candidates,
+                        observations=observations,
+                        eligible=candidates,
+                    )
+
+        row = artifact["candidates"][0]
+        cognitive = row["cognitive"]
+
+        self.assertIs(cognitive["available"], False)
+        self.assertIsNone(cognitive["observed"])
+        self.assertIsNone(cognitive["strength"])
+        self.assertIsNone(cognitive["accessibility"])
+        self.assertIsNone(cognitive["salience"])
+        self.assertIs(
+            cognitive[
+                "would_suppress_if_supplementary"
+            ],
+            False,
+        )
+        self.assertEqual(
+            row["comparison"]["category"],
+            "cognitive_evidence_unavailable",
+        )
+
+        # The primary is preserved; the supplementary candidate's
+        # counterfactual is explicitly "evidence unavailable".
+        self.assertEqual(
+            row["cognitive"][
+                "counterfactual_gate_decision"
+            ],
+            "primary_preserved",
+        )
+        self.assertEqual(
+            artifact["candidates"][1]["cognitive"][
+                "counterfactual_gate_decision"
+            ],
+            "cognitive_evidence_unavailable",
+        )
+        self.assertEqual(
+            artifact["candidates"][1]["comparison"][
+                "category"
+            ],
+            "cognitive_evidence_unavailable",
+        )
+
+        metrics = artifact["metrics"]
+
+        self.assertEqual(
+            metrics[
+                "cognitive_evidence_unavailable_count"
+            ],
+            2,
+        )
+        self.assertEqual(
+            metrics["cognitive_neutral_unobserved_count"],
+            0,
+        )
+        self.assertEqual(
+            metrics["cognitive_observed_count"], 0
+        )
+
+    def test_observed_and_neutral_are_counted_separately(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as root:
+            # _B observed and kept; _C observed and dormant; _A neutral.
+            record_use(root, _B, used_at=T0)
+            record_use(
+                root, _C, used_at=T0 - hours(500)
+            )
+
+            candidates = [
+                candidate(_A),
+                candidate(_B),
+                candidate(_C),
+            ]
+
+            engine = SpyDecayEngine(
+                [_preview(), _preview(), _preview()]
+            )
+            bind_legacy_lifecycle_comparison_engine(engine)
+
+            observations = (
+                capture_legacy_lifecycle_observations(
+                    candidates
+                )
+            )
+
+            with state_env(root):
+                artifact = _build_artifact(
+                    candidates=candidates,
+                    observations=observations,
+                    eligible=candidates,
+                )
+
+        metrics = artifact["metrics"]
+
+        self.assertEqual(
+            metrics["cognitive_observed_count"], 2
+        )
+        self.assertEqual(
+            metrics["cognitive_neutral_unobserved_count"],
+            1,
+        )
+        self.assertEqual(
+            metrics[
+                "cognitive_evidence_unavailable_count"
+            ],
+            0,
+        )
+        self.assertEqual(
+            metrics["cognitive_represented_count"], 3
+        )
+        self.assertEqual(
+            metrics["cognitive_observed_count"]
+            + metrics[
+                "cognitive_neutral_unobserved_count"
+            ]
+            + metrics[
+                "cognitive_evidence_unavailable_count"
+            ],
+            metrics["cognitive_represented_count"],
+        )
+
+    def test_binding_unavailable_excluded_from_all_three(
+        self,
+    ):
+        # A candidate with no usable identity: it must not inflate
+        # evidence_unavailable, neutral OR observed.
+        candidates = [{"content": "no identity here"}]
+
+        engine = SpyDecayEngine([_preview()])
+        bind_legacy_lifecycle_comparison_engine(engine)
+
+        observations = (
+            capture_legacy_lifecycle_observations(
+                candidates
+            )
+        )
+
+        artifact = _build_artifact(
+            candidates=candidates,
+            observations=observations,
+            eligible=candidates,
+        )
+
+        row = artifact["candidates"][0]
+
+        self.assertEqual(
+            row["comparison"]["category"],
+            "binding_unavailable",
+        )
+        self.assertIsNone(row["memory_key"])
+        self.assertIsNone(
+            row["candidate_fingerprint"]
+        )
+
+        metrics = artifact["metrics"]
+
+        self.assertEqual(
+            metrics["cognitive_represented_count"], 0
+        )
+        self.assertEqual(
+            metrics["cognitive_observed_count"], 0
+        )
+        self.assertEqual(
+            metrics["cognitive_neutral_unobserved_count"],
+            0,
+        )
+        self.assertEqual(
+            metrics[
+                "cognitive_evidence_unavailable_count"
+            ],
+            0,
+        )
+
+
+class ArtifactValidatorTests(unittest.TestCase):
+    """Review §6/§8: one authoritative validator, reject-by-whole."""
+
+    def _valid(self):
+        return _artifact(
+            [
+                _report_row(
+                    "legacy_keep_cognitive_keep"
+                )
+            ]
+        )
+
+    def test_valid_artifact_passes(self):
+        self.assertTrue(
+            is_valid_lifecycle_comparison_artifact(
+                self._valid()
+            )
+        )
+
+    def test_reports_are_valid(self):
+        # The builder output in the reporter fixtures must satisfy the
+        # same validator the writer uses.
+        with tempfile.TemporaryDirectory() as root:
+            _write_artifact(
+                root,
+                CID,
+                RID,
+                self._valid(),
+            )
+
+            report = reporter.build_report(root=root)
+
+        self.assertEqual(report["valid_artifact_count"], 1)
+        self.assertEqual(report["invalid_artifact_count"], 0)
+
+    def test_nan_and_infinity_rejected(self):
+        for bad in (
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+        ):
+            with self.subTest(bad=bad):
+                artifact = self._valid()
+                artifact["candidates"][0]["legacy"][
+                    "score_current"
+                ] = bad
+
+                self.assertFalse(
+                    is_valid_lifecycle_comparison_artifact(
+                        artifact
+                    )
+                )
+
+    def test_invalid_identifiers_rejected(self):
+        cases = {
+            "version": "memory-lifecycle-comparison-shadow.v2",
+            "mode": "live",
+            "conversation_id": "nope",
+            "cognitive_request_id": "nope",
+            "source_unified_revision": -1,
+            "created_at": "not-a-time",
+            "live_lifecycle_gate_active": "yes",
+            "observation_truncated": 1,
+            "observation_truncated_count": -1,
+            "metrics": [],
+            "candidates": {},
+        }
+
+        for key, value in cases.items():
+            with self.subTest(key=key):
+                artifact = self._valid()
+                artifact[key] = value
+
+                self.assertFalse(
+                    is_valid_lifecycle_comparison_artifact(
+                        artifact
+                    )
+                )
+
+    def test_malformed_identity_rejected(self):
+        for field, value in (
+            ("memory_key", "k" * 64),
+            ("memory_key", "deadbeef"),
+            ("candidate_fingerprint", "Z" * 64),
+            ("candidate_fingerprint", None),
+        ):
+            with self.subTest(field=field, value=value):
+                artifact = self._valid()
+                artifact["candidates"][0][field] = value
+
+                self.assertFalse(
+                    is_valid_lifecycle_comparison_artifact(
+                        artifact
+                    )
+                )
+
+    def test_wrong_binding_types_rejected(self):
+        eco = self._valid()["candidates"][0][
+            "binding"
+        ]
+
+        for mutation in (
+            {"base_policy_available": "yes"},
+            {
+                "base_policy_available": False,
+                "base_surfacing_eligible": True,
+            },
+            {
+                "base_policy_available": True,
+                "base_surfacing_eligible": True,
+                "base_eligible_rank": None,
+            },
+            {
+                "base_policy_available": True,
+                "base_surfacing_eligible": False,
+                "base_eligible_rank": 0,
+            },
+            {"base_eligible_rank": -1},
+        ):
+            with self.subTest(mutation=mutation):
+                artifact = self._valid()
+                artifact["candidates"][0][
+                    "binding"
+                ].update(mutation)
+
+                self.assertFalse(
+                    is_valid_lifecycle_comparison_artifact(
+                        artifact
+                    )
+                )
+
+        # Sanity: the untouched binding is valid.
+        artifact = self._valid()
+        artifact["candidates"][0]["binding"] = (
+            dict(eco)
+        )
+
+        self.assertTrue(
+            is_valid_lifecycle_comparison_artifact(
+                artifact
+            )
+        )
+
+    def test_tri_state_violations_rejected(self):
+        for mutation in (
+            {"available": False, "observed": False},
+            {"available": True, "observed": None},
+            {"observed": True, "use_count": 0},
+            {
+                "observed": False,
+                "strength": 0.5,
+            },
+        ):
+            with self.subTest(mutation=mutation):
+                base = _report_row(
+                    "legacy_keep_cognitive_keep"
+                )
+
+                base["cognitive"].update(mutation)
+
+                # Keep a consistent category for this row.
+                artifact = _artifact([base])
+
+                self.assertFalse(
+                    is_valid_lifecycle_comparison_artifact(
+                        artifact
+                    )
+                )
+
+    def test_unknown_category_and_decision_rejected(self):
+        artifact = self._valid()
+        artifact["candidates"][0]["comparison"][
+            "category"
+        ] = "not_a_category"
+
+        self.assertFalse(
+            is_valid_lifecycle_comparison_artifact(
+                artifact
+            )
+        )
+
+        artifact = self._valid()
+        artifact["candidates"][0]["cognitive"][
+            "counterfactual_gate_decision"
+        ] = "not_a_decision"
+
+        self.assertFalse(
+            is_valid_lifecycle_comparison_artifact(
+                artifact
+            )
+        )
+
+        artifact = self._valid()
+        artifact["candidates"][0]["cognitive"][
+            "effective_live_gate_decision"
+        ] = "not_a_decision"
+
+        self.assertFalse(
+            is_valid_lifecycle_comparison_artifact(
+                artifact
+            )
+        )
+
+    def test_one_malformed_row_invalidates_the_whole(self):
+        artifact = _artifact(
+            [
+                _report_row(
+                    "legacy_keep_cognitive_keep"
+                ),
+                _report_row(
+                    "legacy_keep_cognitive_keep"
+                ),
+            ]
+        )
+
+        self.assertTrue(
+            is_valid_lifecycle_comparison_artifact(
+                artifact
+            )
+        )
+
+        artifact["candidates"][1]["comparison"][
+            "category"
+        ] = "bogus"
+
+        self.assertFalse(
+            is_valid_lifecycle_comparison_artifact(
+                artifact
+            )
+        )
+
+    def test_reporter_zeroes_a_partially_malformed_artifact(
+        self,
+    ):
+        good = _artifact(
+            [
+                _report_row(
+                    "legacy_keep_cognitive_keep"
+                ),
+                _report_row(
+                    "legacy_keep_cognitive_keep"
+                ),
+            ]
+        )
+
+        bad = _artifact(
+            [
+                _report_row(
+                    "legacy_keep_cognitive_keep"
+                ),
+                _report_row(
+                    "legacy_keep_cognitive_keep"
+                ),
+            ]
+        )
+
+        bad["candidates"][1]["comparison"][
+            "category"
+        ] = "bogus"
+
+        with tempfile.TemporaryDirectory() as root:
+            _write_artifact(root, CID, RID, good)
+            _write_artifact(
+                root,
+                CID,
+                "ctxreq_" + "1" * 32,
+                bad,
+            )
+
+            report = reporter.build_report(root=root)
+
+        self.assertEqual(report["artifact_count"], 2)
+        self.assertEqual(
+            report["valid_artifact_count"], 1
+        )
+        self.assertEqual(
+            report["invalid_artifact_count"], 1
+        )
+        # Only the valid artifact's rows contribute.
+        self.assertEqual(report["candidate_count"], 2)
+
+    def test_reporter_counts_nan_and_infinity_invalid(
+        self,
+    ):
+        nan = _artifact(
+            [_report_row("legacy_keep_cognitive_keep")]
+        )
+        nan["candidates"][0]["legacy"][
+            "score_current"
+        ] = float("nan")
+
+        inf = _artifact(
+            [_report_row("legacy_keep_cognitive_keep")]
+        )
+        inf["candidates"][0]["legacy"][
+            "score_current"
+        ] = float("inf")
+
+        with tempfile.TemporaryDirectory() as root:
+            _write_artifact(root, CID, RID, self._valid())
+            _write_artifact(
+                root,
+                CID,
+                "ctxreq_" + "2" * 32,
+                nan,
+            )
+            _write_artifact(
+                root,
+                CID,
+                "ctxreq_" + "3" * 32,
+                inf,
+            )
+
+            report = reporter.build_report(root=root)
+
+        self.assertEqual(report["artifact_count"], 3)
+        self.assertEqual(
+            report["valid_artifact_count"], 1
+        )
+        self.assertEqual(
+            report["invalid_artifact_count"], 2
+        )
+        self.assertEqual(report["candidate_count"], 1)
+        self.assertEqual(
+            report["distributions"][
+                "legacy_score_current"
+            ]["count"],
+            1,
+        )
+
+
+class ReporterBoundTests(unittest.TestCase):
+    """Review §16: a programmatic limit can never become unbounded."""
+
+    def test_negative_limit_scans_nothing(self):
+        with tempfile.TemporaryDirectory() as root:
+            _write_artifact(
+                root,
+                CID,
+                RID,
+                _artifact(
+                    [
+                        _report_row(
+                            "legacy_keep_cognitive_keep"
+                        )
+                    ]
+                ),
+            )
+
+            report = reporter.build_report(
+                root=root, limit=-1
+            )
+
+        self.assertEqual(report["artifact_count"], 0)
+        self.assertEqual(report["candidate_count"], 0)
+
+    def test_negative_limit_cli_scans_nothing(self):
+        with tempfile.TemporaryDirectory() as root:
+            _write_artifact(
+                root,
+                CID,
+                RID,
+                _artifact(
+                    [
+                        _report_row(
+                            "legacy_keep_cognitive_keep"
+                        )
+                    ]
+                ),
+            )
+
+            buffer = io.StringIO()
+
+            with contextlib.redirect_stdout(buffer):
+                code = reporter.main(
+                    [
+                        "--root",
+                        root,
+                        "--limit",
+                        "-5",
+                        "--json",
+                    ]
+                )
+
+        self.assertEqual(code, 0)
+
+        payload = json.loads(buffer.getvalue())
+
+        self.assertEqual(payload["artifact_count"], 0)
+
+
+class GateSemanticsTests(_EngineBoundTestCase):
+    """Review §9/§10: the counterfactual is preserved whether or not
+    the live gate participates, and live participation is captured."""
+
+    def _artifact(self):
+        with tempfile.TemporaryDirectory() as root:
+            record_use(
+                root, _B, used_at=T0 - hours(500)
+            )
+
+            candidates = [
+                candidate(_A),
+                candidate(_B),
+            ]
+
+            engine = SpyDecayEngine(
+                [_preview(), _preview()]
+            )
+            bind_legacy_lifecycle_comparison_engine(engine)
+
+            observations = (
+                capture_legacy_lifecycle_observations(
+                    candidates
+                )
+            )
+
+            with state_env(root):
+                return _build_artifact(
+                    candidates=candidates,
+                    observations=observations,
+                    eligible=candidates,
+                )
+
+    def test_gate_disabled_preserves_counterfactual(self):
+        artifact = self._artifact()
+
+        row = artifact["candidates"][1]
+
+        self.assertEqual(
+            row["cognitive"][
+                "counterfactual_gate_decision"
+            ],
+            "would_suppress",
+        )
+        self.assertEqual(
+            row["cognitive"][
+                "effective_live_gate_decision"
+            ],
+            "gate_disabled",
+        )
+        self.assertIs(
+            artifact["live_lifecycle_gate_active"],
+            False,
+        )
+
+    def test_gate_active_effective_matches_counterfactual(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as root:
+            record_use(
+                root, _B, used_at=T0 - hours(500)
+            )
+
+            candidates = [
+                candidate(_A),
+                candidate(_B),
+            ]
+
+            engine = SpyDecayEngine(
+                [_preview(), _preview()]
+            )
+            bind_legacy_lifecycle_comparison_engine(engine)
+
+            observations = (
+                capture_legacy_lifecycle_observations(
+                    candidates
+                )
+            )
+
+            with state_env(root):
+                with patch.dict(
+                    os.environ,
+                    {
+                        INTEGRATION_ENV: "1",
+                        "OMBRE_GATEWAY_MEMORY_"
+                        "LIFECYCLE_SHADOW": "1",
+                    },
+                    clear=False,
+                ):
+                    artifact = _build_artifact(
+                        candidates=candidates,
+                        observations=observations,
+                        eligible=candidates,
+                    )
+
+        self.assertIs(
+            artifact["live_lifecycle_gate_active"],
+            True,
+        )
+
+        row = artifact["candidates"][1]
+
+        self.assertEqual(
+            row["cognitive"][
+                "counterfactual_gate_decision"
+            ],
+            "would_suppress",
+        )
+        self.assertEqual(
+            row["cognitive"][
+                "effective_live_gate_decision"
+            ],
+            "would_suppress",
+        )
+
+
+class AutoResolveOutcomeMetricTests(_EngineBoundTestCase):
+    """Review §11: the legacy outcome-change metric is explicit."""
+
+    _CREATED = {
+        "applicable": True,
+        "skip_reason": None,
+        "current_resolved": False,
+        "auto_resolve_candidate": True,
+        "score_current": 0.2,
+        "score_if_auto_resolve_succeeds": 1.0,
+        "threshold": 0.3,
+        "archive_candidate_current": False,
+        "archive_candidate_after_auto_resolve_if_successful":
+            True,
+        "nominal_archive_candidate": False,
+    }
+
+    _REMOVED = {
+        "applicable": True,
+        "skip_reason": None,
+        "current_resolved": False,
+        "auto_resolve_candidate": True,
+        "score_current": 0.2,
+        "score_if_auto_resolve_succeeds": 1.0,
+        "threshold": 0.3,
+        "archive_candidate_current": True,
+        "archive_candidate_after_auto_resolve_if_successful":
+            False,
+        "nominal_archive_candidate": False,
+    }
+
+    def test_created_direction_counted(self):
+        candidates = [candidate(_A)]
+
+        engine = SpyDecayEngine([dict(self._CREATED)])
+        bind_legacy_lifecycle_comparison_engine(engine)
+
+        observations = (
+            capture_legacy_lifecycle_observations(
+                candidates
+            )
+        )
+
+        artifact = _build_artifact(
+            candidates=candidates,
+            observations=observations,
+            eligible=candidates,
+        )
+
+        metrics = artifact["metrics"]
+
+        self.assertEqual(
+            metrics[
+                "legacy_auto_resolve_changed_archive_outcome_count"
+            ],
+            1,
+        )
+        self.assertEqual(
+            metrics[
+                "legacy_auto_resolve_created_archive_candidate_count"
+            ],
+            1,
+        )
+        self.assertEqual(
+            metrics[
+                "legacy_auto_resolve_removed_archive_candidate_count"
+            ],
+            0,
+        )
+
+    def test_removed_direction_counted(self):
+        candidates = [candidate(_A)]
+
+        engine = SpyDecayEngine([dict(self._REMOVED)])
+        bind_legacy_lifecycle_comparison_engine(engine)
+
+        observations = (
+            capture_legacy_lifecycle_observations(
+                candidates
+            )
+        )
+
+        artifact = _build_artifact(
+            candidates=candidates,
+            observations=observations,
+            eligible=candidates,
+        )
+
+        metrics = artifact["metrics"]
+
+        self.assertEqual(
+            metrics[
+                "legacy_auto_resolve_changed_archive_outcome_count"
+            ],
+            1,
+        )
+        self.assertEqual(
+            metrics[
+                "legacy_auto_resolve_created_archive_candidate_count"
+            ],
+            0,
+        )
+        self.assertEqual(
+            metrics[
+                "legacy_auto_resolve_removed_archive_candidate_count"
+            ],
+            1,
+        )
+
+    def test_reporter_matches_builder_metric(self):
+        row = _report_row(
+            "legacy_keep_cognitive_keep"
+        )
+        row["legacy"]["auto_resolve_candidate"] = True
+        row["legacy"][
+            "archive_candidate_current"
+        ] = False
+        row["legacy"][
+            "archive_candidate_after_auto_resolve_if_successful"
+        ] = True
+
+        with tempfile.TemporaryDirectory() as root:
+            _write_artifact(
+                root,
+                CID,
+                RID,
+                _artifact([row]),
+            )
+
+            report = reporter.build_report(root=root)
+
+        self.assertEqual(
+            report[
+                "legacy_auto_resolve_changed_archive_outcome_count"
+            ],
+            1,
+        )
+        self.assertEqual(
+            report[
+                "legacy_auto_resolve_created_archive_candidate_count"
+            ],
+            1,
+        )
+
+
+class InterleavingRaceTests(
+    unittest.IsolatedAsyncioTestCase,
+):
+    """Review §12: a genuinely interleaved same-conversation race.
+
+    Request A captures its candidates + Legacy preview evidence, then
+    pauses at a deterministic point. Request B runs to completion and
+    advances the conversation-scoped latest artifacts to B. A then
+    resumes. A's artifact must contain A evidence only.
+    """
+
+    def tearDown(self):
+        bind_legacy_lifecycle_comparison_engine(None)
+
+    def _snap(self, memories):
+        observations = (
+            capture_legacy_lifecycle_observations(
+                memories
+            )
+        )
+
+        return build_memory_shadow_snapshot(
+            conversation_id=CID,
+            unified={
+                "version":
+                    "unified-context-candidate.v1",
+                "conversation_id": CID,
+                "revision": 5,
+                "sections": {"memories": memories},
+                "telemetry": {
+                    "current_user_excluded": True,
+                    "memory_count": len(memories),
+                },
+            },
+            retrieval_memories=memories,
+            legacy_lifecycle_observations=observations,
+        )
+
+    async def _artifacts(self, root):
+        directory = (
+            Path(root)
+            / "memory_lifecycle_comparison"
+            / CID
+        )
+
+        found = []
+
+        for path in sorted(directory.glob("*.json")):
+            found.append(
+                json.loads(
+                    path.read_text(encoding="utf-8")
+                )
+            )
+
+        return found
+
+    async def test_same_conversation_interleaving_is_request_local(
+        self,
+    ):
+        a_mem = [memory(_A)]
+        b_mem = [memory(_B)]
+
+        engine = SpyDecayEngine(
+            [_preview(), _preview()]
+        )
+        bind_legacy_lifecycle_comparison_engine(engine)
+
+        a_ready = asyncio.Event()
+        a_release = asyncio.Event()
+        calls = {"n": 0}
+
+        async def controlled_runtime(conversation_id):
+            calls["n"] += 1
+
+            if calls["n"] == 1:
+                # Request A has captured its own candidates and Legacy
+                # preview evidence; pause here.
+                snapshot = self._snap(a_mem)
+                a_ready.set()
+                await a_release.wait()
+
+                return {
+                    "stored": True,
+                    "revision": 5,
+                    "memory_shadow_snapshot": snapshot,
+                }
+
+            return {
+                "stored": True,
+                "revision": 5,
+                "memory_shadow_snapshot": self._snap(
+                    b_mem
+                ),
+            }
+
+        with tempfile.TemporaryDirectory() as root:
+            environ = {
+                **_isolated_env(),
+                _CONFIDENCE_ENV: "1",
+                _FLASH_ENV: "0",
+                COMPARISON_SHADOW_ENV: "1",
+                "OMBRE_CONTEXT_STATE_DIR": root,
+            }
+
+            with patch.dict(
+                os.environ, environ, clear=False
+            ):
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(
+                        patch.object(
+                            coordinator,
+                            "observe_context_sources",
+                            Mock(return_value=CID),
+                        )
+                    )
+                    stack.enter_context(
+                        patch.object(
+                            coordinator,
+                            "update_unified_context_"
+                            "candidate_from_runtime",
+                            controlled_runtime,
+                        )
+                    )
+                    stack.enter_context(
+                        patch.object(
+                            coordinator,
+                            "update_context_confidence_gate",
+                            Mock(
+                                return_value=_confidence()
+                            ),
+                        )
+                    )
+
+                    body = b'{"messages":[]}'
+
+                    task_a = asyncio.create_task(
+                        coordinator.run_context_pipeline(
+                            body
+                        )
+                    )
+
+                    # A is now deterministically paused.
+                    await asyncio.wait_for(
+                        a_ready.wait(), timeout=5
+                    )
+
+                    # Request B completes fully and advances the
+                    # conversation-scoped latest artifacts to B.
+                    task_b = asyncio.create_task(
+                        coordinator.run_context_pipeline(
+                            body
+                        )
+                    )
+
+                    await asyncio.wait_for(
+                        task_b, timeout=5
+                    )
+
+                    # Simulate B having advanced the shared,
+                    # conversation-scoped "latest" artifacts to B.
+                    policy_dir = (
+                        Path(root)
+                        / "memory_surfacing_policy"
+                    )
+                    policy_dir.mkdir(
+                        parents=True, exist_ok=True
+                    )
+                    (
+                        policy_dir / (CID + ".json")
+                    ).write_text(
+                        json.dumps(
+                            eligible_policy(b_mem)
+                        ),
+                        encoding="utf-8",
+                    )
+
+                    unified_dir = (
+                        Path(root)
+                        / "unified_context_candidate"
+                    )
+                    unified_dir.mkdir(
+                        parents=True, exist_ok=True
+                    )
+                    (
+                        unified_dir / (CID + ".json")
+                    ).write_text(
+                        json.dumps(
+                            {
+                                "version":
+                                    "unified-context-"
+                                    "candidate.v1",
+                                "conversation_id": CID,
+                                "revision": 5,
+                                "sections": {
+                                    "memories": b_mem
+                                },
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+
+                    # A resumes after B has already written its state.
+                    a_release.set()
+
+                    await asyncio.wait_for(
+                        task_a, timeout=5
+                    )
+
+            artifacts = await self._artifacts(root)
+
+        self.assertEqual(len(artifacts), 2)
+
+        fingerprint_a = candidate_fingerprint(
+            {"id": _A, "content": a_mem[0]["content"]}
+        )
+        fingerprint_b = candidate_fingerprint(
+            {"id": _B, "content": b_mem[0]["content"]}
+        )
+
+        by_fingerprint = {}
+
+        for artifact in artifacts:
+            keys = {
+                row["candidate_fingerprint"]
+                for row in artifact["candidates"]
+            }
+            by_fingerprint[frozenset(keys)] = artifact
+
+        # Each request wrote exactly its own evidence, no bleed-over.
+        self.assertIn(
+            frozenset({fingerprint_a}),
+            by_fingerprint,
+        )
+        self.assertIn(
+            frozenset({fingerprint_b}),
+            by_fingerprint,
+        )
+
+        for artifact in artifacts:
+            keys = {
+                row["memory_key"]
+                for row in artifact["candidates"]
+            }
+
+            if fingerprint_a in {
+                row["candidate_fingerprint"]
+                for row in artifact["candidates"]
+            }:
+                self.assertEqual(
+                    keys, {memory_key(_A)}
+                )
+            else:
+                self.assertEqual(
+                    keys, {memory_key(_B)}
+                )
 
 
 if __name__ == "__main__":
