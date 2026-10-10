@@ -498,6 +498,38 @@ Two memory paths reach the model with different access semantics:
 This asymmetry is **intentional in the baseline and not removed** by this task.
 Frontend Memory Arbitration Shadow v1 only *observes* it.
 
+### 4.1 Observation units are not equal (attachment ≠ memory item)
+
+The repository has **no proven item-level schema** for the inner body of a
+`relevant_memories.txt` attachment. The only thing the canonicalizer guarantees
+is that an explicit `filename="relevant_memories.txt"` envelope is a Frontend
+Memory *attachment*. Therefore v1 measures:
+
+- a Frontend Memory **attachment / bundle** (one canonical envelope), versus
+- an OB **retrieved memory candidate** (one Unified-admitted memory).
+
+`OBSERVATION SHAPE != FUTURE CANONICAL MEMORY CONTRACT`. Do not read the
+arbitration artifact as if it proved an item-level memory inventory.
+
+### 4.2 Four size concepts must never be collapsed
+
+The chain has four different "size" notions. Only the Frontend attachment
+footprint is genuinely model-visible in the request:
+
+1. **Frontend attachment body size** — the extracted inner text of the
+   attachment (`body`). Useful for comparison, not the wire cost.
+2. **Frontend model-visible attachment footprint** — the exact raw canonical
+   envelope present in the request, including metadata
+   (`<attachment …>BODY</attachment>`). This is the real provider-context cost.
+3. **OB retrieved candidate full-content size** — the whole Unified candidate
+   memory content. Normally **NOT** model-visible.
+4. **OB model-visible cue / Recall size** — the bounded Flash cue, and full
+   content only after an explicit Recall. This is a later, separate stage.
+
+Because (1)/(3) are body/content sizes while (2) is genuinely model-visible and
+(4) is a different stage, there is deliberately **no cross-source token share**.
+A single "memory token share" would be semantically wrong.
+
 ---
 
 ## 5. Feature-flag dependency map (observation and mutation)
@@ -512,6 +544,11 @@ implicitly drives the upstream chain it consumes.
   `observe_context_sources` / `observe_unified_preview_gate` to run the
   upstream Conversation→Unified chain for this request (they are consumers, not
   observability-only toggles).
+- `..._MEMORY_RECALL_SURFACE_SHADOW` is **not a standalone producer**: a Recall
+  Surface derives from a Memory Flash artifact. With no Flash artifact for the
+  request it has nothing to surface. Enabling it alone drives the upstream chain
+  (it is part of `memory_observer_enabled`) but does **not** by itself yield a
+  complete memory observation.
 - `OMBRE_GATEWAY_CONTEXT_REAL_INJECTION` also drives the full upstream chain,
   even when every observability shadow flag is off.
 - `..._MEMORY_FLASH_LIVE_EXPOSURE` requires the Flash flag and the Recall Surface
@@ -545,12 +582,19 @@ points at real code.
 
 ### P0 — correctness / authority problems
 
-- **P0-1 — Two memory access models coexist without a shared arbitration
+**None demonstrated at this baseline.** The access asymmetry in §4 is an
+intentional design/authority gap under measurement, not a proven invariant
+violation, so it is deliberately not classified as P0. P0 is reserved for
+demonstrated correctness / data-integrity / authority violations.
+
+### Open Architecture Questions
+
+- **OA-1 — Two memory access models coexist without a shared arbitration
   authority.** OB memory is cue/Recall-gated; Frontend Memory is full-content
   model-visible (`canonicalizer.py` classifies it; `rewriter.py` preserves it).
   There is no single authority that decides what the model is allowed to see
-  across both sources. This is the problem the shadow phase exists to measure;
-  it is **not** fixed here.
+  across both sources. This is the question the shadow phase exists to measure;
+  it is **not** fixed here, and no current invariant is violated by it.
 
 ### P1 — architecture debt likely to hurt the next stages
 
@@ -586,10 +630,14 @@ points at real code.
 - **P2-2 — Legacy `decay_engine.py` runs beside the new lifecycle chain.**
   Two lifecycle-ish authorities exist (legacy decay vs
   `memory_lifecycle_state.py`). They are not reconciled. Out of scope here.
-- **P2-3 — Some modules appear to have no live consumer in the default pipeline.**
-  `retrieval_shadow_metrics.py` and `live_recall_usage_ref_receipt.py` produce
-  evidence only. `UNVERIFIED`: whether every such artifact is actually read by
-  anything downstream; treat as evidence-only until proven otherwise.
+- **P2-3 — The two suspected stale evidence modules are actually live.**
+  `retrieval_shadow_metrics.py` is imported and called by
+  `unified_context_candidate.py` (`record_retrieval_shadow_metrics`), and
+  `live_recall_usage_ref_receipt.py` is imported and used by
+  `live_recall_usage_surface.py` (`build_usage_ref_receipt`,
+  `persist_usage_ref_receipt`, `read_usage_ref_receipt`,
+  `receipt_matches_binding`, `useref_sha256`). Neither is unconsumed; no
+  unconsumed memory-stage module was found among those checked.
 - **P2-4 — Per-module `_root()` / `_atomic_write` / `_path` duplication.**
   `recall_types.py` centralises shared primitives, but several modules
   (`exposure_ledger.py`, `memory_flash.py`, `context_confidence_gate.py`) keep
