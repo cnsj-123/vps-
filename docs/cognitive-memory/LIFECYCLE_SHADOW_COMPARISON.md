@@ -1,0 +1,353 @@
+# Legacy vs Cognitive Lifecycle Shadow Comparison — v0
+
+**STATUS: WORKING EXPERIMENT / SHADOW OBSERVATION — NOT AN ADR — NOT A FROZEN
+SPECIFICATION**
+
+This document describes an **observation-only experiment**. It does not decide
+which lifecycle model is correct, it does not freeze a contract, and it does
+**not** unify the two lifecycle planes. If this document and the code disagree,
+**the code is correct and this document is wrong**.
+
+- Repository: `https://github.com/cnsj-123/vps-`
+- Source of truth: `origin/feature/gateway-v2`
+- Base commit: `01b5948ab1b14c2a65ddebea31611f2e5321aa74`
+  (merge of PR#3, `trae/lifecycle-authority-audit-v0`)
+- Companion documents:
+  `docs/cognitive-memory/LIFECYCLE_AUTHORITY_MAP.md` (authority matrix) and
+  `docs/cognitive-memory/ARCHITECTURE_STATUS.md` (chain reality map).
+
+The single sentence that matters most:
+
+```
+Correlation / disagreement in this artifact does NOT prove which lifecycle
+policy is better. It only exposes where their current semantics differ.
+```
+
+---
+
+## 1. Why the comparison exists
+
+The repository carries **two parallel lifecycle vocabularies** that share the
+word "lifecycle" but are different subsystems (see `LIFECYCLE_AUTHORITY_MAP.md`
+§0). They are not silently bridged and they are not unified. Before any decision
+about which plane should win (open question **OA-2**), we need to know **where
+their current behaviour actually differs** on real request-local retrieval
+candidates.
+
+This experiment records exactly that: for the same real candidates, what the
+**existing Legacy OB policy** would do versus what the **existing Cognitive
+policy** would do — without executing either, without mutating anything, and
+without changing live behaviour. It is a measurement, not a migration.
+
+---
+
+## 2. Observation unit
+
+One **request-local retrieval candidate**. The comparison covers the bounded real
+retrieval candidate set available in THIS request (`MAX_COMPARISON_ROWS = 64`),
+not only the memories that ultimately become a Memory Flash cue.
+
+Each retained candidate is bound by:
+
+- `candidate_fingerprint` (`sha256(normalized memory_id + "\0" + normalized
+  content)`, from `retrieval_decision_shadow.candidate_fingerprint`), **plus**
+- canonical retrieval occurrence / order (an ordered multiset / FIFO queue per
+  fingerprint, so duplicate fingerprints are matched deterministically and are
+  **never** silently merged or deduplicated), **plus**
+- `retrieval_index`.
+
+A memory id alone is **not** used to align the planes: the same id may appear
+twice. If no truthful binding to this request's Unified snapshot can be
+established, the candidate is recorded with category `binding_unavailable` and a
+**null** binding triple — the comparison never guesses.
+
+---
+
+## 3. Legacy semantics (what is measured, not executed)
+
+The Legacy side answers: *"what would the existing DecayEngine do?"* — using the
+**real** runtime engine's side-effect-free preview API,
+`DecayEngine.preview_decay_cycle_decision(metadata)`, which shares the exact same
+predicates and score math as the live `run_decay_cycle()` (no copied second
+formula).
+
+Per candidate it records:
+
+- `available` / `applicable` / `skip_reason`
+- `current_resolved`
+- `auto_resolve_candidate`
+- `score_current`
+- `score_if_auto_resolve_succeeds`
+- `threshold`
+- `archive_candidate_current`
+- `archive_candidate_after_auto_resolve_if_successful`
+- `nominal_archive_candidate`
+
+This is a **preview**. No resolve, archive, touch, delete or activation write
+ever happens. The engine is bound narrowly at server startup
+(`bind_legacy_lifecycle_comparison_engine(decay_engine)`); the comparison never
+starts, stops, wraps or constructs a DecayEngine.
+
+---
+
+## 4. Cognitive semantics (real formulas, reused)
+
+The Cognitive side reuses the **real** lifecycle formulas and the **same**
+supplementary evaluator the live gate uses
+(`memory_surfacing_lifecycle.evaluate_lifecycle_surfacing_candidate`), so the
+`accessibility >= x OR salience >= y` decision lives in **one** place.
+
+Per candidate it records:
+
+- `observed`
+- `use_count`, `strength`, `accessibility`, `salience`,
+  `age_since_last_used_hours`
+- `min_accessibility`, `min_salience`
+- `would_suppress_if_supplementary`, `would_keep_if_supplementary`
+- `effective_gate_decision`
+- `invalid_event_count`
+
+If valid `used` events exist, values come from the real derived-state helpers
+(`strength_for_use_count`, `accessibility_for_age`, `salience_for_age`,
+`lifecycle_use_facts`, `read_lifecycle_events`). The comparison writes **no**
+lifecycle event, state snapshot, reinforcement receipt or `used` evidence.
+
+---
+
+## 5. Unobserved neutrality
+
+```
+unobserved != forgotten
+```
+
+A memory with **no valid** `used` lifecycle event is **neutral**. The comparison
+never fabricates `strength = 0`, `accessibility = 0`, `forgotten = true` or
+`would_suppress = true` for it. Invalid lifecycle event files increment
+`invalid_event_count` and **fail neutral** — they never turn a memory into
+"suppressed". Cold start therefore never looks like a disagreement.
+`cognitive_neutral_unobserved_count` counts these candidates separately from
+genuine cognitive suppression.
+
+---
+
+## 6. Auto-resolve counterfactual caveat
+
+`score_if_auto_resolve_succeeds` and
+`archive_candidate_after_auto_resolve_if_successful` are **counterfactuals**.
+The live decay cycle performs auto-resolve **before** it evaluates archive, so the
+comparison must model that ordering to be honest. But the auto-resolve canonical
+write is **not** executed. These fields describe what *would* happen if the normal
+auto-resolve write succeeded; they are never an observed state.
+
+---
+
+## 7. Archive counterfactual caveat
+
+The comparison does **not** archive anything. Legacy archive is represented by:
+
+- `archive_candidate_current` — archive decision with the candidate's current
+  state, and
+- `nominal_archive_candidate` — the archive decision **assuming the normal
+  auto-resolve canonical write succeeds first**.
+
+`nominal_archive_candidate` is a **naming-precise** term: it is a nominal result,
+not a performed canonical write. It must not be read as evidence that a memory was
+or will be archived.
+
+---
+
+## 8. Request-local binding
+
+The artifact is **request-scoped** and bound to `conversation_id`,
+`cognitive_request_id` and `source_unified_revision`. It consumes **this
+request's** `memory_shadow_snapshot`. It must **never** re-read the
+conversation-global file `unified_context_candidate/{conversation_id}.json` to
+reconstruct current-request authority, because a concurrent request on the same
+conversation may overwrite that file at any time (see `ARCHITECTURE_STATUS.md`
+§0.2).
+
+Storage layout:
+
+```
+<state_root>/
+  memory_lifecycle_comparison/
+    <conversation_id>/
+      <cognitive_request_id>.json
+```
+
+There is deliberately **no** conversation-global "latest comparison" file.
+
+---
+
+## 9. Persisted privacy model
+
+**Persisted** (privacy-safe):
+
+- request binding ids already used by other request-scoped Context artifacts
+  (`conversation_id`, `cognitive_request_id`)
+- revision
+- counts, enums, booleans
+- finite numeric scores / thresholds
+- `candidate_fingerprint` (a digest)
+- `memory_key(memory_id)` (a cryptographic, non-reversible hashed identity)
+
+**Never persisted**: raw memory text, memory `name`, query text, user text, cue,
+`memref`, `useref`, or raw memory id. Non-finite numbers (`NaN` / `Infinity`) are
+rejected to `null`.
+
+**Log lines are stricter**: they carry only aggregate counts / reason codes /
+revisions / threshold snapshots — **no** `conversation_id`,
+`cognitive_request_id`, `memory_key`, `candidate_fingerprint`, or raw memory id.
+
+---
+
+## 10. Comparison categories
+
+Deterministic categories (at minimum):
+
+```
+binding_unavailable
+legacy_unavailable
+legacy_not_applicable
+cognitive_evidence_unavailable
+
+legacy_archive_cognitive_unobserved
+legacy_archive_cognitive_suppress
+legacy_archive_cognitive_keep
+legacy_keep_cognitive_unobserved
+legacy_keep_cognitive_suppress
+legacy_keep_cognitive_keep
+```
+
+`cognitive_unobserved` is **its own concept** and is never called
+"cognitive_keep" without that qualification. Each candidate also records a
+`binding` triple (`unified_admitted`, `base_surfacing_eligible`,
+`base_eligible_rank`; all `null` when binding is unavailable) and an
+`effective_gate_decision`, which distinguishes the **counterfactual** bucket
+(`would_suppress_if_supplementary`) from the **effective current gate effect**:
+
+```
+primary_preserved | neutral_unobserved | would_keep | would_suppress |
+not_base_eligible | binding_unavailable
+```
+
+The existing Lifecycle Surfacing gate **never suppresses the first base-eligible
+candidate**. So a primary candidate may show
+`would_suppress_if_supplementary = true` while its effective decision is
+`primary_preserved`. That is **not** a contradiction; it is the primary
+preservation rule made explicit.
+
+---
+
+## 11. Feature flag
+
+```
+OMBRE_GATEWAY_CONTEXT_LIFECYCLE_COMPARISON_SHADOW
+```
+
+- Unicode truthy values accepted: `1` / `true` / `yes` / `on` (case-insensitive).
+- **Default OFF.** With the flag off, the observer does not run and writes nothing.
+- The comparison runs independently of the Memory Flash flag: with Flash **OFF**
+  it still observes the base Surfacing Policy over this request's Unified
+  snapshot and writes only the comparison artifact.
+
+Version / mode:
+
+```
+memory-lifecycle-comparison-shadow.v1
+shadow_only
+```
+
+---
+
+## 12. Reporter usage
+
+A read-only aggregate reporter summarises many request-scoped artifacts:
+
+```
+PYTHONPATH=src python -m ombrebrain.maintenance.lifecycle_comparison_report --limit 100 --json
+```
+
+- `--limit N` bounds how many artifacts are scanned (default `500`).
+- `--json` prints the aggregate as JSON; without it a human-readable summary is
+  printed.
+- It writes / creates / moves / deletes **nothing** — not even a malformed
+  artifact.
+- It emits **only aggregate statistics and finite numbers**: no
+  `conversation_id`, `cognitive_request_id`, `memory_key`, `candidate_fingerprint`,
+  raw memory id, text, name, query or cue.
+- A malformed artifact only increments `invalid_artifact_count` and is skipped
+  from numeric analysis; it never crashes the report.
+- Output is deterministically ordered and reports category counts, effective-gate
+  decision counts, bounded percentile distributions, and tolerant counts (an
+  artifact from a newer version is counted, never silently dropped).
+
+The reporter is a maintenance / research tool, not a runtime authority. It creates
+no database, no rolling global aggregate and no runtime accumulator.
+
+---
+
+## 13. Interpretation caveats
+
+- The artifact records **where current semantics differ**, not which is better.
+- `nominal_archive_candidate`, `score_if_auto_resolve_succeeds` and
+  `archive_candidate_after_auto_resolve_if_successful` are **counterfactuals**,
+  never observed actions.
+- `cognitive_unobserved` is **neutral**, never "forgotten" and never "keep".
+- `would_suppress_if_supplementary = true` on a primary candidate is expected and
+  does not indicate a bug.
+- A high disagreement rate is **not** evidence that either policy is wrong.
+- Nothing here observes live traffic unless the flag is explicitly enabled on a
+  deployment; enabling it changes no live body and mutates no memory state.
+
+---
+
+## 14. What data may justify a future ArchiveCandidate Shadow
+
+This experiment may produce evidence such as:
+
+- how often a `nominal_archive_candidate` is simultaneously a
+  `would_suppress_if_supplementary` candidate (`both_archive_and_suppress_count`);
+- how often Legacy would archive while Cognitive has **no** evidence
+  (`legacy_archive_cognitive_unobserved`);
+- the distributions of Legacy `score_current` versus Cognitive `strength` /
+  `accessibility` / `salience`;
+- how often the base Surfacing Policy admits a candidate the cognitive
+  counterfactual would suppress.
+
+**If and only if** such evidence shows a material, well-understood divergence
+might a *separate* ArchiveCandidate Shadow task be justified. This experiment
+makes **no** such decision and implements **no** ArchiveCandidate behaviour.
+
+---
+
+## 15. What this experiment CANNOT prove
+
+- It cannot prove Legacy is better, Cognitive is better, or that either should be
+  deleted, disabled, or made authoritative.
+- It cannot prove that `activation_count` should become `use_count`, that
+  `importance` should become `strength`, that cognitive accessibility should
+  control archive, or that archive should become proposal-only.
+- It cannot prove causation. Disagreement here is **correlation**, not cause.
+- It cannot bridge the planes: `trace(reinforce=True) != UseMemory` still holds,
+  and no `used` ↔ `touch` bridge is added.
+- It cannot observe a memory that retrieval never returned this request.
+
+---
+
+## Explicitly NOT done in this task
+
+- No change to any live lifecycle behaviour; the comparison is default OFF and
+  observation-only.
+- No change to the decay formula, archive threshold, auto-resolve threshold,
+  `activation_count` / `last_active` semantics, Memory Surfacing thresholds,
+  retrieval ranking, or Dream ranking.
+- No bridging of the Legacy and Cognitive planes; no `UseMemory` → `touch` bridge
+  and no `trace(reinforce=True)` → `used` bridge.
+- No ArchiveCandidate behaviour, no consolidation, no migration of lifecycle
+  authority.
+- No mutation of any memory state, and no conversation-global "latest" comparison
+  file.
+
+**OA-2 (parallel lifecycle authorities) remains unresolved.** This task adds
+*comparison evidence*, not a resolution.
