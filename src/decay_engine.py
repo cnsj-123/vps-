@@ -120,6 +120,62 @@ def _days_since_active(meta: dict, fallback_days: float = _DEFAULT_DAYS_FALLBACK
         return float(fallback_days)
 
 
+def _decay_cycle_skip_reason(meta: dict) -> str | None:
+    """Pure predicate: why the live decay cycle skips one bucket.
+
+    Shared by ``run_decay_cycle`` and ``preview_decay_cycle_decision`` so
+    the protected / non-decaying rules have ONE source of truth. It is a
+    behaviour-preserving extraction of the exact inline checks that used
+    to sit at the top of the live loop (same order, same truthiness, same
+    ``parse_bool`` semantics).
+
+    Returns a stable, privacy-safe reason string, or ``None`` when the
+    bucket is a normal decay candidate. It never reads anything other
+    than the supplied metadata dict.
+    """
+    bucket_type = meta.get("type")
+    if bucket_type in ("permanent", "feel", "i", "plan", "letter"):
+        return "type_" + bucket_type
+    if meta.get("pinned"):
+        return "pinned"
+    if meta.get("protected"):
+        return "protected"
+    if parse_bool(meta.get("anchor"), default=False):
+        return "anchor"
+    return None
+
+
+def _auto_resolve_decision(meta: dict) -> tuple[bool, int | None, float | None]:
+    """Pure auto-resolve predicate shared by the live cycle and the preview.
+
+    Returns ``(eligible, importance, days_since)`` using the EXACT live
+    semantics:
+
+      * an already-``resolved`` bucket is never eligible and its
+        ``importance`` is never coerced (the live path checked that
+        first, and so does this helper);
+      * ``importance`` goes through the same ``int()`` coercion (which
+        may raise on malformed input -- the live path behaved the same);
+      * ``days_since`` uses the 999-day malformed-time fallback;
+      * eligible when ``importance <= threshold`` AND
+        ``days_since > threshold`` under the current constants.
+
+    It performs no IO and mutates nothing.
+    """
+    if meta.get("resolved", False):
+        return False, None, None
+
+    imp = int(meta.get("importance") or _DEFAULT_IMPORTANCE)
+    days_since = _days_since_active(
+        meta, fallback_days=_AUTO_RESOLVE_FALLBACK_DAYS
+    )
+    eligible = (
+        imp <= _AUTO_RESOLVE_IMPORTANCE_MAX
+        and days_since > _AUTO_RESOLVE_DAYS_MIN
+    )
+    return eligible, imp, days_since
+
+
 class DecayEngine:
     """
     Memory decay engine — periodically scans all dynamic buckets,
@@ -272,6 +328,105 @@ class DecayEngine:
         return round(base_score * resolved_factor * urgency_boost, 4)
 
     # ---------------------------------------------------------
+    # Read-only preview: what would the live cycle decide?
+    # 只读预览：实时衰减循环会做什么决定？
+    #
+    # Side-effect-free and synchronous. It reuses the SAME skip and
+    # auto-resolve predicates as run_decay_cycle() and the SAME
+    # calculate_score() math, so it can never drift into a second
+    # scoring implementation. It performs no IO: no BucketManager, no
+    # archive / update / touch / delete, no embeddings, no start / stop
+    # and it never mutates the supplied metadata dict.
+    # ---------------------------------------------------------
+    def preview_decay_cycle_decision(self, metadata: dict) -> dict:
+        """Counterfactual Legacy lifecycle decision for one memory.
+
+        Returns a privacy-safe structure describing what the live decay
+        cycle would decide for this metadata:
+
+            applicable / skip_reason
+            current_resolved
+            auto_resolve_candidate
+            score_current
+            score_if_auto_resolve_succeeds
+            threshold
+            archive_candidate_current
+            archive_candidate_after_auto_resolve_if_successful
+            nominal_archive_candidate
+
+        Precision notes:
+
+          - ``nominal_archive_candidate`` is the archive classification
+            under the NORMAL live order: if the bucket is an auto-resolve
+            candidate it assumes the canonical ``resolved=True`` write
+            would SUCCEED (``score_if_auto_resolve_succeeds``); otherwise
+            it uses ``score_current``. It is NOT a claim that the write
+            cannot fail, and it never says "will_archive".
+          - For a skipped / malformed bucket nothing is scored or
+            archive-classified: ``applicable`` is False, scores are None
+            and every archive field is False.
+        """
+        threshold = self.threshold
+
+        def _skipped(reason: str, resolved: bool) -> dict:
+            return {
+                "applicable": False,
+                "skip_reason": reason,
+                "current_resolved": resolved,
+                "auto_resolve_candidate": False,
+                "score_current": None,
+                "score_if_auto_resolve_succeeds": None,
+                "threshold": threshold,
+                "archive_candidate_current": False,
+                "archive_candidate_after_auto_resolve_if_successful": False,
+                "nominal_archive_candidate": False,
+            }
+
+        if not isinstance(metadata, dict):
+            return _skipped("malformed_metadata", False)
+
+        skip_reason = _decay_cycle_skip_reason(metadata)
+
+        if skip_reason is not None:
+            return _skipped(
+                skip_reason,
+                bool(metadata.get("resolved", False)),
+            )
+
+        current_resolved = bool(metadata.get("resolved", False))
+
+        eligible, _imp, _days = _auto_resolve_decision(metadata)
+
+        score_current = self.calculate_score(metadata)
+        archive_candidate_current = score_current < threshold
+
+        if eligible:
+            # Counterfactual: score a COPY with resolved=True so the
+            # caller's dict is never touched and no write is attempted.
+            resolved_metadata = dict(metadata)
+            resolved_metadata["resolved"] = True
+            score_after = self.calculate_score(resolved_metadata)
+            archive_after = score_after < threshold
+            nominal_archive_candidate = archive_after
+        else:
+            score_after = None
+            archive_after = False
+            nominal_archive_candidate = archive_candidate_current
+
+        return {
+            "applicable": True,
+            "skip_reason": None,
+            "current_resolved": current_resolved,
+            "auto_resolve_candidate": eligible,
+            "score_current": score_current,
+            "score_if_auto_resolve_succeeds": score_after,
+            "threshold": threshold,
+            "archive_candidate_current": archive_candidate_current,
+            "archive_candidate_after_auto_resolve_if_successful": archive_after,
+            "nominal_archive_candidate": nominal_archive_candidate,
+        }
+
+    # ---------------------------------------------------------
     # Execute one decay cycle
     # 执行一轮衰减周期
     # Scan all dynamic buckets → score → archive those below threshold
@@ -310,36 +465,28 @@ class DecayEngine:
             # 也 resolved=True——plan 的生命周期只能由 status 字段驱动，letter
             # 承诺永久保留原样，两者都不该被这条「重要度低+超期未解决」的通用
             # 自动结案逻辑碰。
-            if (
-                meta.get("type") in ("permanent", "feel", "i", "plan", "letter")
-                or meta.get("pinned")
-                or meta.get("protected")
-                or parse_bool(meta.get("anchor"), default=False)
-            ):
+            if _decay_cycle_skip_reason(meta) is not None:
                 continue
 
             checked += 1
 
             # --- Auto-resolve: imp≤4 + >30 days old + not resolved → auto resolve ---
             # --- 自动结案：重要度≤4 + 超过30天 + 未解决 → 自动 resolve ---
-            if not meta.get("resolved", False):
-                imp = int(meta.get("importance") or _DEFAULT_IMPORTANCE)
-                # auto-resolve 路径上时间字段坏 → 按 999 天处理（加速会被结案）
-                days_since = _days_since_active(
-                    meta, fallback_days=_AUTO_RESOLVE_FALLBACK_DAYS
-                )
-                if imp <= _AUTO_RESOLVE_IMPORTANCE_MAX and days_since > _AUTO_RESOLVE_DAYS_MIN:
-                    try:
-                        await self.bucket_mgr.update(bucket["id"], resolved=True)
-                        meta["resolved"] = True  # refresh local meta so resolved_factor applies this cycle
-                        auto_resolved += 1
-                        logger.info(
-                            f"Auto-resolved / 自动结案: "
-                            f"{meta.get('name', bucket['id'])} "
-                            f"(imp={imp}, days={days_since:.0f})"
-                        )
-                    except Exception as e:
-                        logger.warning(f"Auto-resolve failed / 自动结案失败: {e}")
+            # Predicate shared with preview_decay_cycle_decision() so the
+            # live path and the read-only preview can never diverge.
+            eligible, imp, days_since = _auto_resolve_decision(meta)
+            if eligible:
+                try:
+                    await self.bucket_mgr.update(bucket["id"], resolved=True)
+                    meta["resolved"] = True  # refresh local meta so resolved_factor applies this cycle
+                    auto_resolved += 1
+                    logger.info(
+                        f"Auto-resolved / 自动结案: "
+                        f"{meta.get('name', bucket['id'])} "
+                        f"(imp={imp}, days={days_since:.0f})"
+                    )
+                except Exception as e:
+                    logger.warning(f"Auto-resolve failed / 自动结案失败: {e}")
 
             try:
                 score = self.calculate_score(meta)
