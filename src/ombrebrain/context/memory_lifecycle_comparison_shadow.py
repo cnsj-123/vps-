@@ -28,8 +28,6 @@ from ombrebrain.context.memory_lifecycle_state import (
 )
 from ombrebrain.context.memory_surfacing_lifecycle import (
     evaluate_lifecycle_surfacing_candidate,
-    lifecycle_shadow_enabled,
-    lifecycle_surfacing_enabled,
     resolve_surfacing_lifecycle_config,
 )
 from ombrebrain.context.retrieval_decision_shadow import (
@@ -105,6 +103,16 @@ _SNAPSHOT_VERSION = "memory-shadow-snapshot.v1"
 _POLICY_VERSION = "memory-surfacing-policy.v1"
 _POLICY_MODE = "shadow_only"
 _ALLOW_DECISION = "allow_shadow"
+_NO_SURFACE_DECISION = "no_surface"
+
+# The CLOSED memory-surfacing-policy.v1 decision enum. Any other string
+# (a future / corrupt / unknown decision such as "banana" or
+# "future_v2_decision") is NOT valid evidence and must never become
+# "not eligible".
+_KNOWN_BASE_POLICY_DECISIONS = (
+    _ALLOW_DECISION,
+    _NO_SURFACE_DECISION,
+)
 
 # Hard bound on persisted per-request candidate evidence.
 MAX_COMPARISON_ROWS = 64
@@ -385,12 +393,13 @@ def _base_policy_binding(
 
     Returns ``(available, eligible_list)``. ``available`` is False
     whenever the policy is missing, malformed, from another
-    conversation, or bound to another Unified revision -- in which case
-    eligibility is UNKNOWN (``eligible_list`` is None) and must never be
-    inferred as ``not eligible``. When the policy IS validly bound,
-    ``eligible_list`` is the real eligible list (an empty list when the
-    policy decided ``no_surface``), so a real ``no_surface`` correctly
-    means "not eligible".
+    conversation, bound to another Unified revision, or carries a
+    decision OUTSIDE the closed v1 enum -- in which case eligibility is
+    UNKNOWN (``eligible_list`` is None) and must never be inferred as
+    ``not eligible``. When the policy IS validly bound, ``eligible_list``
+    is the real eligible list (an empty list when the policy decided the
+    real ``no_surface``), so a genuine ``no_surface`` correctly means
+    "not eligible".
     """
 
     if not isinstance(base_policy, dict):
@@ -416,21 +425,36 @@ def _base_policy_binding(
 
     decision = base_policy.get("decision")
 
-    if not isinstance(decision, str):
-        # A malformed decision is UNKNOWN, never "not eligible".
+    if (
+        not isinstance(decision, str)
+        or decision not in _KNOWN_BASE_POLICY_DECISIONS
+    ):
+        # An unknown / malformed / future decision is UNKNOWN, never
+        # "not eligible".
         return False, None
-
-    if decision != _ALLOW_DECISION:
-        return True, []
 
     eligible = base_policy.get("eligible")
 
-    if not isinstance(eligible, list):
-        # A valid allow_shadow policy always carries an eligible list;
-        # anything else is malformed, so eligibility is UNKNOWN.
-        return False, None
+    if decision == _ALLOW_DECISION:
+        if not isinstance(eligible, list):
+            # A valid allow_shadow policy always carries an eligible
+            # list; anything else is malformed, so eligibility is
+            # UNKNOWN.
+            return False, None
 
-    return True, eligible
+        return True, eligible
+
+    # decision == no_surface: the real v1 contract carries an EMPTY
+    # eligible set. A contradictory ``no_surface`` that still lists
+    # eligible candidates is malformed evidence, not a trustworthy
+    # "not eligible".
+    if eligible is None:
+        return True, []
+
+    if isinstance(eligible, list) and not eligible:
+        return True, []
+
+    return False, None
 
 
 def _legacy_view(
@@ -841,9 +865,18 @@ def build_lifecycle_comparison_artifact(
     base_policy: Any,
     legacy_observations: Any,
     retrieval_candidate_count: int,
+    live_lifecycle_gate_active: bool,
     as_of: datetime | None = None,
 ) -> dict[str, Any]:
     """Build the privacy-safe, request-scoped comparison artifact.
+
+    ``live_lifecycle_gate_active`` is an explicit REQUEST-LOCAL
+    orchestration fact supplied by the Context coordinator from the
+    ACTUAL live-gate conditions for THIS request (Flash running AND the
+    lifecycle Surfacing integration AND the lifecycle Shadow enabled).
+    The observer does NOT re-read environment flags to infer
+    orchestration reality: the coordinator owns request execution
+    reality, this builder only records it.
 
     Read-only with respect to every memory authority (it reads THIS
     request's Unified snapshot and the existing cognitive lifecycle
@@ -905,13 +938,11 @@ def build_lifecycle_comparison_artifact(
         else []
     )
 
-    # Actual live-gate participation under the CURRENT flags. It only
-    # records whether the real gate could change behaviour; it never
-    # changes the counterfactual analysis.
-    live_gate_active = bool(
-        lifecycle_surfacing_enabled()
-        and lifecycle_shadow_enabled()
-    )
+    # Actual live-gate participation for THIS request, supplied by the
+    # coordinator from the real orchestration conditions. It only
+    # records whether the real gate participated; it never changes the
+    # counterfactual analysis (which is computed regardless of Flash).
+    live_gate_active = bool(live_lifecycle_gate_active)
 
     config = resolve_lifecycle_config()
 
@@ -1627,7 +1658,14 @@ def _valid_cognitive_row(cognitive: Any) -> bool:
         "age_since_last_used_hours",
     )
 
-    if observed is False:
+    # Unobserved (available True / observed False) and evidence
+    # unavailable (available False / observed None) both carry the SAME
+    # empty numeric shape: no use, no derived numbers, and never a
+    # suppression OR keep claim.
+    if observed is False or available is False:
+        if cognitive.get("use_count") != 0:
+            return False
+
         for name in lifecycle_numeric:
             if cognitive.get(name) is not None:
                 return False
@@ -1635,6 +1673,14 @@ def _valid_cognitive_row(cognitive: Any) -> bool:
         if (
             cognitive.get(
                 "would_suppress_if_supplementary"
+            )
+            is not False
+        ):
+            return False
+
+        if (
+            cognitive.get(
+                "would_keep_if_supplementary"
             )
             is not False
         ):
@@ -1649,8 +1695,25 @@ def _valid_cognitive_row(cognitive: Any) -> bool:
             "accessibility",
             "salience",
         ):
-            if cognitive.get(name) is None:
+            if not _is_finite(cognitive.get(name)):
                 return False
+
+        age = cognitive.get("age_since_last_used_hours")
+
+        if not _is_finite(age) or float(age) < 0.0:
+            return False
+
+        # The real evaluator sets exactly one of the two complementary
+        # supplementary outcomes for an observed memory.
+        if (
+            cognitive.get(
+                "would_keep_if_supplementary"
+            )
+            is cognitive.get(
+                "would_suppress_if_supplementary"
+            )
+        ):
+            return False
 
     return True
 
@@ -1706,6 +1769,70 @@ def _valid_binding_row(binding: Any) -> bool:
     return True
 
 
+def _derived_comparison_category(
+    row: dict[str, Any],
+) -> str:
+    """Recompute a row's category from its OWN underlying evidence.
+
+    Uses the SAME ``_category`` helper the builder uses, so a persisted
+    category that disagrees with its evidence is detectable instead of
+    being trusted merely because it is a known enum member.
+    """
+
+    binding = row.get("binding") or {}
+    legacy = row.get("legacy") or {}
+    cognitive = row.get("cognitive") or {}
+
+    return _category(
+        binding_available=(
+            binding.get("unified_admitted") is not None
+        ),
+        legacy=legacy,
+        legacy_available=(
+            legacy.get("available") is True
+        ),
+        cognitive_available=(
+            cognitive.get("available") is True
+        ),
+        cognitive=cognitive,
+    )
+
+
+def _derived_counterfactual_gate_decision(
+    row: dict[str, Any],
+) -> str:
+    """Recompute a row's counterfactual gate decision from its evidence.
+
+    Uses the SAME ``_counterfactual_gate_decision`` helper the builder
+    uses.
+    """
+
+    binding = row.get("binding") or {}
+    cognitive = row.get("cognitive") or {}
+
+    rank = binding.get("base_eligible_rank")
+
+    if not _is_nonneg_int(rank):
+        rank = None
+
+    return _counterfactual_gate_decision(
+        binding_available=(
+            binding.get("unified_admitted") is not None
+        ),
+        base_policy_available=(
+            binding.get("base_policy_available") is True
+        ),
+        base_eligible=(
+            binding.get("base_surfacing_eligible") is True
+        ),
+        base_rank=rank,
+        cognitive_available=(
+            cognitive.get("available") is True
+        ),
+        cognitive=cognitive,
+    )
+
+
 def _valid_candidate_row(row: Any) -> bool:
     if not isinstance(row, dict):
         return False
@@ -1751,6 +1878,40 @@ def _valid_candidate_row(row: Any) -> bool:
     ):
         return False
 
+    binding = row.get("binding")
+    cognitive = row.get("cognitive")
+
+    if category == _CAT_BINDING_UNAVAILABLE:
+        # The exact unknown shape: no identity, no admission and no
+        # eligibility claim whatsoever. Unknown identity must never
+        # carry a definite admission / eligibility claim.
+        if (
+            binding.get("unified_admitted") is not None
+            or binding.get("base_policy_available")
+            is not False
+            or binding.get("base_surfacing_eligible")
+            is not None
+            or binding.get("base_eligible_rank") is not None
+        ):
+            return False
+
+        if key is not None or fingerprint is not None:
+            return False
+    else:
+        # A categorised (bound) row must carry a definite admission.
+        if binding.get("unified_admitted") is None:
+            return False
+
+    # Persisted labels must agree with the evidence they were derived
+    # from -- a known enum member can still be semantically false.
+    if category != _derived_comparison_category(row):
+        return False
+
+    if cognitive.get(
+        "counterfactual_gate_decision"
+    ) != _derived_counterfactual_gate_decision(row):
+        return False
+
     return True
 
 
@@ -1762,10 +1923,12 @@ def is_valid_lifecycle_comparison_artifact(
     A complete, structurally sound ``memory-lifecycle-comparison-shadow.v1``
     artifact is valid; anything else (wrong version / mode, malformed
     identity, non-finite numbers, an inconsistent binding or
-    cognitive tri-state, an unknown category or gate decision, or one
-    malformed row among otherwise valid rows) is INVALID as a whole.
-    Future / newer versions are unsupported for this v1 reporter and are
-    therefore invalid -- they are never partially interpreted.
+    cognitive tri-state, an unknown category or gate decision, a
+    derived label that disagrees with its own evidence, persisted
+    metrics that disagree with the candidate rows, or one malformed row
+    among otherwise valid rows) is INVALID as a whole. Future / newer
+    versions are unsupported for this v1 reporter and are therefore
+    invalid -- they are never partially interpreted.
     """
 
     if not isinstance(artifact, dict):
@@ -1795,9 +1958,11 @@ def is_valid_lifecycle_comparison_artifact(
     if parse_iso_utc(artifact.get("created_at")) is None:
         return False
 
-    if not _is_bool(
-        artifact.get("live_lifecycle_gate_active")
-    ):
+    live_gate_active = artifact.get(
+        "live_lifecycle_gate_active"
+    )
+
+    if not _is_bool(live_gate_active):
         return False
 
     if not _is_bool(
@@ -1805,12 +1970,16 @@ def is_valid_lifecycle_comparison_artifact(
     ):
         return False
 
-    if not _is_nonneg_int(
-        artifact.get("observation_truncated_count")
-    ):
+    persisted_truncated = artifact.get(
+        "observation_truncated_count"
+    )
+
+    if not _is_nonneg_int(persisted_truncated):
         return False
 
-    if not isinstance(artifact.get("metrics"), dict):
+    metrics = artifact.get("metrics")
+
+    if not isinstance(metrics, dict):
         return False
 
     candidates = artifact.get("candidates")
@@ -1824,6 +1993,49 @@ def is_valid_lifecycle_comparison_artifact(
     for row in candidates:
         if not _valid_candidate_row(row):
             return False
+
+    # The effective live decision must agree with the artifact-level
+    # live-participation fact for EVERY row.
+    for row in candidates:
+        counterfactual = row["cognitive"][
+            "counterfactual_gate_decision"
+        ]
+
+        if row["cognitive"][
+            "effective_live_gate_decision"
+        ] != _effective_live_gate_decision(
+            counterfactual,
+            live_gate_active=live_gate_active,
+        ):
+            return False
+
+    # Truncation bookkeeping must be internally consistent with the
+    # persisted candidate rows.
+    if artifact.get("observation_truncated") is not (
+        persisted_truncated > 0
+    ):
+        return False
+
+    total = metrics.get("retrieval_candidate_count")
+
+    if not _is_nonneg_int(total):
+        return False
+
+    if persisted_truncated != max(
+        0, total - len(candidates)
+    ):
+        return False
+
+    # These artifacts are research evidence: a hand-falsified counter is
+    # not trustworthy. Recompute the request metrics from the validated
+    # candidate rows with the SAME builder helper and require agreement.
+    if metrics != _metrics(
+        candidates,
+        retrieval_candidate_count=total,
+        persisted_count=len(candidates),
+        truncated_count=persisted_truncated,
+    ):
+        return False
 
     return True
 
@@ -1855,6 +2067,7 @@ def update_memory_lifecycle_comparison(
     snapshot: Any,
     expected_unified_revision: Any,
     base_policy: Any,
+    live_lifecycle_gate_active: bool,
     as_of: datetime | None = None,
 ) -> dict[str, Any]:
     """Observe + persist one request's Legacy vs Cognitive comparison.
@@ -1865,6 +2078,10 @@ def update_memory_lifecycle_comparison(
     comparison data and NOTHING else. It consumes THIS request's
     request-local snapshot only and never re-reads a conversation-global
     Unified file.
+
+    ``live_lifecycle_gate_active`` is the explicit request-local
+    orchestration fact the coordinator computed for THIS request; it is
+    recorded verbatim and never re-derived from environment flags.
     """
 
     if not is_valid_conversation_id(
@@ -1951,6 +2168,9 @@ def update_memory_lifecycle_comparison(
         ),
         retrieval_candidate_count=(
             _retrieval_candidate_count(snapshot)
+        ),
+        live_lifecycle_gate_active=(
+            live_lifecycle_gate_active
         ),
         as_of=as_of,
     )

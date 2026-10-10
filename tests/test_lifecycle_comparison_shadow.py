@@ -34,6 +34,7 @@ from ombrebrain.context.memory_lifecycle_comparison_shadow import (
     MAX_COMPARISON_ROWS,
     MODE,
     VERSION,
+    _metrics,
     bind_legacy_lifecycle_comparison_engine,
     build_lifecycle_comparison_artifact,
     capture_legacy_lifecycle_observations,
@@ -550,6 +551,7 @@ class BuilderTests(_EngineBoundTestCase):
         eligible,
         observations,
         retrieval_candidate_count=None,
+        live_gate_active=False,
     ):
         return build_lifecycle_comparison_artifact(
             conversation_id=CID,
@@ -570,6 +572,7 @@ class BuilderTests(_EngineBoundTestCase):
                 is not None
                 else len(observations)
             ),
+            live_lifecycle_gate_active=live_gate_active,
             as_of=T0,
         )
 
@@ -769,6 +772,7 @@ class BuilderTests(_EngineBoundTestCase):
                     base_policy=eligible_policy([]),
                     legacy_observations=observations,
                     retrieval_candidate_count=1,
+                    live_lifecycle_gate_active=False,
                     as_of=T0,
                 )
 
@@ -972,6 +976,7 @@ class PersistenceTests(_EngineBoundTestCase):
                                 base_policy=eligible_policy(
                                     candidates
                                 ),
+                                live_lifecycle_gate_active=False,
                             )
                         )
 
@@ -1029,6 +1034,7 @@ class PersistenceTests(_EngineBoundTestCase):
                                 base_policy=eligible_policy(
                                     candidates
                                 ),
+                                live_lifecycle_gate_active=False,
                             )
                         )
 
@@ -1065,6 +1071,7 @@ class PersistenceTests(_EngineBoundTestCase):
                     base_policy=eligible_policy([mem]),
                     legacy_observations=observations,
                     retrieval_candidate_count=1,
+                    live_lifecycle_gate_active=False,
                     as_of=T0,
                 )
 
@@ -1165,6 +1172,7 @@ class IsolationTests(_EngineBoundTestCase):
             snapshot=snapshot,
             expected_unified_revision=revision,
             base_policy=eligible_policy(candidates),
+            live_lifecycle_gate_active=False,
         )
 
         self.assertTrue(report["stored"])
@@ -1484,7 +1492,7 @@ def _report_row(category, **overrides):
             "unified_admitted": True,
             "base_policy_available": True,
             "base_surfacing_eligible": True,
-            "base_eligible_rank": 0,
+            "base_eligible_rank": 1,
         },
         "legacy": {
             "available": True,
@@ -1534,6 +1542,8 @@ def _artifact(
     revision=5,
     live_gate_active=False,
 ):
+    total = len(rows) + truncated
+
     return {
         "version": VERSION,
         "mode": MODE,
@@ -1544,7 +1554,15 @@ def _artifact(
         "live_lifecycle_gate_active": live_gate_active,
         "observation_truncated": truncated > 0,
         "observation_truncated_count": truncated,
-        "metrics": {},
+        # The validator recomputes these from the rows with the SAME
+        # builder helper, so a fixture artifact must carry the real
+        # metrics -- an empty / hand-written dict is now invalid.
+        "metrics": _metrics(
+            rows,
+            retrieval_candidate_count=total,
+            persisted_count=len(rows),
+            truncated_count=truncated,
+        ),
         "candidates": rows,
     }
 
@@ -1925,6 +1943,8 @@ class PipelineCompositionTests(
         memories,
         comparison_impl=None,
         policy_mock=None,
+        integration_on=False,
+        lifecycle_shadow_on=False,
     ):
         body = b'{"messages":[]}'
 
@@ -1936,6 +1956,12 @@ class PipelineCompositionTests(
             ),
             COMPARISON_SHADOW_ENV: (
                 "1" if comparison_on else "0"
+            ),
+            INTEGRATION_ENV: (
+                "1" if integration_on else "0"
+            ),
+            "OMBRE_GATEWAY_MEMORY_LIFECYCLE_SHADOW": (
+                "1" if lifecycle_shadow_on else "0"
             ),
             "OMBRE_CONTEXT_STATE_DIR": root,
         }
@@ -2160,6 +2186,153 @@ class PipelineCompositionTests(
 
         self.assertEqual(after, baseline)
 
+    def _comparison_artifact(self, root):
+        files = sorted(
+            self._comparison_dir(root).glob("*.json")
+        )
+
+        self.assertEqual(len(files), 1)
+
+        return json.loads(
+            files[0].read_text(encoding="utf-8")
+        )
+
+    async def _live_gate_case(
+        self,
+        *,
+        flash_on,
+        integration_on,
+        lifecycle_shadow_on,
+    ):
+        memories = [memory(_A), memory(_B)]
+
+        policy = eligible_policy(
+            memories, source_unified_revision=5
+        )
+
+        with tempfile.TemporaryDirectory() as root:
+            # Both candidates carry a real, DORMANT ``used`` history:
+            # the supplementary candidate's counterfactual MUST still be
+            # computed (would_suppress) regardless of Flash.
+            record_use(
+                root, _A, used_at=T0 - hours(500)
+            )
+            record_use(
+                root, _B, used_at=T0 - hours(500)
+            )
+
+            await self._run(
+                root=root,
+                comparison_on=True,
+                flash_on=flash_on,
+                memories=memories,
+                policy_mock=Mock(
+                    return_value=policy
+                ),
+                integration_on=integration_on,
+                lifecycle_shadow_on=lifecycle_shadow_on,
+            )
+
+            return self._comparison_artifact(root)
+
+    async def test_live_gate_matrix_a_flash_off(self):
+        # comparison ON, flash OFF, integration ON, shadow ON.
+        artifact = await self._live_gate_case(
+            flash_on=False,
+            integration_on=True,
+            lifecycle_shadow_on=True,
+        )
+
+        self.assertIs(
+            artifact["live_lifecycle_gate_active"],
+            False,
+        )
+
+        decisions = [
+            row["cognitive"][
+                "counterfactual_gate_decision"
+            ]
+            for row in artifact["candidates"]
+        ]
+
+        # The counterfactual is STILL computed while Flash is OFF.
+        self.assertIn("would_suppress", decisions)
+
+        for row in artifact["candidates"]:
+            self.assertEqual(
+                row["cognitive"][
+                    "effective_live_gate_decision"
+                ],
+                "gate_disabled",
+            )
+
+    async def test_live_gate_matrix_b_integration_off(self):
+        # comparison ON, flash ON, integration OFF, shadow ON.
+        artifact = await self._live_gate_case(
+            flash_on=True,
+            integration_on=False,
+            lifecycle_shadow_on=True,
+        )
+
+        self.assertIs(
+            artifact["live_lifecycle_gate_active"],
+            False,
+        )
+
+        for row in artifact["candidates"]:
+            self.assertEqual(
+                row["cognitive"][
+                    "effective_live_gate_decision"
+                ],
+                "gate_disabled",
+            )
+
+    async def test_live_gate_matrix_c_lifecycle_shadow_off(
+        self,
+    ):
+        # comparison ON, flash ON, integration ON, shadow OFF.
+        artifact = await self._live_gate_case(
+            flash_on=True,
+            integration_on=True,
+            lifecycle_shadow_on=False,
+        )
+
+        self.assertIs(
+            artifact["live_lifecycle_gate_active"],
+            False,
+        )
+
+        for row in artifact["candidates"]:
+            self.assertEqual(
+                row["cognitive"][
+                    "effective_live_gate_decision"
+                ],
+                "gate_disabled",
+            )
+
+    async def test_live_gate_matrix_d_all_on(self):
+        # comparison ON, flash ON, integration ON, shadow ON.
+        artifact = await self._live_gate_case(
+            flash_on=True,
+            integration_on=True,
+            lifecycle_shadow_on=True,
+        )
+
+        self.assertIs(
+            artifact["live_lifecycle_gate_active"],
+            True,
+        )
+
+        for row in artifact["candidates"]:
+            self.assertEqual(
+                row["cognitive"][
+                    "effective_live_gate_decision"
+                ],
+                row["cognitive"][
+                    "counterfactual_gate_decision"
+                ],
+            )
+
 
 # ------------------------------------------------------------------
 # Review fixes: base-policy / unified binding, tri-state, validator,
@@ -2181,6 +2354,7 @@ def _build_artifact(
     unified_candidates=None,
     unified_conversation=CID,
     retrieval_candidate_count=None,
+    live_gate_active=False,
 ):
     if base_policy is _UNSET:
         base_policy = eligible_policy(
@@ -2211,6 +2385,7 @@ def _build_artifact(
             if retrieval_candidate_count is not None
             else len(observations)
         ),
+        live_lifecycle_gate_active=live_gate_active,
         as_of=T0,
     )
 
@@ -2335,10 +2510,53 @@ class BasePolicyBindingTests(_EngineBoundTestCase):
         policy["eligible"] = "not-a-list"
         self._assert_unknown(self._row(policy))
 
+    def test_unknown_string_decision_is_unknown(self):
+        for bad in (
+            "banana",
+            "corrupt",
+            "future_v2_decision",
+            "",
+        ):
+            with self.subTest(decision=bad):
+                self._assert_unknown(
+                    self._row(
+                        eligible_policy(
+                            [candidate(_A)],
+                            decision=bad,
+                        )
+                    )
+                )
+
+    def test_non_string_decision_is_unknown(self):
+        for bad in (None, 3, True, ["allow_shadow"]):
+            with self.subTest(decision=bad):
+                self._assert_unknown(
+                    self._row(
+                        eligible_policy(
+                            [candidate(_A)],
+                            decision=bad,
+                        )
+                    )
+                )
+
+    def test_contradictory_no_surface_is_unknown(self):
+        # The real v1 contract carries an EMPTY eligible set for
+        # ``no_surface``. A contradictory policy that still lists
+        # eligible candidates is malformed evidence, never a
+        # trustworthy "not eligible".
+        self._assert_unknown(
+            self._row(
+                eligible_policy(
+                    [candidate(_A)],
+                    decision="no_surface",
+                )
+            )
+        )
+
     def test_valid_bound_no_surface_is_not_eligible(self):
         row = self._row(
             eligible_policy(
-                [candidate(_A)], decision="no_surface"
+                [], decision="no_surface"
             )
         )
 
@@ -2480,6 +2698,7 @@ class UnifiedBindingTests(_EngineBoundTestCase):
                     base_policy=eligible_policy(
                         candidates
                     ),
+                    live_lifecycle_gate_active=False,
                 )
 
             self.assertFalse(report["stored"])
@@ -2551,6 +2770,7 @@ class UnifiedBindingTests(_EngineBoundTestCase):
                     base_policy=eligible_policy(
                         candidates
                     ),
+                    live_lifecycle_gate_active=False,
                 )
 
             self.assertFalse(report["stored"])
@@ -3098,6 +3318,361 @@ class ArtifactValidatorTests(unittest.TestCase):
         )
 
 
+class AdversarialValidatorMatrixTests(_EngineBoundTestCase):
+    """Review §4: mutate ONE field on a REAL builder artifact and prove
+    the WHOLE artifact is rejected and contributes ZERO to the report.
+
+    Every case starts from a genuinely built artifact (real evaluators,
+    real base policy, recomputed metrics), asserts that baseline is
+    valid, then falsifies exactly one derived label / shape. Where the
+    mutation is row-level, the metrics are refreshed first so the ONLY
+    remaining inconsistency is the intended semantic one.
+    """
+
+    def _assert_whole_invalid_and_zeroed(self, artifact):
+        self.assertFalse(
+            is_valid_lifecycle_comparison_artifact(
+                artifact
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as root:
+            _write_artifact(root, CID, RID, artifact)
+
+            report = reporter.build_report(root=root)
+
+        self.assertEqual(report["artifact_count"], 1)
+        self.assertEqual(
+            report["valid_artifact_count"], 0
+        )
+        self.assertEqual(
+            report["invalid_artifact_count"], 1
+        )
+        self.assertEqual(report["candidate_count"], 0)
+
+        for name, count in report[
+            "category_counts"
+        ].items():
+            with self.subTest(category=name):
+                self.assertEqual(count, 0)
+
+        self.assertEqual(
+            report["distributions"][
+                "cognitive_strength"
+            ]["count"],
+            0,
+        )
+
+    def _refresh_metrics(self, artifact):
+        rows = artifact["candidates"]
+
+        artifact["metrics"] = _metrics(
+            rows,
+            retrieval_candidate_count=artifact[
+                "metrics"
+            ]["retrieval_candidate_count"],
+            persisted_count=len(rows),
+            truncated_count=artifact[
+                "observation_truncated_count"
+            ],
+        )
+
+    def _primary_artifact(self):
+        # Real builder artifact: one OBSERVED + KEPT primary
+        # candidate (legacy KEEP, cognitive KEEP, rank 0).
+        with tempfile.TemporaryDirectory() as root:
+            record_use(root, _A, used_at=T0)
+
+            candidates = [candidate(_A)]
+
+            engine = SpyDecayEngine([_preview()])
+            bind_legacy_lifecycle_comparison_engine(
+                engine
+            )
+
+            observations = (
+                capture_legacy_lifecycle_observations(
+                    candidates
+                )
+            )
+
+            with state_env(root):
+                return _build_artifact(
+                    candidates=candidates,
+                    observations=observations,
+                    eligible=candidates,
+                )
+
+    def _kept_pair_artifact(self):
+        # Real builder artifact: rank 0 primary + rank 1 observed keep.
+        with tempfile.TemporaryDirectory() as root:
+            record_use(root, _A, used_at=T0)
+            record_use(root, _B, used_at=T0)
+
+            candidates = [
+                candidate(_A),
+                candidate(_B),
+            ]
+
+            engine = SpyDecayEngine(
+                [_preview(), _preview()]
+            )
+            bind_legacy_lifecycle_comparison_engine(
+                engine
+            )
+
+            observations = (
+                capture_legacy_lifecycle_observations(
+                    candidates
+                )
+            )
+
+            with state_env(root):
+                return _build_artifact(
+                    candidates=candidates,
+                    observations=observations,
+                    eligible=candidates,
+                )
+
+    def _binding_unavailable_artifact(self):
+        candidates = [{"content": "no identity"}]
+
+        engine = SpyDecayEngine([_preview()])
+        bind_legacy_lifecycle_comparison_engine(engine)
+
+        observations = (
+            capture_legacy_lifecycle_observations(
+                candidates
+            )
+        )
+
+        return _build_artifact(
+            candidates=candidates,
+            observations=observations,
+            eligible=candidates,
+        )
+
+    # 1. legacy KEEP + cognitive KEEP, category changed to a suppress
+    #    category that contradicts the row's own evidence.
+    def test_case1_category_contradicts_evidence(self):
+        artifact = self._primary_artifact()
+
+        row = artifact["candidates"][0]
+
+        self.assertEqual(
+            row["comparison"]["category"],
+            "legacy_keep_cognitive_keep",
+        )
+
+        row["comparison"][
+            "category"
+        ] = "legacy_archive_cognitive_suppress"
+
+        self._refresh_metrics(artifact)
+
+        self._assert_whole_invalid_and_zeroed(
+            artifact
+        )
+
+    # 2. base_policy_available=false but counterfactual=would_suppress.
+    def test_case2_policy_unavailable_but_suppress(self):
+        artifact = self._primary_artifact()
+
+        binding = artifact["candidates"][0]["binding"]
+
+        binding["base_policy_available"] = False
+        binding["base_surfacing_eligible"] = None
+        binding["base_eligible_rank"] = None
+
+        artifact["candidates"][0]["cognitive"][
+            "counterfactual_gate_decision"
+        ] = "would_suppress"
+
+        self._refresh_metrics(artifact)
+
+        self._assert_whole_invalid_and_zeroed(
+            artifact
+        )
+
+    # 3. base eligible rank=0 but counterfactual=would_suppress.
+    def test_case3_primary_rank_but_suppress(self):
+        artifact = self._primary_artifact()
+
+        row = artifact["candidates"][0]
+
+        self.assertEqual(
+            row["binding"]["base_eligible_rank"], 0
+        )
+
+        row["cognitive"][
+            "counterfactual_gate_decision"
+        ] = "would_suppress"
+
+        self._refresh_metrics(artifact)
+
+        self._assert_whole_invalid_and_zeroed(
+            artifact
+        )
+
+    # 4. live_lifecycle_gate_active=false but effective=would_suppress.
+    def test_case4_live_off_effective_suppress(self):
+        artifact = self._primary_artifact()
+
+        self.assertIs(
+            artifact["live_lifecycle_gate_active"],
+            False,
+        )
+
+        row = artifact["candidates"][0]
+
+        self.assertEqual(
+            row["cognitive"][
+                "counterfactual_gate_decision"
+            ],
+            "primary_preserved",
+        )
+
+        row["cognitive"][
+            "effective_live_gate_decision"
+        ] = "would_suppress"
+
+        self._refresh_metrics(artifact)
+
+        self._assert_whole_invalid_and_zeroed(
+            artifact
+        )
+
+    # 5. live=true, counterfactual=would_keep, effective=would_suppress.
+    def test_case5_live_on_effective_mismatch(self):
+        artifact = self._kept_pair_artifact()
+
+        artifact["live_lifecycle_gate_active"] = True
+
+        row = artifact["candidates"][1]
+
+        self.assertEqual(
+            row["cognitive"][
+                "counterfactual_gate_decision"
+            ],
+            "would_keep",
+        )
+
+        row["cognitive"][
+            "effective_live_gate_decision"
+        ] = "would_suppress"
+
+        self._refresh_metrics(artifact)
+
+        self._assert_whole_invalid_and_zeroed(
+            artifact
+        )
+
+    # 6. available=false, observed=null, use_count=5.
+    def test_case6_unavailable_with_use_count(self):
+        artifact = self._primary_artifact()
+
+        cog = artifact["candidates"][0]["cognitive"]
+
+        cog["available"] = False
+        cog["observed"] = None
+        cog["use_count"] = 5
+        cog["strength"] = None
+        cog["accessibility"] = None
+        cog["salience"] = None
+        cog["age_since_last_used_hours"] = None
+        cog["would_suppress_if_supplementary"] = False
+        cog["would_keep_if_supplementary"] = False
+
+        self._refresh_metrics(artifact)
+
+        self._assert_whole_invalid_and_zeroed(
+            artifact
+        )
+
+    # 7. available=false but strength=0.5.
+    def test_case7_unavailable_with_strength(self):
+        artifact = self._primary_artifact()
+
+        cog = artifact["candidates"][0]["cognitive"]
+
+        cog["available"] = False
+        cog["observed"] = None
+        cog["use_count"] = 0
+        cog["strength"] = 0.5
+        cog["accessibility"] = None
+        cog["salience"] = None
+        cog["age_since_last_used_hours"] = None
+        cog["would_suppress_if_supplementary"] = False
+        cog["would_keep_if_supplementary"] = False
+
+        self._refresh_metrics(artifact)
+
+        self._assert_whole_invalid_and_zeroed(
+            artifact
+        )
+
+    # 8. available=true, observed=false, would_keep=true.
+    def test_case8_neutral_with_keep_claim(self):
+        artifact = self._primary_artifact()
+
+        cog = artifact["candidates"][0]["cognitive"]
+
+        cog["available"] = True
+        cog["observed"] = False
+        cog["use_count"] = 0
+        cog["strength"] = None
+        cog["accessibility"] = None
+        cog["salience"] = None
+        cog["age_since_last_used_hours"] = None
+        cog["would_suppress_if_supplementary"] = False
+        cog["would_keep_if_supplementary"] = True
+
+        self._refresh_metrics(artifact)
+
+        self._assert_whole_invalid_and_zeroed(
+            artifact
+        )
+
+    # 9. binding_unavailable category but base_policy_available=true.
+    def test_case9_binding_unavailable_with_claim(self):
+        artifact = self._binding_unavailable_artifact()
+
+        row = artifact["candidates"][0]
+
+        self.assertEqual(
+            row["comparison"]["category"],
+            "binding_unavailable",
+        )
+
+        row["binding"]["base_policy_available"] = True
+        row["binding"]["base_surfacing_eligible"] = False
+        row["binding"]["base_eligible_rank"] = None
+
+        self._refresh_metrics(artifact)
+
+        self._assert_whole_invalid_and_zeroed(
+            artifact
+        )
+
+    # 10. valid rows but top-level metrics manually falsified.
+    def test_case10_falsified_metrics(self):
+        artifact = self._primary_artifact()
+
+        self.assertTrue(
+            is_valid_lifecycle_comparison_artifact(
+                artifact
+            )
+        )
+
+        artifact["metrics"][
+            "observed_candidate_count"
+        ] += 1
+
+        self._assert_whole_invalid_and_zeroed(
+            artifact
+        )
+
+
 class ReporterBoundTests(unittest.TestCase):
     """Review §16: a programmatic limit can never become unbounded."""
 
@@ -3216,6 +3791,10 @@ class GateSemanticsTests(_EngineBoundTestCase):
     def test_gate_active_effective_matches_counterfactual(
         self,
     ):
+        # The builder records the explicit request-local orchestration
+        # fact it is given; it no longer infers it from environment
+        # flags. With live participation TRUE the effective decision
+        # must equal the (unchanged) counterfactual.
         with tempfile.TemporaryDirectory() as root:
             record_use(
                 root, _B, used_at=T0 - hours(500)
@@ -3238,20 +3817,12 @@ class GateSemanticsTests(_EngineBoundTestCase):
             )
 
             with state_env(root):
-                with patch.dict(
-                    os.environ,
-                    {
-                        INTEGRATION_ENV: "1",
-                        "OMBRE_GATEWAY_MEMORY_"
-                        "LIFECYCLE_SHADOW": "1",
-                    },
-                    clear=False,
-                ):
-                    artifact = _build_artifact(
-                        candidates=candidates,
-                        observations=observations,
-                        eligible=candidates,
-                    )
+                artifact = _build_artifact(
+                    candidates=candidates,
+                    observations=observations,
+                    eligible=candidates,
+                    live_gate_active=True,
+                )
 
         self.assertIs(
             artifact["live_lifecycle_gate_active"],

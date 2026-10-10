@@ -34,6 +34,8 @@ from ombrebrain.context.memory_lifecycle_comparison_shadow import (
 )
 from ombrebrain.context.memory_surfacing_lifecycle import (
     apply_lifecycle_surfacing_gate,
+    lifecycle_shadow_enabled,
+    lifecycle_surfacing_enabled,
 )
 from ombrebrain.context.memory_surfacing_policy import (
     evaluate_surfacing_policy,
@@ -190,6 +192,29 @@ def _apply_lifecycle_surfacing(
         )
 
         return policy
+
+
+def _lifecycle_surfacing_gate_active(
+    *,
+    flash_enabled: bool,
+) -> bool:
+    """Whether the LIVE lifecycle Surfacing gate actually participated.
+
+    The coordinator owns request execution reality: the lifecycle gate
+    is only ever applied inside ``if flash_enabled:`` (see below), and
+    ``apply_lifecycle_surfacing_gate`` itself is a no-op unless the
+    integration AND the lifecycle shadow are both enabled. This mirrors
+    that exact condition -- reusing the real helpers, never re-parsing
+    flags -- so the comparison records a truthful orchestration fact. It
+    is deliberately independent of the COUNTERFACTUAL analysis, which
+    the comparison still computes while Flash is OFF.
+    """
+
+    return bool(
+        flash_enabled
+        and lifecycle_surfacing_enabled()
+        and lifecycle_shadow_enabled()
+    )
 
 
 def observe_context_confidence(
@@ -683,6 +708,11 @@ def observe_memory_exposure_shadow(
                         expected_unified_revision
                     ),
                     base_policy=policy,
+                    live_lifecycle_gate_active=(
+                        _lifecycle_surfacing_gate_active(
+                            flash_enabled=flash_enabled,
+                        )
+                    ),
                 )
             )
 
