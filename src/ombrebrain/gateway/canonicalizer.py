@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from copy import deepcopy
+from dataclasses import dataclass
 import re
 from typing import Any
 
@@ -44,6 +45,10 @@ _ATTR_RE = re.compile(
 # Current Operit message_insert package.
 _OPERIT_EXTRA_ID_PREFIX = "message_insert_extra_bundle_"
 _OPERIT_EXTRA_FILENAME_PREFIX = "Time:"
+
+# A separate front-end memory attachment. This is the ONLY filename
+# that may ever be classified / extracted as Frontend Memory.
+_FRONTEND_MEMORY_FILENAME = "relevant_memories.txt"
 
 # Older message_insert attachment forms kept for compatibility.
 _LEGACY_EXTRA_FILENAMES = {
@@ -93,7 +98,7 @@ def _classify_attachment(attrs: dict[str, str]) -> SegmentKind:
         return SegmentKind.DYNAMIC_CONTEXT
 
     # A separate front-end memory attachment, if one exists.
-    if filename_lower == "relevant_memories.txt":
+    if filename_lower == _FRONTEND_MEMORY_FILENAME:
         return SegmentKind.FRONTEND_MEMORY
 
     # Keep this conservative: only attachment metadata may trigger
@@ -206,6 +211,130 @@ def split_operit_text(
         )
 
     return tuple(blocks)
+
+
+@dataclass(frozen=True)
+class FrontendMemorySegment:
+    """One explicitly identified Frontend Memory attachment body.
+
+    Only an ``<attachment filename="relevant_memories.txt">`` envelope
+    produces a segment. ``body`` is the exact inner text of the
+    attachment (no trimming, no normalization). ``placement`` is the
+    canonical position in the request: ``"current"`` for the current
+    user message, ``"history"`` otherwise.
+    """
+
+    placement: str
+    source_message_index: int
+    source_block_index: int
+    body: str
+
+
+def _parse_single_attachment(
+    raw: Any,
+) -> tuple[str, str] | None:
+    """Parse exactly one attachment envelope, or return None.
+
+    Fail-safe by construction: anything that is not a single, fully
+    matched attachment envelope returns None. The attachment grammar
+    is never duplicated -- this reuses the same ``_ATTACHMENT_RE`` /
+    ``_ATTR_RE`` the canonical splitter uses.
+    """
+
+    if not isinstance(raw, str):
+        return None
+
+    match = _ATTACHMENT_RE.fullmatch(raw)
+
+    if match is None:
+        return None
+
+    attrs_text = match.group("attrs")
+
+    if attrs_text is None:
+        attrs_text = match.group("self_attrs") or ""
+
+    attrs = _attachment_attrs(attrs_text)
+
+    body = match.group("body")
+
+    return attrs.get("filename", ""), (
+        body if body is not None else ""
+    )
+
+
+def extract_frontend_memory_segments(
+    request: CanonicalRequest,
+) -> tuple[FrontendMemorySegment, ...]:
+    """Public, fail-safe accessor for canonical Frontend Memory.
+
+    This is the single supported way for another package to read
+    Frontend Memory structure from a canonical request. It does NOT
+    expose the private attachment grammar and does NOT reclassify
+    ordinary text: a segment is returned only when the canonical
+    splitter already tagged the block ``SegmentKind.FRONTEND_MEMORY``
+    AND the envelope's own filename is exactly
+    ``relevant_memories.txt``.
+
+    Malformed / unknown / self-closing / empty attachments are
+    skipped, so a broken attachment can never be treated as trusted
+    Frontend Memory.
+    """
+
+    segments: list[FrontendMemorySegment] = []
+
+    messages = list(request.history)
+
+    if request.current is not None:
+        messages.append(request.current)
+
+    for message in messages:
+        placement = (
+            "current"
+            if message is request.current
+            else "history"
+        )
+
+        for block in message.blocks:
+            if (
+                block.kind
+                is not SegmentKind.FRONTEND_MEMORY
+            ):
+                continue
+
+            parsed = _parse_single_attachment(
+                block.text
+            )
+
+            if parsed is None:
+                continue
+
+            filename, body = parsed
+
+            if (
+                filename.lower()
+                != _FRONTEND_MEMORY_FILENAME
+            ):
+                # Defensive: classification already required this.
+                continue
+
+            if not body.strip():
+                continue
+
+            segments.append(
+                FrontendMemorySegment(
+                    placement=placement,
+                    source_message_index=(
+                        block.source_message_index
+                    ),
+                    source_block_index=(
+                        block.source_block_index
+                    ),
+                    body=body,
+                )
+            )
+
+    return tuple(segments)
 
 
 def _canonicalize_message(

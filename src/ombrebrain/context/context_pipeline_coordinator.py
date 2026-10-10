@@ -24,6 +24,9 @@ from ombrebrain.context.memory_recall_surface import (
 from ombrebrain.context.memory_flash_live_exposure import (
     select_live_memory_flash_body,
 )
+from ombrebrain.context.memory_source_arbitration_shadow import (
+    update_memory_source_arbitration,
+)
 from ombrebrain.context.memory_surfacing_lifecycle import (
     apply_lifecycle_surfacing_gate,
 )
@@ -129,6 +132,16 @@ _MEMORY_SURFACING_LIFECYCLE_ENV = (
 # Default OFF.
 _MEMORY_FLASH_LIVE_EXPOSURE_ENV = (
     "OMBRE_GATEWAY_CONTEXT_MEMORY_FLASH_LIVE_EXPOSURE"
+)
+
+# Frontend Memory Arbitration Shadow master flag. It is an observer
+# that runs on the request-local Unified snapshot THIS request just
+# produced, so it never starts the Memory observer pipeline on its
+# own: the existing Unified chain must already be running for THIS
+# request. Default OFF and observation-only -- it never removes,
+# rewrites or converts Frontend Memory and never changes the body.
+_MEMORY_SOURCE_ARBITRATION_ENV = (
+    "OMBRE_GATEWAY_CONTEXT_MEMORY_SOURCE_ARBITRATION_SHADOW"
 )
 
 
@@ -332,6 +345,112 @@ def observe_context_confidence(
     )
 
     return report
+
+
+def observe_memory_source_arbitration(
+    conversation_id: str | None,
+    *,
+    cognitive_request_id: str | None,
+    snapshot: Any,
+    expected_unified_revision: Any,
+    forward_body: bytes,
+) -> None:
+    """Observe the Frontend Memory vs OB Memory access asymmetry.
+
+    Shadow-only and fail-open. It measures an asymmetry that already
+    exists in the baseline and changes nothing about it:
+
+      Frontend Memory (``relevant_memories.txt``) full content is
+      already model-visible in the live request, preserved by cache
+      rewriting and excluded from Conversation Snapshot USER_TEXT-
+      derived semantic state;
+      OB / cognitive memory only reaches the model through a bounded
+      Memory Flash cue and an explicit Recall.
+
+    Being present in the request is NOT recalled / used / reinforced:
+    those later stages are never modelled and are never fabricated
+    here.
+
+    It consumes request-local evidence only: THIS request's forwarded
+    body (Frontend candidates) and THIS request's own Unified memory
+    shadow snapshot (OB candidates + the exact Unified revision). It
+    never re-reads the shared conversation-level Unified file, so two
+    concurrent same-conversation requests cannot cross-contaminate,
+    and it never re-runs retrieval, re-embeds, re-ranks or calls a
+    model / external API.
+
+    Only privacy-safe telemetry is logged (mode, stored, decision,
+    reason, counts, estimated tokens, revisions, shares). No Frontend
+    Memory text, OB memory text, cue, user text, memref, useref, raw
+    memory id, conversation id or cognitive request id is logged.
+    """
+
+    if not _truthy(
+        os.environ.get(
+            _MEMORY_SOURCE_ARBITRATION_ENV
+        )
+    ):
+        return
+
+    if (
+        not isinstance(conversation_id, str)
+        or not isinstance(
+            cognitive_request_id,
+            str,
+        )
+    ):
+        return
+
+    try:
+        report = update_memory_source_arbitration(
+            conversation_id=conversation_id,
+            cognitive_request_id=(
+                cognitive_request_id
+            ),
+            snapshot=snapshot,
+            expected_unified_revision=(
+                expected_unified_revision
+            ),
+            forward_body=forward_body,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[gateway.context_memory_source_arbitration] "
+            "observer_failed=%s fail_open=true",
+            type(exc).__name__,
+        )
+        return
+
+    if not isinstance(report, dict):
+        return
+
+    # Explicit privacy-safe allowlist: the report is never spread
+    # into the log line, so an unexpected extra field (text, ids)
+    # can never leak, and no conversation / request id is logged.
+    logger.info(
+        "[gateway.context_memory_source_arbitration] %s",
+        json.dumps(
+            {
+                "mode": report.get("mode"),
+                "stored": report.get("stored"),
+                "decision": report.get(
+                    "decision"
+                ),
+                "reason": report.get("reason"),
+                "ob_observation_available":
+                    report.get(
+                        "ob_observation_available"
+                    ),
+                "source_unified_revision":
+                    report.get(
+                        "source_unified_revision"
+                    ),
+                "metrics": report.get("metrics"),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+    )
 
 
 def observe_memory_exposure_shadow(
@@ -733,6 +852,7 @@ async def observe_unified_preview_gate(
     conversation_id: str | None,
     *,
     cognitive_request_id: str | None = None,
+    forward_body: bytes | None = None,
 ) -> bool:
     """Refresh the Unified -> Preview -> Gate chain for this request.
 
@@ -751,6 +871,10 @@ async def observe_unified_preview_gate(
     ``cognitive_request_id`` is the internal, per-request identity
     used only by the Memory Flash / Exposure Ledger observers. It is
     never added to the body, a header, a cache key or a log.
+
+    ``forward_body`` is the exact bytes this request will forward. It
+    is only read (never mutated) by the Frontend Memory Arbitration
+    Shadow observer, which analyses the same bytes the model sees.
     """
 
     unified_enabled = _truthy(
@@ -822,6 +946,16 @@ async def observe_unified_preview_gate(
         or recall_surface_enabled
     )
 
+    # Frontend Memory Arbitration Shadow (default OFF). Like the other
+    # Memory observers it consumes THIS request's own Unified memory
+    # shadow snapshot, so when it is on it refreshes the Unified chain
+    # for this request instead of silently doing nothing.
+    memory_arbitration_enabled = _truthy(
+        os.environ.get(
+            _MEMORY_SOURCE_ARBITRATION_ENV
+        )
+    )
+
     if not (
         unified_enabled
         or preview_enabled
@@ -830,6 +964,7 @@ async def observe_unified_preview_gate(
         or confidence_enabled
         or real_injection_enabled
         or memory_observer_enabled
+        or memory_arbitration_enabled
     ):
         return False
 
@@ -1034,6 +1169,37 @@ async def observe_unified_preview_gate(
                 "observer_failed=%s fail_open=true",
                 type(exc).__name__,
             )
+
+    # Frontend Memory Arbitration Shadow. It measures the access
+    # asymmetry between Frontend Memory (already model-visible) and
+    # OB memory (cue + Recall only). It consumes THIS request's own
+    # forwarded body and Unified snapshot only, is fail-open and never
+    # changes the body. Being present in the request is not recalled /
+    # used / reinforced, so no later stage is invented here.
+    if (
+        memory_arbitration_enabled
+        and unified.get("stored")
+        and isinstance(forward_body, bytes)
+        and isinstance(
+            cognitive_request_id,
+            str,
+        )
+    ):
+        observe_memory_source_arbitration(
+            conversation_id,
+            cognitive_request_id=(
+                cognitive_request_id
+            ),
+            snapshot=(
+                unified.get(
+                    "memory_shadow_snapshot"
+                )
+            ),
+            expected_unified_revision=(
+                unified.get("revision")
+            ),
+            forward_body=forward_body,
+        )
 
     if not (
         preview_enabled
@@ -1799,6 +1965,7 @@ async def _run_context_pipeline_selection(
                 cognitive_request_id=(
                     cognitive_request_id
                 ),
+                forward_body=forward_body,
             )
         )
 
