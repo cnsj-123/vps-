@@ -9,12 +9,19 @@ and the code disagree, the code is correct and this document is wrong.
 
 - Repository source of truth: the tree at the baseline commit below.
 - Baseline: `origin/feature/gateway-v2`
-- Baseline HEAD: `50562653d81c1a5a6746ff52c8f7136808eeaac9`
-- Baseline tree: `6fce3b2ba45c516ec257176106db863d73af07f5`
+- Baseline HEAD: `ab586b34d0265a713d3e3ed3ac60741246093ed2`
+  (merge of PR#2, `trae/request-local-cognitive-workspace-v0`)
 - Audit date context: originally written for the Frontend Memory Arbitration
   Shadow task (branch `trae/frontend-memory-arbitration-shadow-v1`), then
   updated for the Request-local Cognitive Workspace Foundation v0 task
-  (branch `trae/request-local-cognitive-workspace-v0`).
+  (branch `trae/request-local-cognitive-workspace-v0`), then updated for the
+  Memory Lifecycle Authority Map + Dual-Authority Guardrails v0 task
+  (branch `trae/lifecycle-authority-audit-v0`).
+
+Companion document: **`docs/cognitive-memory/LIFECYCLE_AUTHORITY_MAP.md`** is the
+exact call-site / authority matrix for the legacy and cognitive lifecycle planes
+(referenced from §2.19, §2.20, §2.21 and §8). It is itself a WORKING DRAFT /
+REALITY MAP, not an ADR or specification.
 
 Everything below is derived by reading the real modules listed next to each
 stage. Where a claim could not be verified from code it is explicitly marked
@@ -504,15 +511,33 @@ retrieval, surfacing, exposure, or Recall alone.
 | Field | Value |
 | --- | --- |
 | Owner | `src/decay_engine.py` |
-| Input | memory buckets / activation metadata |
+| Input (read-only legacy metadata) | `importance` / `activation_count` / `last_active` / `created` / `arousal` / `resolved` / `digested` |
 | Output | decay / forgetting over long horizons |
-| Persisted | legacy bucket metadata |
+| Persisted | legacy lifecycle transitions only (auto-`resolved`, archive move) |
 | Shadow/Live | **live legacy subsystem**, independent of the new chain |
 | Flag | none in the new chain |
 | Mutates provider request | no |
-| Mutates canonical memory | yes (legacy activation/importance fields) |
+| Mutates canonical memory | yes — automatic `resolved` write + archive transition; does **not** write `activation_count` / `last_active` / `importance` |
 | Lifecycle effect | yes, in the **legacy** model |
-| Downstream | legacy retrieval / ranking |
+| Downstream | legacy spontaneous surfacing / Dream truncation / archive decision / read-only score consumers; **not** canonical `BucketManager.search` retrieval scoring |
+
+Authority (exact; see `LIFECYCLE_AUTHORITY_MAP.md` §3.8, §9 and §10): where it is
+**running**, `DecayEngine` has real **canonical + archive authority**.
+`run_decay_cycle()` auto-resolves buckets (`importance <= 4` and `> 30` days since
+last activation) and archives buckets whose `calculate_score()` falls below the
+threshold; it never deletes. `calculate_score()` also drives Dream candidate
+truncation (`tools/dream/candidates.py`) and spontaneous-`breath` ranking, so the
+legacy score has Dream-selection influence, not only an archive role. It is
+started eagerly by the `streamable-http` lifespan and, under stdio, lazily on the
+first use of `breath` / `dream` / `hold` / `grow` / `anchor` / `plan` / `i` via
+`ensure_started()`. That start asymmetry is a real runtime authority asymmetry
+and is documented, not "fixed", in the lifecycle audit.
+
+### 2.21.1 (Deprecated label) "legacy DecayEngine vs new lifecycle"
+
+Both subsystems exist and both are authorities, but they are **different scopes**,
+not two candidates for one job. See §8 for the current reality and why the old
+"two lifecycle-ish authorities coexist" framing under-stated it.
 
 ### 2.22 Request-local Cognitive Workspace (v0)
 
@@ -757,6 +782,17 @@ demonstrated correctness / data-integrity / authority violations.
   There is no single authority that decides what the model is allowed to see
   across both sources. This is the question the shadow phase exists to measure;
   it is **not** fixed here, and no current invariant is violated by it.
+- **OA-2 — The system has parallel lifecycle authorities with different scopes,
+  not one lifecycle owner (re-prioritized by the lifecycle authority audit).**
+  This was previously recorded low (as "P2-2, two lifecycle-ish modules coexist")
+  but real authority is not mere coexistence. See §8 and
+  `LIFECYCLE_AUTHORITY_MAP.md`. Concretely: legacy `DecayEngine` holds **real
+  canonical + archive authority where it runs** (auto-resolve, auto-archive; its
+  score also drives Dream truncation); the new cognitive lifecycle holds
+  **supplementary Memory Flash surfacing authority when its gates are ON** and
+  owns cognitive `used`/reinforcement/`strength`-`accessibility`-`salience`. The
+  two planes **do not currently mutate each other's state**. Migration to a single
+  owner is **unresolved** and is not attempted by the audit.
 
 ### P1 — architecture debt likely to hurt the next stages
 
@@ -796,9 +832,10 @@ demonstrated correctness / data-integrity / authority violations.
   canonical summary (`observer.py`) re-canonicalizes; Snapshot/Compact also
   canonicalize. This is acceptable but is duplicated work; a future phase may
   thread one canonical request through the coordinator instead of re-parsing.
-- **P2-2 — Legacy `decay_engine.py` runs beside the new lifecycle chain.**
-  Two lifecycle-ish authorities exist (legacy decay vs
-  `memory_lifecycle_state.py`). They are not reconciled. Out of scope here.
+- **P2-2 — (Re-prioritized up to OA-2.)** Legacy `decay_engine.py` and the new
+  cognitive lifecycle are **not** two interchangeable lifecycle modules; they are
+  parallel authorities with different scopes (§8). Retained here only as a
+  cross-reference; the live question is now OA-2.
 - **P2-3 — The two suspected stale evidence modules are actually live.**
   `retrieval_shadow_metrics.py` is imported and called by
   `unified_context_candidate.py` (`record_retrieval_shadow_metrics`), and
@@ -881,3 +918,60 @@ The v0 workspace is the smallest first step justified by the code that exists
 today: it carries only the exact stage outputs the current Context chain already
 produces, and it does not pre-design the arbitration / consolidation stages
 sketched above.
+
+---
+
+## 8. Lifecycle authority reality — parallel planes (recorded, NOT solved)
+
+> Status: WORKING DRAFT / REALITY MAP. This records what the code does at the
+> baseline and does **not** claim the problem is solved. Full call-site matrix:
+> `docs/cognitive-memory/LIFECYCLE_AUTHORITY_MAP.md`.
+
+At this baseline the repository does **not** have one unified lifecycle owner. It
+has **two parallel lifecycle authorities with different scopes**:
+
+- **Legacy OB (canonical + archive) — real authority where it runs.**
+  `DecayEngine.run_decay_cycle()` writes canonical `resolved` (auto-resolve) and
+  moves low-score buckets into `archive/` (auto-archive); `trace(reinforce=True)`
+  writes canonical activation metadata (`activation_count += 1`,
+  `last_active = now`). `calculate_score()` additionally drives Dream candidate
+  truncation and spontaneous-`breath` ranking. It never deletes.
+- **New cognitive lifecycle (usage + surfacing) — gated and supplementary.**
+  Only a validated, persisted `UseMemory(useref)` produces `used` evidence, which
+  the reinforcement observer turns into immutable lifecycle events and derived
+  `strength` / `accessibility` / `salience`. When its gates are ON,
+  `memory_surfacing_lifecycle` adds a **supplementary Memory Flash surfacing
+  constraint** — behaviour-affecting surfacing authority that does **not** mutate
+  canonical storage.
+
+Recorded facts:
+
+- The legacy and cognitive planes **do not currently mutate each other's state.**
+  The cognitive plane never calls `touch` / `touch_many` /
+  `update(bump_active=True)` / `archive` / `delete` / `run_decay_cycle`; the
+  legacy plane never reads `strength` / `accessibility` / `salience` / lifecycle
+  event files / Use receipts.
+- `trace(reinforce=True)` is an explicit legacy reinforcement judgement;
+  `UseMemory(useref)` is explicit evidence that a recalled memory was actually
+  used. **Neither is authorized to fabricate the other**, and no bridge is added.
+- The start wiring is asymmetric: `streamable-http` starts `DecayEngine` eagerly;
+  stdio starts it lazily on first use of certain tools. Documented, not changed.
+- `resolved` is a semantic/task state; it is **not** an alias for forgotten /
+  inaccessible / archived.
+
+The correct framing is therefore **parallel lifecycle authorities with different
+scopes**, not "one lifecycle implementation with a legacy duplicate".
+**Migration remains unresolved**; the audit changes no live behaviour and adds
+only guardrail tests.
+
+### Explicitly NOT done in the Memory Lifecycle Authority Map + Dual-Authority Guardrails v0 task
+
+- No change to live memory lifecycle behaviour.
+- No `UseMemory` → `touch` bridge and no `trace(reinforce=True)` → `used` bridge.
+- No disabling of `DecayEngine`, no enabling it in stdio, no startup change.
+- No change to the decay formula, archive threshold, auto-resolve threshold,
+  `activation_count` / `last_active` semantics, Memory Surfacing thresholds,
+  retrieval ranking, or Dream ranking.
+- No move / archive / restore / delete of any real user memory.
+- No production abstraction added; only the authority map, guardrail tests, this
+  status update, and one comment-only stale-comment correction.

@@ -3142,8 +3142,9 @@ class BucketManager:
     # ---------------------------------------------------------
     # Touch bucket (refresh activation time + increment count)
     # 触碰桶（刷新激活时间 + 累加激活次数）
-    # Called on every recall hit; affects decay score.
-    # 每次检索命中时调用，影响衰减得分。
+    # Explicit legacy reinforcement only (trace(reinforce=True)); since OB
+    # 3.6.0 search/surface no longer touch recall hits. Affects decay score.
+    # 仅由显式强化 trace(reinforce=True) 调用；自 3.6.0 起检索/浮现命中不再 touch。
     # ---------------------------------------------------------
     async def touch(self, bucket_id: str, ripple: bool = True) -> None:
         """
