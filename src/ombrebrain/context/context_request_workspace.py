@@ -52,6 +52,19 @@ class ContextRequestWorkspace:
     # Request-local Memory observation snapshot THIS request produced.
     memory_shadow_snapshot: dict[str, Any] | None = None
 
+    # Request-local Source-Neutral Memory Evidence Snapshot THIS
+    # request produced. It is an in-memory-only evidence object (it
+    # carries source-native references), never serialized, never
+    # logged, never model-visible. It lets downstream shadow observers
+    # read THIS request's exact evidence instead of reparsing the
+    # forwarded body / snapshot again.
+    memory_source_evidence: Any | None = None
+
+    # Request-local Unified Memory Delivery Plan Shadow artifact THIS
+    # request produced. Privacy-safe and shadow-only: it is a proposal
+    # with no live authority and never changes the forwarded body.
+    memory_delivery_plan: dict[str, Any] | None = None
+
     # Confidence Gate report for THIS request (observer only).
     confidence_report: dict[str, Any] | None = None
 
