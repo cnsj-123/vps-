@@ -381,12 +381,25 @@ There is **no single lifecycle owner**. Authority is split across two planes.
 | Memory Flash surfacing | base Surfacing Policy | `memory_surfacing_lifecycle` (supplementary, gated) |
 | Dream selection | legacy `calculate_score` truncation | none |
 | Usage evidence | none | `memory_usage_signal` |
-| Cognitive reinforcement | `trace(reinforce=True)` (legacy activation) | `memory_reinforcement` (event-sourced) |
+| Intentional legacy reinforcement / activation | `trace(reinforce=True)` → `BucketManager.touch(...)` → `activation_count` / `last_active` / temporal ripple | none |
+| Cognitive reinforcement evidence | none | `memory_reinforcement`: validated `used` → immutable lifecycle reinforcement receipt |
 | Semantic `resolved` | `DecayEngine` auto-resolve + explicit `trace` | none |
 | Archive | `DecayEngine` (automatic) + human web | none |
 | Delete | explicit `trace` / human web (+ test-only physical) | none |
 | Restore | explicit `trace(restore=True)` + letters restore | none |
 | Background scheduler | `DecayEngine._background_loop` | none |
+
+**Intentional reinforcement must not be conflated with reinforcement evidence.**
+`trace(reinforce=True)` is an explicit legacy *judgement* that writes canonical
+activation; it is **not** evidence that a specific recalled memory was used, and
+it is **not** `COGNITIVE_REINFORCEMENT_AUTHORITY`. The cognitive plane's
+reinforcement evidence is derived only from a validated, persisted `used` via
+`memory_reinforcement`. The invariant holds and is not bridged:
+
+```
+trace(reinforce=True)  !=  UseMemory
+intentional reinforcement  !=  evidence of actual use
+```
 
 **Scoring systems must not be conflated.** Canonical retrieval ranking is
 `BucketManager.search`'s own weighted sum over topic / emotion / time /

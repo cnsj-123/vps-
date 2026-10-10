@@ -64,6 +64,13 @@ _DOCUMENTED_LAZY_START_FILES = {
     "src/tools/i/core.py",
 }
 
+# The two lifecycle architecture documents. They must not carry
+# machine-local file:///workspace links (broken on GitHub).
+_ARCHITECTURE_DOCS = (
+    "docs/cognitive-memory/LIFECYCLE_AUTHORITY_MAP.md",
+    "docs/cognitive-memory/ARCHITECTURE_STATUS.md",
+)
+
 
 def _parse(relative: str) -> ast.Module:
     path = _REPO_ROOT / relative
@@ -90,6 +97,31 @@ def _imported_modules(tree: ast.Module) -> list[str]:
 
 def _call_attr_names(tree: ast.Module) -> set[str]:
     return {node.func.attr for node in _calls(tree)}
+
+
+def _decay_engine_startup_target(node: ast.AST) -> str | None:
+    """Return the called attr name when *node* is a target-aware DecayEngine
+    startup call, i.e. ``<something>.decay_engine.<attr>(...)``.
+
+    The receiver must be an attribute expression whose own attribute name is
+    ``decay_engine`` (e.g. ``rt.decay_engine``). This deliberately does NOT
+    match unrelated ``foo.ensure_started()`` calls, ``self.start()``, or the
+    RuntimeLifecycle dynamic ``getattr(self.decay_engine, "start", None)``
+    path (its ``func`` is a ``Name``, not an ``Attribute``).
+    """
+
+    if not isinstance(node, ast.Call):
+        return None
+    func = node.func
+    if not isinstance(func, ast.Attribute):
+        return None
+    receiver = func.value
+    if not (
+        isinstance(receiver, ast.Attribute)
+        and receiver.attr == "decay_engine"
+    ):
+        return None
+    return func.attr
 
 
 def _class_method(
@@ -458,34 +490,56 @@ class ServerWiringContractTests(unittest.TestCase):
         # DecayEngine can only start through two legitimate paths:
         #   A. RuntimeLifecycle.start()
         #      -> getattr(self.decay_engine, "start", None)  (covered by J)
-        #   B. lazy `rt.decay_engine.ensure_started()` from a tool, where
+        #   B. lazy `<recv>.decay_engine.ensure_started()` from a tool, where
         #      DecayEngine.ensure_started() calls self.start().
-        # Scan ALL of src (not just src/tools) so that a new, unexpected
-        # DecayEngine startup authority anywhere in the tree fails here.
-        found: set[str] = set()
+        # Target-aware rule: only calls whose receiver is a
+        # `*.decay_engine` attribute expression count. Scan ALL of src so a
+        # new, unexpected DecayEngine startup authority anywhere fails here.
+        ensure_files: set[str] = set()
+        direct_start_files: set[str] = set()
         for path in sorted(_SRC.rglob("*.py")):
             try:
                 tree = ast.parse(path.read_text(encoding="utf-8"))
             except (SyntaxError, UnicodeDecodeError):
                 continue
+            rel = str(path.relative_to(_REPO_ROOT))
             for node in ast.walk(tree):
-                if not isinstance(node, ast.Call):
-                    continue
-                func = node.func
-                called = (
-                    func.attr
-                    if isinstance(func, ast.Attribute)
-                    else func.id
-                    if isinstance(func, ast.Name)
-                    else None
-                )
-                if called == "ensure_started":
-                    found.add(
-                        str(path.relative_to(_REPO_ROOT))
-                    )
+                target = _decay_engine_startup_target(node)
+                if target == "ensure_started":
+                    ensure_files.add(rel)
+                elif target == "start":
+                    direct_start_files.add(rel)
+        # The only `*.decay_engine.ensure_started()` callers are the seven
+        # documented lazy tool entrypoints.
+        self.assertEqual(ensure_files, _DOCUMENTED_LAZY_START_FILES)
+        # Zero unexpected direct `*.decay_engine.start()` calls. The
+        # intentional eager start is the RuntimeLifecycle getattr path,
+        # tested separately, and is not a direct attribute call.
         self.assertEqual(
-            found, _DOCUMENTED_LAZY_START_FILES
+            direct_start_files,
+            set(),
+            "unexpected direct *.decay_engine.start() call site",
         )
+
+    def test_K_startup_receiver_rule_is_target_aware(self):
+        # The target-aware rule must match DecayEngine-bearing receivers but
+        # ignore unrelated ensure_started()/start() calls, and must catch a
+        # direct *.decay_engine.start().
+        cases = {
+            "rt.decay_engine.ensure_started()": "ensure_started",
+            "something.decay_engine.ensure_started()": "ensure_started",
+            "self.decay_engine.ensure_started()": "ensure_started",
+            "something.decay_engine.start()": "start",
+            "self.ensure_started()": None,
+            "outbox.ensure_started()": None,
+            "service.start()": None,
+            "getattr(self.decay_engine, 'start', None)": None,
+        }
+        for src, expected in cases.items():
+            node = ast.parse(src).body[0].value
+            self.assertEqual(
+                _decay_engine_startup_target(node), expected, src
+            )
 
     def test_K_decay_engine_ensure_started_calls_start(self):
         # Path B: ensure_started() must actually start the background loop.
@@ -500,6 +554,13 @@ class ServerWiringContractTests(unittest.TestCase):
             ),
             "DecayEngine.ensure_started must call self.start()",
         )
+
+
+class ArchitectureDocHygieneTests(unittest.TestCase):
+    def test_architecture_docs_have_no_machine_local_links(self):
+        for rel in _ARCHITECTURE_DOCS:
+            text = (_REPO_ROOT / rel).read_text(encoding="utf-8")
+            self.assertNotIn("file:///workspace", text, rel)
 
 
 if __name__ == "__main__":

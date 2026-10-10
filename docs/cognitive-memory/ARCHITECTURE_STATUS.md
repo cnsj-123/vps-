@@ -511,15 +511,15 @@ retrieval, surfacing, exposure, or Recall alone.
 | Field | Value |
 | --- | --- |
 | Owner | `src/decay_engine.py` |
-| Input | memory buckets / activation metadata |
+| Input (read-only legacy metadata) | `importance` / `activation_count` / `last_active` / `created` / `arousal` / `resolved` / `digested` |
 | Output | decay / forgetting over long horizons |
-| Persisted | legacy bucket metadata |
+| Persisted | legacy lifecycle transitions only (auto-`resolved`, archive move) |
 | Shadow/Live | **live legacy subsystem**, independent of the new chain |
 | Flag | none in the new chain |
 | Mutates provider request | no |
-| Mutates canonical memory | yes (legacy activation/importance fields) |
+| Mutates canonical memory | yes — automatic `resolved` write + archive transition; does **not** write `activation_count` / `last_active` / `importance` |
 | Lifecycle effect | yes, in the **legacy** model |
-| Downstream | legacy retrieval / ranking |
+| Downstream | legacy spontaneous surfacing / Dream truncation / archive decision / read-only score consumers; **not** canonical `BucketManager.search` retrieval scoring |
 
 Authority (exact; see `LIFECYCLE_AUTHORITY_MAP.md` §3.8, §9 and §10): where it is
 **running**, `DecayEngine` has real **canonical + archive authority**.
