@@ -338,25 +338,47 @@ def _log(summary: dict[str, Any]) -> None:
     )
 
 
-def _evaluate_supplementary(
+def evaluate_lifecycle_surfacing_candidate(
     *,
     candidate: Any,
     as_of: datetime,
     config: dict[str, float],
     thresholds: dict[str, float],
-) -> tuple[bool, bool, int]:
-    """One supplementary candidate: (observed, kept, invalid_count).
+) -> dict[str, Any]:
+    """Read-only evaluation of ONE supplementary candidate.
 
-    Unobserved (no valid used lifecycle event) is always kept --
-    ``unobserved != forgotten``. The derived Lifecycle State snapshot
-    is never consulted; accessibility / salience come from the
-    immutable events at ``as_of``.
+    This is the SINGLE place the lifecycle Surfacing threshold decision
+    lives. It is shared by the live/shadow Lifecycle Surfacing gate
+    (``_apply_gate`` below) and by the Lifecycle Comparison observer,
+    so no second ``access >= x or salience >= y`` copy can drift.
+
+    It reads only this candidate's own immutable lifecycle events. It
+    never reads the derived Lifecycle State snapshot (its ``as_of`` is
+    stale), never writes an event / state / receipt, never mutates its
+    input and never touches a canonical memory store.
+
+    Unobserved (no valid used lifecycle event) is returned as
+    ``observed=False, kept=True`` -- ``unobserved != forgotten`` -- and
+    is never fabricated into strength=0 / accessibility=0 /
+    would_suppress=true. The result carries raw derived numbers; the
+    caller decides whether to persist or round them.
     """
+
+    unavailable = {
+        "observed": False,
+        "kept": True,
+        "use_count": 0,
+        "strength": None,
+        "accessibility": None,
+        "salience": None,
+        "age_since_last_used_hours": None,
+        "invalid_event_count": 0,
+    }
 
     memory_id = candidate_memory_id(candidate)
 
     if memory_id is None:
-        return False, True, 0
+        return dict(unavailable)
 
     store = read_lifecycle_events(memory_id)
 
@@ -379,7 +401,11 @@ def _evaluate_supplementary(
 
     if not isinstance(events, list) or not events:
         # Zero valid events: neutral, never suppressed.
-        return False, True, invalid_count
+        neutral = dict(unavailable)
+        neutral["invalid_event_count"] = (
+            invalid_count
+        )
+        return neutral
 
     facts = lifecycle_use_facts(
         events, as_of=as_of
@@ -389,7 +415,11 @@ def _evaluate_supplementary(
     last_used = facts["last_used_at"]
 
     if use_count <= 0 or last_used is None:
-        return False, True, invalid_count
+        neutral = dict(unavailable)
+        neutral["invalid_event_count"] = (
+            invalid_count
+        )
+        return neutral
 
     strength = strength_for_use_count(
         use_count, config=config
@@ -420,7 +450,18 @@ def _evaluate_supplementary(
         or salience >= thresholds["min_salience"]
     )
 
-    return True, kept, invalid_count
+    return {
+        "observed": True,
+        "kept": kept,
+        "use_count": use_count,
+        "strength": strength,
+        "accessibility": accessibility,
+        "salience": salience,
+        "age_since_last_used_hours": (
+            age_since_last_used
+        ),
+        "invalid_event_count": invalid_count,
+    }
 
 
 def _apply_gate(
@@ -467,14 +508,20 @@ def _apply_gate(
 
         evaluated_count += 1
 
-        observed, kept, invalid = (
-            _evaluate_supplementary(
+        evaluation = (
+            evaluate_lifecycle_surfacing_candidate(
                 candidate=candidate,
                 as_of=as_of,
                 config=config,
                 thresholds=thresholds,
             )
         )
+
+        observed = evaluation["observed"]
+        kept = evaluation["kept"]
+        invalid = evaluation[
+            "invalid_event_count"
+        ]
 
         invalid_event_count += invalid
 

@@ -63,6 +63,9 @@ from ombrebrain.context import ContextService
 from ombrebrain.context.unified_context_candidate import (
     bind_context_service,
 )
+from ombrebrain.context.memory_lifecycle_comparison_shadow import (
+    bind_legacy_lifecycle_comparison_engine,
+)
 from ombrebrain.context.wake import WakeContextBuilder
 from ombrebrain.context.live_recall_authorization import (
     request_live_recall,
@@ -293,6 +296,11 @@ embedding_outbox = EmbeddingOutbox(config, bucket_mgr, embedding_engine)
 bucket_mgr.attach_embedding_outbox(embedding_outbox)
 dehydrator = Dehydrator(config)                      # Dehydrator / 脱水器
 decay_engine = DecayEngine(config, bucket_mgr)       # Decay engine / 衰减引擎
+# Narrow, read-only binding of the EXISTING DecayEngine for the
+# observation-only Legacy vs Cognitive lifecycle comparison shadow.
+# It stores the reference only: it never starts/stops the engine and
+# never creates a second one. Default OFF and fail-open.
+bind_legacy_lifecycle_comparison_engine(decay_engine)
 import_engine = ImportEngine(config, bucket_mgr, dehydrator, embedding_engine)  # Import engine / 导入引擎
 migrate_engine = MigrateEngine(config, bucket_mgr, embedding_engine)              # Migrate engine / 记忆包迁移引擎
 you_service = YouService(
