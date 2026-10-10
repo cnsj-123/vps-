@@ -923,6 +923,8 @@ class ConfidenceGatePipelineTests(
         def mutation_impl(
             conversation_id,
             forward_body,
+            *,
+            workspace=None,
         ):
             mutation_calls.append(
                 conversation_id
@@ -933,6 +935,7 @@ class ConfidenceGatePipelineTests(
             forward_body,
             *,
             context_chain_fresh,
+            workspace=None,
         ):
             selector_freshness.append(
                 context_chain_fresh
@@ -943,6 +946,7 @@ class ConfidenceGatePipelineTests(
                 forward_body,
                 context_chain_fresh=
                     context_chain_fresh,
+                workspace=workspace,
             )
 
         confidence = Mock(
@@ -1191,6 +1195,7 @@ class ConfidenceGatePipelineTests(
             forward_body,
             *,
             context_chain_fresh,
+            workspace=None,
         ):
             selector_freshness.append(
                 context_chain_fresh
@@ -1201,6 +1206,7 @@ class ConfidenceGatePipelineTests(
                 forward_body,
                 context_chain_fresh=
                     context_chain_fresh,
+                workspace=workspace,
             )
 
         environ = {

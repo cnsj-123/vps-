@@ -853,78 +853,29 @@ def evaluate_context_injection_gate(
     }
 
 
-def update_context_injection_gate(
+def _persist_context_injection_gate(
     conversation_id: str,
+    *,
+    conversation_candidate: dict[str, Any],
+    unified: dict[str, Any],
+    preview: dict[str, Any],
 ) -> dict[str, Any]:
-    """Evaluate and persist a privacy-safe shadow gate decision."""
+    """Evaluate + persist a Gate from explicit artifacts.
 
-    _validate_conversation_id(
-        conversation_id
-    )
-
-    candidate = _read_json(
-        _path(
-            "context_candidate",
-            conversation_id,
-        )
-    )
-
-    if candidate is None:
-        return {
-            "stored":
-                False,
-            "decision":
-                "deny",
-            "reason":
-                "conversation_candidate_not_found",
-            "conversation_id":
-                conversation_id,
-        }
-
-    unified = _read_json(
-        _path(
-            "unified_context_candidate",
-            conversation_id,
-        )
-    )
-
-    if unified is None:
-        return {
-            "stored":
-                False,
-            "decision":
-                "deny",
-            "reason":
-                "unified_candidate_not_found",
-            "conversation_id":
-                conversation_id,
-        }
-
-    preview = _read_json(
-        _path(
-            "injection_preview",
-            conversation_id,
-        )
-    )
-
-    if preview is None:
-        return {
-            "stored":
-                False,
-            "decision":
-                "deny",
-            "reason":
-                "preview_not_found",
-            "conversation_id":
-                conversation_id,
-        }
+    The returned artifact contains no rendered Preview text, so it is
+    both the privacy-safe report and the request-local runtime
+    authority THIS request's Mutation / Real Injection stages consume.
+    Revision checks, budget checks, render integrity, the DATA-ONLY
+    envelope checks and deny semantics all live in
+    ``evaluate_context_injection_gate`` and are unchanged.
+    """
 
     result = (
         evaluate_context_injection_gate(
             conversation_id=
                 conversation_id,
             conversation_candidate=
-                candidate,
+                conversation_candidate,
             unified=
                 unified,
             preview=
@@ -1058,3 +1009,143 @@ def update_context_injection_gate(
     )
 
     return output
+
+
+def update_context_injection_gate(
+    conversation_id: str,
+) -> dict[str, Any]:
+    """Evaluate and persist a privacy-safe shadow gate decision."""
+
+    _validate_conversation_id(
+        conversation_id
+    )
+
+    candidate = _read_json(
+        _path(
+            "context_candidate",
+            conversation_id,
+        )
+    )
+
+    if candidate is None:
+        return {
+            "stored":
+                False,
+            "decision":
+                "deny",
+            "reason":
+                "conversation_candidate_not_found",
+            "conversation_id":
+                conversation_id,
+        }
+
+    unified = _read_json(
+        _path(
+            "unified_context_candidate",
+            conversation_id,
+        )
+    )
+
+    if unified is None:
+        return {
+            "stored":
+                False,
+            "decision":
+                "deny",
+            "reason":
+                "unified_candidate_not_found",
+            "conversation_id":
+                conversation_id,
+        }
+
+    preview = _read_json(
+        _path(
+            "injection_preview",
+            conversation_id,
+        )
+    )
+
+    if preview is None:
+        return {
+            "stored":
+                False,
+            "decision":
+                "deny",
+            "reason":
+                "preview_not_found",
+            "conversation_id":
+                conversation_id,
+        }
+
+    return (
+        _persist_context_injection_gate(
+            conversation_id,
+            conversation_candidate=
+                candidate,
+            unified=
+                unified,
+            preview=
+                preview,
+        )
+    )
+
+
+def update_context_injection_gate_from_request_local(
+    conversation_id: str,
+    *,
+    conversation_candidate: dict[str, Any],
+    unified: dict[str, Any],
+    preview: dict[str, Any],
+) -> dict[str, Any]:
+    """Evaluate + persist THIS request's Gate from ITS OWN artifacts.
+
+    Uses the exact request-local Conversation Candidate / Unified /
+    Preview instead of re-reading conversation-scoped "latest" files,
+    so a concurrent request on the same conversation can never become
+    this request's Gate identity. Persistence is unchanged and remains
+    for observability / compatibility.
+
+    A malformed binding fails closed: an invalid artifact returns a
+    stored=False deny rather than being treated as a fresh request.
+    """
+
+    _validate_conversation_id(
+        conversation_id
+    )
+
+    if not (
+        isinstance(
+            conversation_candidate,
+            dict,
+        )
+        and isinstance(
+            unified,
+            dict,
+        )
+        and isinstance(
+            preview,
+            dict,
+        )
+    ):
+        return {
+            "stored":
+                False,
+            "decision":
+                "deny",
+            "reason":
+                "invalid_request_local_evidence",
+            "conversation_id":
+                conversation_id,
+        }
+
+    return (
+        _persist_context_injection_gate(
+            conversation_id,
+            conversation_candidate=
+                conversation_candidate,
+            unified=
+                unified,
+            preview=
+                preview,
+        )
+    )

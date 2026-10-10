@@ -2420,6 +2420,8 @@ class GatewayRealInjectionRequestTests(
         def mutation_impl(
             conversation_id,
             forward_body,
+            *,
+            workspace=None,
         ):
             order.append(
                 "mutation_shadow"
@@ -2430,6 +2432,7 @@ class GatewayRealInjectionRequestTests(
             forward_body,
             *,
             context_chain_fresh,
+            workspace=None,
         ):
             order.append(
                 "real_selector"

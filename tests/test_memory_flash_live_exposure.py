@@ -1384,6 +1384,7 @@ class ContextInteractionTests(
             *,
             cognitive_request_id=None,
             forward_body=None,
+            workspace=None,
         ):
             if seed_surface:
                 update_recall_surface(
