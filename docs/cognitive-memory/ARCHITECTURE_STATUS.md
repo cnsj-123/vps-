@@ -9,10 +9,12 @@ and the code disagree, the code is correct and this document is wrong.
 
 - Repository source of truth: the tree at the baseline commit below.
 - Baseline: `origin/feature/gateway-v2`
-- Baseline HEAD: `07cc03883a4493c5388879458717fe62e18485b5`
-- Baseline tree: `79883fa380daebf3fa817016052fbaec3e5a2dd5`
-- Audit date context: written for the Frontend Memory Arbitration Shadow task
-  (branch `trae/frontend-memory-arbitration-shadow-v1`).
+- Baseline HEAD: `50562653d81c1a5a6746ff52c8f7136808eeaac9`
+- Baseline tree: `6fce3b2ba45c516ec257176106db863d73af07f5`
+- Audit date context: originally written for the Frontend Memory Arbitration
+  Shadow task (branch `trae/frontend-memory-arbitration-shadow-v1`), then
+  updated for the Request-local Cognitive Workspace Foundation v0 task
+  (branch `trae/request-local-cognitive-workspace-v0`).
 
 Everything below is derived by reading the real modules listed next to each
 stage. Where a claim could not be verified from code it is explicitly marked
@@ -60,6 +62,31 @@ do persist bounded cue text and/or internal ids because a future Recall needs a
 target. This asymmetry is intentional in the baseline and is recorded here so it
 is not mistaken for an oversight.
 
+## 0.2 Request-local vs conversation-global authority
+
+A second invariant now runs through the Context decision chain, and it must not
+be collapsed either:
+
+```
+conversation-scoped persisted artifact  =  latest persisted observation
+request-local workspace artifact        =  runtime authority for THIS request
+```
+
+`conversation-scoped artifact != request-local authority`. A conversation-scoped
+file (`unified_context_candidate/{cid}.json`, `injection_preview/{cid}.json`,
+`injection_gate/{cid}.json`, …) is a **latest persisted observation** that a
+concurrent request on the same conversation may overwrite at any time. It stays
+on disk for observability, debugging and compatibility. It is **no longer the
+runtime authority** for a request that produced its own artifacts.
+
+The pipeline now binds each request's exact stage outputs into an in-memory
+**request-local Cognitive Workspace** (see §2.22). Downstream stages for THIS
+request (Preview, Gate, Mutation Shadow, Real Injection) prefer the workspace
+artifact over re-reading the shared file. This is a generalization of the
+pre-existing `memory_shadow_snapshot` pattern (which already protected the Memory
+observers from re-reading the shared Unified file), not a second, contradictory
+request-identity mechanism.
+
 ---
 
 ## 1. Chain order (as actually orchestrated)
@@ -84,15 +111,23 @@ Inside `_run_context_pipeline_selection`:
 
 ```
 1. mint cognitive_request_id (ctxreq_<32 hex>, internal only)
-2. observe_context_sources(forward_body)             -> conversation_id
-3. observe_unified_preview_gate(conversation_id, cpu) -> context_chain_fresh
+2. create ContextRequestWorkspace(conversation_id, cognitive_request_id)   (in-memory, one per request)
+3. observe_context_sources(forward_body)             -> conversation_id
+4. observe_unified_preview_gate(conversation_id, cpu, workspace=ws) -> context_chain_fresh
      - conversation sources -> Unified -> Confidence -> Memory observer chain
        (Surfacing -> Lifecycle -> Flash -> Recall Surface -> Exposure Ledger)
        -> Preview -> Gate -> context_event
-4. if fresh: observe_request_mutation(...)           (discards mutated body)
-5. select_real_injection(...)                        -> selected_body
-6. select_live_memory_flash_exposure(...)            -> final_body
+     - binds THIS request's Candidate / Unified / memory snapshot / Confidence
+       report / Preview / Gate / freshness into ws
+5. if fresh: observe_request_mutation(..., workspace=ws)   (discards mutated body)
+6. select_real_injection(..., workspace=ws)                -> selected_body
+7. select_live_memory_flash_exposure(...)                  -> final_body
 ```
+
+The workspace is created in-memory for the single pass and is never persisted,
+logged, cached, or added to the request. Conversation-scoped files are still
+written by each stage for observability; the workspace is the runtime authority
+for the request currently being forwarded.
 
 ---
 
@@ -230,7 +265,10 @@ counted in `excluded_segments` and dropped from USER_TEXT-derived semantic state
 
 The Unified file is **conversation-global** (overwritten per request). The
 `memory_shadow_snapshot` is **request-local** and exists precisely so downstream
-observers never re-read the shared file. This request-local vs
+observers never re-read the shared file. As of the request-local workspace task,
+the producer also attaches an in-memory-only `request_local_chain` field
+(`conversation_candidate` + `unified`) to the report it returns; the coordinator
+extracts it into the workspace (§2.22). This request-local vs
 conversation-global split is load-bearing for concurrency.
 
 ### 2.8 Confidence Gate
@@ -346,12 +384,20 @@ Records **two rungs only**. Later rungs (`noticed` / `recall_requested` /
 | Lifecycle effect | none |
 | Downstream | Mutation Shadow, Real Injection |
 
+Both stages now have a request-local entry point used by the coordinator when a
+workspace is present: `update_context_injection_preview_from_unified(...)` renders
+the Preview from **this request's** explicit Unified object, and
+`update_context_injection_gate_from_request_local(...)` evaluates the Gate from
+**this request's** explicit Candidate / Unified / Preview. Persistence still
+writes the conversation-scoped files for observability / compatibility, but the
+request-local artifacts are the runtime authority for this request (§2.22).
+
 ### 2.15 Mutation Shadow
 
 | Field | Value |
 | --- | --- |
 | Owner | `src/ombrebrain/context/context_request_mutation_shadow.py` |
-| Input | `forward_body` + Preview/Gate refreshed by **this** request |
+| Input | `forward_body` + Preview/Gate refreshed by **this** request (from the request-local workspace when available, else conversation-scoped files) |
 | Output | hypothetical injected body + report; the body is **discarded** |
 | Persisted | none |
 | Shadow/Live | shadow |
@@ -366,7 +412,7 @@ Records **two rungs only**. Later rungs (`noticed` / `recall_requested` /
 | Field | Value |
 | --- | --- |
 | Owner | `src/ombrebrain/context/context_real_injection.py` |
-| Input | `forward_body` + fresh Preview/Gate |
+| Input | `forward_body` + fresh Preview/Gate (from the request-local workspace when available, else conversation-scoped files) |
 | Output | `selected_body` (may differ from input) with an `applied` report |
 | Persisted | none |
 | Shadow/Live | **LIVE**, default OFF |
@@ -460,6 +506,91 @@ retrieval, surfacing, exposure, or Recall alone.
 | Mutates canonical memory | yes (legacy activation/importance fields) |
 | Lifecycle effect | yes, in the **legacy** model |
 | Downstream | legacy retrieval / ranking |
+
+### 2.22 Request-local Cognitive Workspace (v0)
+
+| Field | Value |
+| --- | --- |
+| Owner | `src/ombrebrain/context/context_request_workspace.py` (`ContextRequestWorkspace`) |
+| Input | the exact artifacts THIS Context pass produced |
+| Output | in-memory runtime authority: `conversation_id`, `cognitive_request_id`, `conversation_candidate`, `unified`, `memory_shadow_snapshot`, `confidence_report`, `preview`, `gate`, `context_chain_fresh` |
+| Persisted | **none** — in-memory only, one per gateway request |
+| Shadow/Live | runtime authority (not an observer, not a mutator itself) |
+| Flag | none (always created; every consumer keeps its existing flag + fallback) |
+| Mutates provider request | no (it holds artifacts; the stages that read it do) |
+| Mutates canonical memory | no |
+| Lifecycle effect | none |
+| Downstream | Preview, Gate, Mutation Shadow, Real Injection |
+
+Properties:
+
+- `has_request_local_chain` — true only when THIS request produced its own
+  Candidate + Unified. When false, every downstream stage keeps its existing
+  conversation-scoped behaviour.
+- `has_preview_gate_evidence` — true when THIS request stored its own
+  Preview + Gate (even a deny, even a binding that later proves malformed).
+  Distinguishes "this request produced a decision" from "this request produced no
+  decision", so a malformed / foreign binding fails **closed** for mutation
+  instead of silently falling back to a conversation-scoped "latest" pair a
+  concurrent request may own.
+- `request_local_preview_gate()` — returns the pair only when both artifacts are
+  present and bound to this workspace's `conversation_id`; otherwise
+  `(None, None)`.
+
+The workspace is **not** canonical memory, **not** a database, **not** a persisted
+artifact, **not** model-visible, **not** a cache key and **not** an event bus. It
+is not a universal memory schema and carries no future-lifecycle fields. It
+generalizes the pre-existing `memory_shadow_snapshot` request-local pattern to the
+whole decision chain.
+
+Fail semantics (unchanged invariants, preserved):
+
+- Real Injection remains default OFF and fail-open (uncertainty → exact input
+  body).
+- Freshness alone is still never trusted: `context_chain_fresh=True` is required
+  but not sufficient; revision / rendered-hash / token-recompute / DATA-ONLY
+  envelope / original–selected SHA checks all still run inside the pure
+  boundaries.
+- Request-local identity is an **additional** guarantee, never a replacement for
+  content-integrity checks.
+- A malformed or mismatched request-local binding fails **closed** for the
+  Mutation Shadow (mutation is skipped) and fails **open** for request forwarding
+  (the exact input body is kept).
+
+### 2.23 Request-local authority migration status
+
+Stages that now take the request-local workspace as their runtime authority for
+THIS request (when a workspace is present and the request produced its own chain):
+
+| Stage | Request-local source | Fallback when no workspace evidence |
+| --- | --- | --- |
+| Memory observation (`memory_shadow_snapshot`) | `workspace.memory_shadow_snapshot` | existing behaviour (already request-local) |
+| Preview | `workspace.unified` → `update_context_injection_preview_from_unified` | `update_context_injection_preview` (conversation-scoped) |
+| Gate | `workspace.conversation_candidate` + `unified` + `preview` | `update_context_injection_gate` (conversation-scoped) |
+| Mutation Shadow | `workspace.request_local_preview_gate()` | `build_context_request_mutation_shadow_from_runtime` (conversation-scoped) |
+| Real Injection | request-local Preview/Gate forwarded to the selector | `select_context_injected_body` re-reads conversation-scoped files |
+
+Stages that **still depend on conversation-global reads** (recorded honestly, not
+fixed here):
+
+- **Confidence Gate** — `observe_context_confidence(...)` re-reads the persisted
+  Conversation Candidate / Unified files, guarded by
+  `expected_unified_revision` so a concurrent overwrite is detected. It is an
+  observer only, so its result never gates anything, but it is not yet fed from
+  the workspace.
+- **Memory Surfacing / Lifecycle / Memory Flash / Recall Surface / Exposure
+  Ledger** — these consume the request-local `memory_shadow_snapshot` (already
+  request-local), but their own persisted request-scoped artifacts are written to
+  `.../{conversation_id}/{cognitive_request_id}.json`. They are observers and do
+  not feed the forwarded body.
+- **Live Memory Flash Exposure** — strictly post-Real-Injection and
+  fail-open relative to its own input; it reads the already-selected body, not a
+  conversation-global "latest" decision file.
+- **Recall Authorization / Provider-bound Recall / Transport** — downstream of
+  the forwarded body and driven by the trusted request binding.
+
+The Frontend-Memory-observation path (`forward_body`) is intentionally passed as
+this request's own bytes; it is not a conversation-global read.
 
 ---
 
@@ -603,13 +734,20 @@ demonstrated correctness / data-integrity / authority violations.
   Conversation→Unified chain (`context_observation_pipeline.py` and
   `observe_unified_preview_gate`). It is correct, but a future "source-neutral
   candidate pool" must decide explicitly whether it inherits this coupling.
-- **P1-2 — Request-local vs conversation-global state is a repeated
-  footgun.** Unified/Preview/Gate/Confidence live in conversation-scoped files
-  (`unified_context_candidate/{cid}.json`, `injection_preview/{cid}.json`, …)
-  while Flash/Surface/Ledger are request-scoped. Every consumer must remember to
-  use `memory_shadow_snapshot` instead of re-reading the shared file
-  (`build_memory_shadow_snapshot`). This is currently handled correctly, but it
-  relies on discipline rather than a type boundary.
+- **P1-2 — Request-local vs conversation-global state was a repeated footgun
+  (now materially reduced, not eliminated).** Unified/Preview/Gate/Confidence
+  live in conversation-scoped files (`unified_context_candidate/{cid}.json`,
+  `injection_preview/{cid}.json`, …) while Flash/Surface/Ledger are
+  request-scoped. The request-local Cognitive Workspace task migrated the
+  **decision** stages (Preview, Gate, Mutation Shadow, Real Injection) to prefer
+  the workspace artifacts for THIS request, and both entry points fail closed on a
+  malformed / foreign binding instead of silently re-reading the shared file. What
+  remains: the **Confidence Gate** observer still re-reads conversation-scoped
+  files (revision-guarded, observer-only), and the workspace is still a plain
+  dataclass whose discipline is enforced by the coordinator rather than a fully
+  type-enforced boundary. So this is downgraded from "relies on discipline for the
+  whole decision chain" to "relies on discipline for one observer plus the
+  coordinator wiring".
 - **P1-3 — Several persisted artifacts contain redundant identity fields.**
   `exposure_ledger.py` and (following it) other request-scoped artifacts persist
   `conversation_id` + `cognitive_request_id` inside the artifact even though both
@@ -644,7 +782,7 @@ demonstrated correctness / data-integrity / authority violations.
   their own copies. New modules should reuse the shared primitives rather than
   add another copy.
 
-### Explicitly NOT done in this task
+### Explicitly NOT done in the Frontend Memory Arbitration Shadow task
 
 - No change to `decay_engine.py` authority.
 - No merge/archive/supersede of memories.
@@ -653,3 +791,62 @@ demonstrated correctness / data-integrity / authority violations.
 - No Event Segmentation, Episodic Memory, Schema consolidation, Emotion /
   Attachment / Desire.
 - No change to Frontend Memory liveness (it stays fully model-visible).
+
+### Explicitly NOT done in the Request-local Cognitive Workspace Foundation v0 task
+
+- No future memory system (Episodic, Semantic, Relation, Prospective, Wake,
+  Emotion, Attachment, Desire).
+- No Unified Memory Delivery Contract; no removal or rewriting of Frontend
+  Memory; no source-neutral Frontend / OB candidate merging; no item-level
+  parsing of `relevant_memories.txt`.
+- No `AbstractMemoryProvider`, plugin registry, event bus, or generic cognitive
+  framework.
+- No deletion or migration of conversation-scoped persisted artifacts; no storage
+  layout change. Authority separation only (see §0.2).
+- No change to Frontend Memory liveness; no change to any default (Real
+  Injection and Live Memory Flash Exposure remain default OFF).
+
+---
+
+## 7. North-star working direction (NON-NORMATIVE)
+
+> This section is an **evolving working direction**, not a frozen
+> specification and not a contract. Nothing in it is implemented except the
+> request-local Cognitive Workspace (§2.22). It exists so later phases share one
+> vocabulary. If this section and the code disagree, the code wins.
+
+Sketch:
+
+```
+Federated Memory
+  -> source-specific logic
+  -> evidence adapters
+  -> request-local Cognitive Workspace
+  -> unified cognitive control (arbitration / selection)
+  -> model
+  -> explicit Use evidence
+  -> lifecycle / consolidation
+```
+
+Expanded form:
+
+```
+Memory Domains -> source-specific logic -> Evidence Adapters
+  -> Request-local Cognitive Workspace -> Arbitration / Selection
+  -> Flash / Recall / Direct Data -> Model
+  -> Explicit Use Evidence -> Lifecycle / Consolidation
+```
+
+Explicit non-goals of the direction:
+
+- Memory domains **may keep independent storage and internal schemas**. The
+  direction does not require one storage engine.
+- The Cognitive Workspace is **not** a universal memory database. It is a
+  per-request runtime authority, not canonical memory (§2.22).
+- The north star is **not** a frozen implementation spec. It is expected to be
+  revised as the code teaches us what is actually needed.
+
+The v0 workspace is the smallest first step justified by the code that exists
+today: it carries only the exact stage outputs the current Context chain already
+produces, and it does not pre-design the arbitration / consolidation stages
+sketched above.
