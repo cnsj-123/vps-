@@ -63,6 +63,12 @@ _LEDGER_ENV = (
 _CONFIDENCE_ENV = (
     "OMBRE_GATEWAY_CONTEXT_CONFIDENCE_GATE_SHADOW"
 )
+_DELIVERY_ENV = (
+    "OMBRE_GATEWAY_CONTEXT_MEMORY_DELIVERY_SHADOW"
+)
+_ARBITRATION_ENV = (
+    "OMBRE_GATEWAY_CONTEXT_MEMORY_SOURCE_ARBITRATION_SHADOW"
+)
 
 _UPSTREAM_FLAGS = (
     "OMBRE_GATEWAY_CONTEXT_SHADOW",
@@ -80,6 +86,8 @@ _UPSTREAM_FLAGS = (
     _CONFIDENCE_ENV,
     _FLASH_ENV,
     _LEDGER_ENV,
+    _DELIVERY_ENV,
+    _ARBITRATION_ENV,
 )
 
 _ISOLATED_ENV = {
@@ -1422,6 +1430,159 @@ class FlashOnlyDependencyTests(
         self.assertEqual(
             selected,
             _body(),
+        )
+
+
+class DeliveryFlagMatrixTests(
+    RealPipelineTestCase,
+):
+    """Delivery-only / off / arbitration matrix on the real chain."""
+
+    def _plan_files(self, cid):
+        directory = self.path(
+            "memory_delivery_plan",
+            cid,
+        )
+
+        if not directory.is_dir():
+            return []
+
+        return list(directory.iterdir())
+
+    async def test_delivery_only_flag_drives_chain(self):
+        self.bind(
+            [
+                _memory("m1", "first memory"),
+                _memory("m2", "second memory"),
+            ]
+        )
+
+        environ = {
+            **_ISOLATED_ENV,
+            _DELIVERY_ENV: "1",
+        }
+
+        with patch.dict(
+            os.environ,
+            environ,
+            clear=False,
+        ):
+            selected = await (
+                coordinator.run_context_pipeline(
+                    _body()
+                )
+            )
+
+        cid = self.conversation_id()
+
+        for path in (
+            self.path("snapshots", cid + ".json"),
+            self.path("compact", cid + ".json"),
+            self.path(
+                "context_candidate",
+                cid + ".json",
+            ),
+            self.path(
+                "unified_context_candidate",
+                cid + ".json",
+            ),
+        ):
+            with self.subTest(path=path.name):
+                self.assertTrue(path.is_file())
+
+        plan_files = self._plan_files(cid)
+
+        self.assertEqual(len(plan_files), 1)
+
+        artifact = json.loads(
+            plan_files[0].read_text(
+                encoding="utf-8"
+            )
+        )
+
+        self.assertEqual(
+            artifact["version"],
+            "memory-delivery-plan-shadow.v1",
+        )
+        self.assertEqual(
+            artifact["authority"],
+            "proposal_only",
+        )
+        self.assertFalse(
+            artifact["live_authority"]
+        )
+        self.assertEqual(
+            artifact["policy_stage"],
+            "base_surfacing_pre_lifecycle",
+        )
+
+        # Delivery never mutates the forwarded body.
+        self.assertEqual(selected, _body())
+
+    async def test_delivery_off_writes_no_plan(self):
+        self.bind([_memory("m1", "only memory")])
+
+        with patch.dict(
+            os.environ,
+            _ISOLATED_ENV,
+            clear=False,
+        ):
+            selected = await (
+                coordinator.run_context_pipeline(
+                    _body()
+                )
+            )
+
+        # With every flag OFF the chain does not run at all, so no
+        # conversation identity is minted and no delivery plan tree is
+        # created anywhere under the state root.
+        self.assertFalse(
+            self.path(
+                "memory_delivery_plan"
+            ).exists()
+        )
+
+        # Delivery, even when off, never mutates the forwarded body.
+        self.assertEqual(selected, _body())
+
+    async def test_arbitration_and_delivery_share_one_evidence(
+        self,
+    ):
+        # With BOTH consumers ON the coordinator builds the source
+        # evidence ONCE; both request-scoped artifacts are produced
+        # from the same request-local evidence.
+        self.bind([_memory("m1", "shared memory")])
+
+        environ = {
+            **_ISOLATED_ENV,
+            _DELIVERY_ENV: "1",
+            _ARBITRATION_ENV: "1",
+        }
+
+        with patch.dict(
+            os.environ,
+            environ,
+            clear=False,
+        ):
+            await coordinator.run_context_pipeline(
+                _body()
+            )
+
+        cid = self.conversation_id()
+
+        self.assertEqual(
+            len(self._plan_files(cid)), 1
+        )
+
+        arbitration_files = list(
+            self.path(
+                "memory_source_arbitration",
+                cid,
+            ).iterdir()
+        )
+
+        self.assertEqual(
+            len(arbitration_files), 1
         )
 
 
