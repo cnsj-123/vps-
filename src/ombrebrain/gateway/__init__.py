@@ -1,8 +1,12 @@
 from .body_rewriter import rewrite_body_for_cache
 from .cache_breakpoint import relocate_current_breakpoint
 from .canonicalizer import (
+    REWRITE_DROP,
+    REWRITE_KEEP_EXACT,
     FrontendMemorySegment,
+    FrontendRewriteResult,
     extract_frontend_memory_segments,
+    rewrite_frontend_memory_attachments,
 )
 from .cache_move_shadow import (
     cache_move_shadow_summary_from_body,
@@ -19,9 +23,13 @@ from .shadow import rewrite_shadow_summary_from_body
 
 __all__ = [
     "FrontendMemorySegment",
+    "FrontendRewriteResult",
     "OperitAdapter",
+    "REWRITE_DROP",
+    "REWRITE_KEEP_EXACT",
     "cache_move_shadow_summary_from_body",
     "extract_frontend_memory_segments",
+    "rewrite_frontend_memory_attachments",
     "cache_plan_summary_from_body",
     "canonical_summary_from_body",
     "fingertips_ownership_summary_from_body",

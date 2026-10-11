@@ -359,6 +359,353 @@ def extract_frontend_memory_segments(
     return tuple(segments)
 
 
+# ---------------------------------------------------------------------
+# Canonical Frontend attachment control transform (public, pure).
+#
+# This is the ONE enforcement primitive a future memory authority would
+# use to control Frontend Memory attachment occurrences WITHOUT falling
+# back to Frontend Flash / Recall / item parsing: it rewrites only the
+# explicit ``relevant_memories.txt`` attachment envelopes and leaves
+# every other byte of the request untouched.
+#
+# The low-level actions are mechanical rewrite primitives, NOT high-level
+# Memory policy:
+#
+#     keep_exact : the exact raw attachment envelope survives unchanged.
+#     drop       : the exact raw attachment envelope is removed.
+#
+# v0 production code emits ``keep_exact`` ONLY. ``drop`` exists so the
+# transform is a genuine enforcement primitive (and can be unit-tested),
+# not so a live DROP policy can be run.
+#
+# It reuses the SAME attachment grammar / classification / single-envelope
+# parser the canonical splitter uses -- there is deliberately no second
+# attachment parser.
+# ---------------------------------------------------------------------
+
+REWRITE_KEEP_EXACT = "keep_exact"
+REWRITE_DROP = "drop"
+
+_KNOWN_REWRITE_ACTIONS = (
+    REWRITE_KEEP_EXACT,
+    REWRITE_DROP,
+)
+
+_REWRITE_PAYLOAD_UNSUPPORTED = "payload_unsupported"
+_REWRITE_OCCURRENCE_COUNT_MISMATCH = (
+    "occurrence_count_mismatch"
+)
+_REWRITE_UNKNOWN_ACTION = "unknown_rewrite_action"
+_REWRITE_REFUSED = "rewrite_refused"
+
+
+@dataclass(frozen=True)
+class FrontendRewriteResult:
+    """The fail-closed outcome of the canonical control transform.
+
+    ``payload`` is the rewritten request (a NEW object; the input object
+    is never mutated). It is ``None`` whenever ``ok`` is False: a partial
+    rewrite is never returned.
+    """
+
+    ok: bool
+    reason: str | None
+    payload: dict[str, Any] | None
+    occurrence_count: int
+    kept_count: int
+    dropped_count: int
+
+
+def _frontend_occurrences_in_text(
+    text: str,
+) -> list[tuple[int, int, str, str]]:
+    """(start, end, raw_attachment, body) for every Frontend occurrence.
+
+    Only a genuine ``relevant_memories.txt`` envelope with a non-blank
+    body is returned -- exactly the occurrences
+    ``extract_frontend_memory_segments`` would count. Malformed /
+    self-closing / empty attachments and ordinary user text are never
+    treated as controllable Frontend content.
+    """
+
+    occurrences: list[tuple[int, int, str, str]] = []
+
+    for match in _ATTACHMENT_RE.finditer(text):
+        attrs_text = match.group("attrs")
+
+        if attrs_text is None:
+            attrs_text = match.group("self_attrs") or ""
+
+        attrs = _attachment_attrs(attrs_text)
+
+        if (
+            _classify_attachment(attrs)
+            is not SegmentKind.FRONTEND_MEMORY
+        ):
+            continue
+
+        body = match.group("body")
+
+        body = body if body is not None else ""
+
+        if not body.strip():
+            continue
+
+        occurrences.append(
+            (
+                match.start(),
+                match.end(),
+                match.group(0),
+                body,
+            )
+        )
+
+    return occurrences
+
+
+def _apply_rewrite_actions(
+    text: str,
+    occurrences: list[tuple[int, int, str, str]],
+    actions: list[str],
+) -> str:
+    """Rebuild ``text`` keeping / dropping exact envelopes.
+
+    Everything that is not a dropped envelope survives verbatim; a kept
+    envelope is re-emitted from its exact ``raw_attachment`` slice, never
+    reconstructed, so no whitespace / tag normalization can occur.
+    """
+
+    pieces: list[str] = []
+    cursor = 0
+
+    for (start, end, raw, _body), action in zip(
+        occurrences, actions
+    ):
+        pieces.append(text[cursor:start])
+
+        if action == REWRITE_KEEP_EXACT:
+            pieces.append(raw)
+
+        cursor = end
+
+    pieces.append(text[cursor:])
+
+    return "".join(pieces)
+
+
+def rewrite_frontend_memory_attachments(
+    payload: Any,
+    decide: Any,
+    *,
+    expected_occurrences: int | None = None,
+) -> FrontendRewriteResult:
+    """Pure, fail-closed rewrite of Frontend Memory attachment envelopes.
+
+    ``decide`` is called once per Frontend occurrence, in canonical
+    request order, with keyword arguments::
+
+        decide(
+            occurrence=<int>,
+            placement=<"current" | "history">,
+            raw_attachment=<exact envelope>,
+            body=<exact inner body>,
+        )
+
+    and must return ``keep_exact`` or ``drop``. Any other return value (or
+    a refused / raised callback) fails the WHOLE transform.
+
+    The transform never mutates ``payload`` and never returns a partial
+    result: on any failure ``ok`` is False, ``reason`` is a closed enum
+    and ``payload`` is None. Every non-Frontend field -- system, ordinary
+    user text, dynamic-context / Fingertips / unknown attachments, tools,
+    params, model, block metadata, non-text blocks, message count and
+    roles -- is preserved exactly.
+    """
+
+    if not isinstance(payload, dict):
+        return FrontendRewriteResult(
+            ok=False,
+            reason=_REWRITE_PAYLOAD_UNSUPPORTED,
+            payload=None,
+            occurrence_count=0,
+            kept_count=0,
+            dropped_count=0,
+        )
+
+    messages = payload.get("messages")
+
+    if not isinstance(messages, list) or not all(
+        isinstance(message, dict)
+        for message in messages
+    ):
+        return FrontendRewriteResult(
+            ok=False,
+            reason=_REWRITE_PAYLOAD_UNSUPPORTED,
+            payload=None,
+            occurrence_count=0,
+            kept_count=0,
+            dropped_count=0,
+        )
+
+    rewritten = deepcopy(payload)
+
+    rewritten_messages = rewritten["messages"]
+
+    last_index = len(rewritten_messages) - 1
+
+    state = {
+        "occurrence": 0,
+        "kept": 0,
+        "dropped": 0,
+    }
+
+    failure: dict[str, str] | None = None
+
+    def rewrite_text(
+        text: str,
+        placement: str,
+        *,
+        message_index: int,
+        block_index: int,
+    ) -> str:
+        nonlocal failure
+
+        occurrences = _frontend_occurrences_in_text(
+            text
+        )
+
+        actions: list[str] = []
+
+        for start, end, raw, body in occurrences:
+            occurrence = state["occurrence"]
+
+            state["occurrence"] += 1
+
+            try:
+                action = decide(
+                    occurrence=occurrence,
+                    placement=placement,
+                    raw_attachment=raw,
+                    body=body,
+                )
+            except Exception:
+                failure = {
+                    "reason": _REWRITE_REFUSED
+                }
+                return text
+
+            if action not in _KNOWN_REWRITE_ACTIONS:
+                # A refusal (None) and an unknown action are the same
+                # fail-closed outcome: no partial rewrite is allowed.
+                failure = {
+                    "reason": (
+                        _REWRITE_UNKNOWN_ACTION
+                        if action is not None
+                        else _REWRITE_REFUSED
+                    )
+                }
+                return text
+
+            actions.append(action)
+
+        if not actions:
+            return text
+
+        state["kept"] += actions.count(
+            REWRITE_KEEP_EXACT
+        )
+        state["dropped"] += actions.count(
+            REWRITE_DROP
+        )
+
+        return _apply_rewrite_actions(
+            text, occurrences, actions
+        )
+
+    for index, message in enumerate(
+        rewritten_messages
+    ):
+        if failure is not None:
+            break
+
+        placement = (
+            "current"
+            if (
+                index == last_index
+                and message.get("role") == "user"
+            )
+            else "history"
+        )
+
+        content = message.get("content")
+
+        if isinstance(content, str):
+            message["content"] = rewrite_text(
+                content,
+                placement,
+                message_index=index,
+                block_index=0,
+            )
+            continue
+
+        if not isinstance(content, list):
+            continue
+
+        for block_index, block in enumerate(content):
+            if failure is not None:
+                break
+
+            if not (
+                isinstance(block, dict)
+                and block.get("type") == "text"
+            ):
+                continue
+
+            text = block.get("text")
+
+            if not isinstance(text, str):
+                continue
+
+            block["text"] = rewrite_text(
+                text,
+                placement,
+                message_index=index,
+                block_index=block_index,
+            )
+
+    if failure is not None:
+        return FrontendRewriteResult(
+            ok=False,
+            reason=failure["reason"],
+            payload=None,
+            occurrence_count=state["occurrence"],
+            kept_count=0,
+            dropped_count=0,
+        )
+
+    if (
+        expected_occurrences is not None
+        and state["occurrence"] != expected_occurrences
+    ):
+        return FrontendRewriteResult(
+            ok=False,
+            reason=_REWRITE_OCCURRENCE_COUNT_MISMATCH,
+            payload=None,
+            occurrence_count=state["occurrence"],
+            kept_count=0,
+            dropped_count=0,
+        )
+
+    return FrontendRewriteResult(
+        ok=True,
+        reason=None,
+        payload=rewritten,
+        occurrence_count=state["occurrence"],
+        kept_count=state["kept"],
+        dropped_count=state["dropped"],
+    )
+
+
 def _canonicalize_message(
     message: dict[str, Any],
     index: int,
