@@ -9,17 +9,23 @@ and the code disagree, the code is correct and this document is wrong.
 
 - Repository source of truth: the tree at the baseline commit below.
 - Baseline: `origin/feature/gateway-v2`
-- Baseline HEAD: `ab586b34d0265a713d3e3ed3ac60741246093ed2`
-  (merge of PR#2, `trae/request-local-cognitive-workspace-v0`)
+- Baseline HEAD: `2815c934892b7a2ea79b303453e959f6829f0ef1`
+  (merge of PR #4, `trae/lifecycle-shadow-comparison-v0` — Legacy vs
+  Cognitive Lifecycle Shadow Comparison v0)
 - Audit date context: originally written for the Frontend Memory Arbitration
   Shadow task (branch `trae/frontend-memory-arbitration-shadow-v1`), then
   updated for the Request-local Cognitive Workspace Foundation v0 task
-  (branch `trae/request-local-cognitive-workspace-v0`), then updated for the
-  Memory Lifecycle Authority Map + Dual-Authority Guardrails v0 task
-  (branch `trae/lifecycle-authority-audit-v0`), then updated for the
-  Legacy vs Cognitive Lifecycle Shadow Comparison v0 task
+  (branch `trae/request-local-cognitive-workspace-v0`; the then-current
+  `feature/gateway-v2` baseline was
+  `ab586b34d0265a713d3e3ed3ac60741246093ed2`, merge of PR #2 — a historical
+  merge point, since superseded, and NOT the current repository baseline),
+  then updated for the Memory Lifecycle Authority Map + Dual-Authority
+  Guardrails v0 task (branch `trae/lifecycle-authority-audit-v0`), then
+  updated for the Legacy vs Cognitive Lifecycle Shadow Comparison v0 task
   (branch `trae/lifecycle-shadow-comparison-v0`, base
-  `01b5948ab1b14c2a65ddebea31611f2e5321aa74`), then updated for the
+  `01b5948ab1b14c2a65ddebea31611f2e5321aa74`; merged into `feature/gateway-v2`
+  as PR #4, the current baseline HEAD
+  `2815c934892b7a2ea79b303453e959f6829f0ef1`), then updated for the
   Source-Neutral Memory Evidence + Unified Delivery Plan Shadow v0 task
   (branch `trae/unified-memory-delivery-shadow-v0`, base
   `2815c934892b7a2ea79b303453e959f6829f0ef1`).
