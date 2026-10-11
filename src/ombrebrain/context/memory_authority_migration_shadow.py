@@ -8,6 +8,7 @@ from collections import Counter
 from typing import Any
 
 from ombrebrain.context.memory_delivery_shadow import (
+    evidence_ref_for_fields,
     is_valid_memory_delivery_plan_artifact,
 )
 from ombrebrain.context.memory_flash_live_exposure import (
@@ -17,6 +18,8 @@ from ombrebrain.context.memory_lifecycle_event import (
     parse_iso_utc,
 )
 from ombrebrain.context.memory_source_evidence import (
+    KIND_FRONTEND_ATTACHMENT,
+    KIND_OB_CANDIDATE,
     SCOPE_CURRENT,
     SCOPE_HISTORY,
     SCOPE_RETRIEVAL,
@@ -206,26 +209,55 @@ _KNOWN_LIVE_CUTOVER_REASONS = (
     REASON_NO_RENDERER,
 )
 
-# The ONE deterministic coverage mapping. Source + channel -> coverage
-# + replacement requirement. Any other combination invalidates.
-_COVERAGE_BY_ROW = {
+# No-record reasons for the two evidence-integrity gates. A whole source
+# plane that cannot be observed truthfully, and a Source Evidence /
+# Delivery Plan pool that disagrees, both refuse a readiness conclusion
+# instead of persisting a misleading "covered" comparison.
+REASON_SOURCE_UNAVAILABLE = (
+    "source_observation_unavailable"
+)
+REASON_EVIDENCE_MISMATCH = (
+    "source_delivery_evidence_mismatch"
+)
+
+# The ONE deterministic migration-row contract. Source + channel ->
+# (coverage, replacement_requirement, kind, full_content_access_mode,
+# currently_model_visible). It mirrors the upstream STRICT Delivery row
+# contract exactly, so a copied row is never weakened into a shape the
+# Delivery Plan could not itself have produced. Any other combination
+# invalidates the whole artifact.
+_ROW_CONTRACT = {
     (SOURCE_FRONTEND, _MODE_DIRECT_DATA): (
         COVERAGE_FRONTEND_GAP,
         REQ_FRONTEND_CHANNEL,
+        KIND_FRONTEND_ATTACHMENT,
+        _MODE_FULL_ALREADY_PRESENT,
+        True,
     ),
     (SOURCE_OB, _MODE_FLASH_CUE): (
         COVERAGE_OB_CUE,
         REQ_NONE,
+        KIND_OB_CANDIDATE,
+        _MODE_FULL_RECALL_REQUIRED,
+        False,
     ),
     (SOURCE_OB, _MODE_DROP): (
         COVERAGE_OB_WITHHOLD,
         REQ_NONE,
+        KIND_OB_CANDIDATE,
+        _MODE_FULL_NONE,
+        False,
     ),
     (SOURCE_OB, _MODE_UNKNOWN): (
         COVERAGE_OB_UNKNOWN,
         REQ_POLICY_RESOLUTION,
+        KIND_OB_CANDIDATE,
+        _MODE_FULL_UNKNOWN,
+        False,
     ),
 }
+
+_FRONTEND_SCOPES = (SCOPE_CURRENT, SCOPE_HISTORY)
 
 _SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 
@@ -439,14 +471,14 @@ def observe_frontend_final_presence(
     )
 
 
-def _live_exposure_observation(
+def observe_actual_ob_live_exposure(
     *,
     conversation_id: str,
     cognitive_request_id: str,
     pre_live_body: bytes,
     final_body: bytes,
 ) -> tuple[bool, dict[str, Any]]:
-    """Request-level actual OB Live Exposure fact.
+    """Request-level actual OB Live Exposure fact, observed EXACTLY once.
 
     ``(ok, data)``. When the OB live-exposure stage did not change the
     body the fact is an explicit zero -- and NO reason is inferred (it
@@ -560,6 +592,111 @@ def delivery_plan_bound_to_request(
     return is_valid_memory_delivery_plan_artifact(plan)
 
 
+def source_observation_available(
+    source_evidence_snapshot: Any,
+    delivery_plan: Any,
+) -> bool:
+    """True ONLY when BOTH source planes are truthfully observable.
+
+    ``AVAILABLE + zero units`` is valid EMPTY evidence; ``UNAVAILABLE``
+    is NOT. A whole source plane that cannot be observed truthfully must
+    never become ``contract_gap_unit_count = 0`` / ``covered``.
+
+    Both the request-local Source Evidence Snapshot AND the request-local
+    Delivery Plan must independently report BOTH planes available, and
+    the two availability views must AGREE, so a plan built from a
+    different evidence pool can never silently cover an unobservable
+    source.
+    """
+
+    snapshot_frontend = getattr(
+        source_evidence_snapshot,
+        "frontend_observation_available",
+        None,
+    )
+    snapshot_ob = getattr(
+        source_evidence_snapshot,
+        "ob_observation_available",
+        None,
+    )
+
+    if snapshot_frontend is not True:
+        return False
+
+    if snapshot_ob is not True:
+        return False
+
+    if not isinstance(delivery_plan, dict):
+        return False
+
+    plan_frontend = delivery_plan.get(
+        "frontend_observation_available"
+    )
+    plan_ob = delivery_plan.get(
+        "ob_observation_available"
+    )
+
+    if plan_frontend is not True:
+        return False
+
+    if plan_ob is not True:
+        return False
+
+    return (
+        plan_frontend == snapshot_frontend
+        and plan_ob == snapshot_ob
+    )
+
+
+def evidence_pool_matches_delivery(
+    source_evidence_snapshot: Any,
+    delivery_plan: Any,
+) -> bool:
+    """True ONLY when the Delivery Plan describes exactly the same source
+    occurrence pool as the Source Evidence Snapshot.
+
+    Request identity (conversation / request / revision) proves WHO the
+    evidence belongs to, not WHAT the pool contains, so the full source
+    split and the full unit count must agree:
+    """
+
+    units = tuple(
+        getattr(
+            source_evidence_snapshot,
+            "units",
+            (),
+        )
+        or ()
+    )
+
+    frontend_units = sum(
+        1
+        for unit in units
+        if getattr(unit, "source", None)
+        == SOURCE_FRONTEND
+    )
+    ob_units = sum(
+        1
+        for unit in units
+        if getattr(unit, "source", None) == SOURCE_OB
+    )
+
+    if not isinstance(delivery_plan, dict):
+        return False
+
+    metrics = delivery_plan.get("metrics")
+
+    if not isinstance(metrics, dict):
+        return False
+
+    return (
+        metrics.get("frontend_unit_count")
+        == frontend_units
+        and metrics.get("ob_unit_count") == ob_units
+        and metrics.get("unit_count") == len(units)
+    )
+
+
 def _migration_row(
     row: dict[str, Any],
 ) -> dict[str, Any]:
@@ -568,16 +705,16 @@ def _migration_row(
         row.get("immediate_delivery_mode"),
     )
 
-    mapping = _COVERAGE_BY_ROW.get(key)
+    contract = _ROW_CONTRACT.get(key)
 
-    if mapping is None:
+    if contract is None:
         # A Delivery Plan row outside the closed mapping can never be
         # silently relabelled; the writer refuses the whole artifact.
         raise ValueError(
             "unmappable delivery row"
         )
 
-    coverage, requirement = mapping
+    coverage, requirement = contract[0], contract[1]
 
     return {
         "evidence_ref": row.get("evidence_ref"),
@@ -587,6 +724,11 @@ def _migration_row(
         "source_occurrence": row.get(
             "source_occurrence"
         ),
+        # The privacy-safe content digest is persisted ONLY so the
+        # validator can recompute the occurrence evidence_ref from the
+        # row's own fields. It is a sha256, never raw content, and it is
+        # NOT a semantic identity claim.
+        "content_digest": row.get("content_digest"),
         "current_delivery_mode": row.get(
             "immediate_delivery_mode"
         ),
@@ -680,48 +822,37 @@ def build_memory_authority_migration_artifact(
     conversation_id: str,
     cognitive_request_id: str,
     source_unified_revision: int,
-    source_evidence_snapshot: Any,
     delivery_plan: dict[str, Any],
+    frontend_observation: tuple[bool, bool],
+    live_exposure_observation: dict[str, Any],
     pre_live_body: bytes,
     final_body: bytes,
 ) -> dict[str, Any]:
-    """Builder for one privacy-safe Migration Shadow artifact.
+    """PURE builder for one privacy-safe Migration Shadow artifact.
 
-    No logging and deterministic except for ``created_at``. The only
-    read is the validated request-scoped Live Exposure receipt, and
-    only when the body actually changed. It consumes the ALREADY BUILT
-    request-local Source Evidence Snapshot, the ALREADY BUILT
-    request-local Delivery Plan and the exact pre-live / final body
-    bytes. It never rebuilds any of them, never calls a selector and
-    never mutates a body.
+    It performs NO real-request observation. The FINAL-Frontend presence
+    and the request-level OB Live Exposure are observed EXACTLY ONCE by
+    the calling orchestrator and passed in. This function never
+    canonicalizes a body, never calls the Operit adapter, never reads a
+    Live Exposure receipt, never reads runtime files and never rereads
+    request-global state: it only derives rows, metrics and labels from
+    the already-validated observations. ``pre_live_body`` / ``final_body``
+    are used ONLY for deterministic sha256 / byte-count bookkeeping and
+    are never reparsed.
 
-    Callers MUST have already verified the final Frontend multiset and
-    the Live Exposure receipt; this builder assumes those preconditions
-    hold and merely expresses them.
+    It consumes the ALREADY BUILT request-local Delivery Plan and the
+    two precomputed observations, never rebuilds any of them, never
+    calls a selector and never mutates a body. No logging; deterministic
+    except for ``created_at``.
     """
 
     delivery_metrics = delivery_plan["metrics"]
 
     frontend_available, frontend_verified = (
-        observe_frontend_final_presence(
-            final_body,
-            source_evidence_snapshot,
-        )
+        frontend_observation
     )
 
-    live_ok, live = _live_exposure_observation(
-        conversation_id=conversation_id,
-        cognitive_request_id=(
-            cognitive_request_id
-        ),
-        pre_live_body=pre_live_body,
-        final_body=final_body,
-    )
-
-    if not live_ok:
-        raise ValueError(
-            "live exposure receipt mismatch"
-        )
+    live = live_exposure_observation
 
     rows = [
         _migration_row(row)
@@ -855,12 +986,21 @@ def build_memory_authority_migration_artifact(
 def _valid_migration_row(row: Any) -> bool:
     """One structurally + semantically valid migration row.
 
-    The mapping from ``(source, current_delivery_mode)`` to
-    ``(authority_coverage, replacement_requirement)`` is CLOSED: a
-    derived label that disagrees with its own source / channel --
-    e.g. a Frontend row relabelled as a controlled OB cue, or an OB
-    unknown relabelled as a controlled withhold -- invalidates the
-    whole artifact.
+    The migration row is downstream from a STRICT Delivery Plan, so its
+    full shape is CLOSED against the upstream contract: source / kind /
+    scope / delivery channel / full-content access mode / visibility /
+    coverage / replacement requirement must ALL match the ONE contract
+    entry for its ``(source, current_delivery_mode)`` key. A row whose
+    derived label disagrees with its own source / channel -- e.g. a
+    Frontend row relabelled as a controlled OB cue, or an OB unknown
+    relabelled as a controlled withhold -- invalidates the whole
+    artifact.
+
+    ``evidence_ref`` is NOT merely checked for 64-hex shape: it is
+    INDEPENDENTLY recomputed from the row's own persisted
+    ``content_digest`` with the ONE shared Delivery helper, so a
+    valid-looking random digest can never become trusted occurrence
+    provenance.
     """
 
     if not isinstance(row, dict):
@@ -871,38 +1011,38 @@ def _valid_migration_row(row: Any) -> bool:
     if source not in (SOURCE_FRONTEND, SOURCE_OB):
         return False
 
-    if not isinstance(row.get("kind"), str):
-        return False
-
-    if not _is_nonneg_int(
-        row.get("source_occurrence")
-    ):
-        return False
-
-    if not _is_sha256(row.get("evidence_ref")):
-        return False
-
-    if not _is_bool(
-        row.get("currently_model_visible")
-    ):
-        return False
-
     mode = row.get("current_delivery_mode")
 
     if mode not in _KNOWN_DELIVERY_MODES:
         return False
 
-    if row.get(
-        "current_full_content_access_mode"
-    ) not in _KNOWN_FULL_MODES:
+    contract = _ROW_CONTRACT.get((source, mode))
+
+    if contract is None:
         return False
 
-    mapping = _COVERAGE_BY_ROW.get((source, mode))
+    (
+        coverage,
+        requirement,
+        kind,
+        full_mode,
+        visible,
+    ) = contract
 
-    if mapping is None:
+    if row.get("kind") != kind:
         return False
 
-    coverage, requirement = mapping
+    if (
+        row.get("current_full_content_access_mode")
+        != full_mode
+    ):
+        return False
+
+    if (
+        row.get("currently_model_visible")
+        is not visible
+    ):
+        return False
 
     if row.get("authority_coverage") != coverage:
         return False
@@ -913,25 +1053,35 @@ def _valid_migration_row(row: Any) -> bool:
     ):
         return False
 
-    # Source-specific shape: a Frontend row is direct data and
-    # model-visible with an already-present body; an OB row is never
-    # model-visible and is a cue / drop / unknown channel.
     if source == SOURCE_FRONTEND:
         if row.get("source_scope") not in (
-            SCOPE_CURRENT,
-            SCOPE_HISTORY,
+            _FRONTEND_SCOPES
         ):
             return False
-
-        if row.get("currently_model_visible") is not True:
-            return False
-
-        return True
-
-    if row.get("source_scope") != SCOPE_RETRIEVAL:
+    elif row.get("source_scope") != SCOPE_RETRIEVAL:
         return False
 
-    if row.get("currently_model_visible") is not False:
+    occurrence = row.get("source_occurrence")
+
+    if not _is_nonneg_int(occurrence):
+        return False
+
+    content_digest = row.get("content_digest")
+
+    if not _is_sha256(content_digest):
+        return False
+
+    if not _is_sha256(row.get("evidence_ref")):
+        return False
+
+    if row.get("evidence_ref") != (
+        evidence_ref_for_fields(
+            source,
+            kind,
+            occurrence,
+            content_digest,
+        )
+    ):
         return False
 
     return True
@@ -1232,6 +1382,27 @@ def is_valid_memory_authority_migration_artifact(
         if not _is_nonneg_int(metrics.get(name)):
             return False
 
+    # Exact truncation bookkeeping. Migration rows mirror ONLY the
+    # already-persisted Delivery rows, so the FULL unit_count is EXACTLY
+    # the persisted rows plus the source Delivery truncation telemetry.
+    # Internally legal aggregate algebra can never invent hidden rows
+    # beyond that exact identity.
+    if metrics["unit_count"] != (
+        len(rows) + truncated_count
+    ):
+        return False
+
+    if truncated is False and metrics["unit_count"] != len(
+        rows
+    ):
+        return False
+
+    if truncated is True and not (
+        truncated_count > 0
+        and metrics["unit_count"] > len(rows)
+    ):
+        return False
+
     # FULL-scope algebra. Every counter shares ONE explicit request
     # scope, so a forged counter that breaks the partition is rejected.
     if metrics["unit_count"] != (
@@ -1287,6 +1458,73 @@ def is_valid_memory_authority_migration_artifact(
         + metrics[
             "actual_ob_live_exposure"
             "_estimated_tokens"
+        ]
+    ):
+        return False
+
+    # Cross-lock: ``current_exposure`` and ``metrics`` persist the SAME
+    # real exposure facts, so the two views must agree EXACTLY. A
+    # duplicate factual representation that disagrees invalidates the
+    # whole artifact -- there is no "one of them is authoritative" rule.
+    if exposure["frontend_direct_unit_count"] != (
+        metrics["frontend_direct_bypass_count"]
+    ):
+        return False
+
+    if metrics["frontend_direct_bypass_count"] != (
+        metrics["frontend_replacement_required_count"]
+    ):
+        return False
+
+    if exposure[
+        "frontend_direct_model_visible_chars"
+    ] != metrics["frontend_direct_model_visible_chars"]:
+        return False
+
+    if metrics["frontend_direct_model_visible_chars"] != (
+        metrics[
+            "counterfactual_loss_if_direct_mouth_"
+            "removed_without_replacement_chars"
+        ]
+    ):
+        return False
+
+    if exposure[
+        "frontend_direct_model_visible_estimated_tokens"
+    ] != metrics[
+        "frontend_direct_model_visible_estimated_tokens"
+    ]:
+        return False
+
+    if metrics[
+        "frontend_direct_model_visible_estimated_tokens"
+    ] != metrics[
+        "counterfactual_loss_if_direct_mouth_"
+        "removed_without_replacement_estimated_tokens"
+    ]:
+        return False
+
+    if exposure["actual_ob_live_exposed_count"] != (
+        metrics["actual_ob_live_exposed_count"]
+    ):
+        return False
+
+    if exposure[
+        "actual_ob_live_exposure_estimated_tokens"
+    ] != metrics[
+        "actual_ob_live_exposure_estimated_tokens"
+    ]:
+        return False
+
+    if metrics[
+        "actual_model_visible_memory_estimated_tokens"
+    ] != (
+        exposure[
+            "frontend_direct_model_visible"
+            "_estimated_tokens"
+        ]
+        + exposure[
+            "actual_ob_live_exposure_estimated_tokens"
         ]
     ):
         return False
@@ -1570,17 +1808,60 @@ def update_memory_authority_migration(
             reason="invalid_body",
         )
 
-    # Current Frontend exposure is verified against the ACTUAL final
-    # body BEFORE anything is persisted. A canonicalization failure, a
-    # malformed final Frontend segment or ANY occurrence / placement /
-    # digest / footprint disagreement means the current exposure cannot
-    # be truthfully observed, so no record is written.
-    (
-        frontend_available,
-        frontend_verified,
-    ) = observe_frontend_final_presence(
-        final_body,
+    # Evidence-readiness gate. A whole source plane that cannot be
+    # observed truthfully must never become "empty / covered". Both the
+    # request-local Source Evidence Snapshot AND the request-local
+    # Delivery Plan must report BOTH planes available and agree.
+    # AVAILABLE + zero units stays valid EMPTY evidence.
+    if not source_observation_available(
         source_evidence_snapshot,
+        delivery_plan,
+    ):
+        logger.warning(
+            "[gateway.context_memory_authority_migration] "
+            "reason=source_observation_unavailable "
+            "fail_open=true"
+        )
+
+        return _report(
+            stored=False,
+            decision="no_record",
+            reason=REASON_SOURCE_UNAVAILABLE,
+        )
+
+    # Request identity is not semantic identity: the Delivery Plan must
+    # describe exactly the same source occurrence pool (per-source split
+    # and full total) as the Source Evidence Snapshot.
+    if not evidence_pool_matches_delivery(
+        source_evidence_snapshot,
+        delivery_plan,
+    ):
+        logger.warning(
+            "[gateway.context_memory_authority_migration] "
+            "reason=source_delivery_evidence_mismatch "
+            "fail_open=true"
+        )
+
+        return _report(
+            stored=False,
+            decision="no_record",
+            reason=REASON_EVIDENCE_MISMATCH,
+        )
+
+    # Current Frontend exposure is verified against the ACTUAL final
+    # body EXACTLY ONCE, here at the orchestration boundary. A
+    # canonicalization failure, a malformed final Frontend segment or
+    # ANY occurrence / placement / digest / footprint disagreement means
+    # the current exposure cannot be truthfully observed.
+    frontend_observation = (
+        observe_frontend_final_presence(
+            final_body,
+            source_evidence_snapshot,
+        )
+    )
+
+    frontend_available, frontend_verified = (
+        frontend_observation
     )
 
     if not (
@@ -1600,10 +1881,14 @@ def update_memory_authority_migration(
             ),
         )
 
-    # Actual OB Live Exposure is a REQUEST-LEVEL fact. A body that
-    # changed REQUIRES the validated request-scoped receipt; a missing /
-    # corrupt / mismatching receipt means no record.
-    live_ok, _live = _live_exposure_observation(
+    # Actual OB Live Exposure is a REQUEST-LEVEL fact, observed EXACTLY
+    # ONCE here. A body that changed REQUIRES the validated request-
+    # scoped receipt; a missing / corrupt / mismatching receipt means no
+    # record.
+    (
+        live_ok,
+        live_exposure_observation,
+    ) = observe_actual_ob_live_exposure(
         conversation_id=conversation_id,
         cognitive_request_id=(
             cognitive_request_id
@@ -1635,10 +1920,13 @@ def update_memory_authority_migration(
                 source_unified_revision=(
                     source_unified_revision
                 ),
-                source_evidence_snapshot=(
-                    source_evidence_snapshot
-                ),
                 delivery_plan=delivery_plan,
+                frontend_observation=(
+                    frontend_observation
+                ),
+                live_exposure_observation=(
+                    live_exposure_observation
+                ),
                 pre_live_body=pre_live_body,
                 final_body=final_body,
             )
