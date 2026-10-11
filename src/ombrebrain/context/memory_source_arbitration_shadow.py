@@ -14,7 +14,6 @@ from ombrebrain.context.memory_source_evidence import (
 )
 from ombrebrain.context.recall_types import (
     atomic_write,
-    estimate_tokens,
     is_valid_cognitive_request_id,
     is_valid_conversation_id,
     normalize_key,
@@ -174,38 +173,6 @@ def _normalized_digest(text: str) -> str:
     ).hexdigest()
 
 
-def _frontend_model_visible_text(
-    unit: Any,
-) -> str:
-    """The exact raw canonical attachment text, in memory only.
-
-    It is derived from the source-native segment the evidence unit
-    retains; if no raw text is available the inner body is used as a
-    conservative lower bound. No tags are ever reconstructed.
-    """
-
-    segment = unit.native_payload
-
-    raw_attachment = getattr(
-        segment,
-        "raw_attachment",
-        None,
-    )
-
-    if (
-        isinstance(raw_attachment, str)
-        and raw_attachment
-    ):
-        return raw_attachment
-
-    body = getattr(segment, "body", None)
-
-    if isinstance(body, str):
-        return body
-
-    return ""
-
-
 def _observations_from_units(
     units: Any,
 ) -> list[_Observation]:
@@ -213,7 +180,11 @@ def _observations_from_units(
 
     Semantics are unchanged from the original v1 builder: a Frontend
     unit keeps its current/history placement and its model-visible raw
-    envelope; an OB unit is retrieved but not model-visible.
+    envelope; an OB unit is retrieved but not model-visible. The
+    model-visible footprint is reused STRAIGHT from the shared evidence
+    unit (measured once by the adapter from the exact canonical
+    envelope), so the arbitration measurement and the Delivery Plan
+    Shadow can never disagree about the same occurrence.
     """
 
     observations: list[_Observation] = []
@@ -223,10 +194,6 @@ def _observations_from_units(
 
     for unit in units:
         if unit.source == SOURCE_FRONTEND:
-            raw_attachment = (
-                _frontend_model_visible_text(unit)
-            )
-
             placement = unit.source_scope
 
             if placement not in (
@@ -249,13 +216,11 @@ def _observations_from_units(
                     content_estimated_tokens=(
                         unit.content_estimated_tokens
                     ),
-                    model_visible_chars=len(
-                        raw_attachment
+                    model_visible_chars=(
+                        unit.model_visible_chars
                     ),
                     model_visible_estimated_tokens=(
-                        estimate_tokens(
-                            raw_attachment
-                        )
+                        unit.model_visible_estimated_tokens
                     ),
                     currently_model_visible=True,
                     retrieved=False,
@@ -278,8 +243,12 @@ def _observations_from_units(
                     content_estimated_tokens=(
                         unit.content_estimated_tokens
                     ),
-                    model_visible_chars=0,
-                    model_visible_estimated_tokens=0,
+                    model_visible_chars=(
+                        unit.model_visible_chars
+                    ),
+                    model_visible_estimated_tokens=(
+                        unit.model_visible_estimated_tokens
+                    ),
                     currently_model_visible=False,
                     retrieved=True,
                 )

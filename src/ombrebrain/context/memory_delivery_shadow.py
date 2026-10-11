@@ -185,6 +185,17 @@ _KNOWN_REASONS = (
 
 _SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 
+# Metric fields that are SUMS (content / token footprints) rather than
+# counts of rows. A truncated artifact can only prove a lower bound for
+# these, so they are validated as monotone (>= the persisted-scope sum)
+# instead of being bounded by a per-row delta.
+_SUM_METRIC_NAMES = (
+    "combined_content_chars",
+    "combined_content_estimated_tokens",
+    "current_model_visible_chars",
+    "current_model_visible_estimated_tokens",
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -219,27 +230,46 @@ def _is_sha256(value: Any) -> bool:
     )
 
 
-def _evidence_ref(unit: Any) -> str:
-    """Stable, occurrence-safe, request-local evidence reference.
+def evidence_ref_for_fields(
+    source: Any,
+    kind: Any,
+    source_occurrence: Any,
+    content_digest: Any,
+) -> str:
+    """The ONE deterministic evidence-ref formula, from persisted fields.
 
-    ``sha256(source + kind + occurrence + content_digest)``. It is NOT
-    a memory id, NOT a content hash alone and NOT a global identity:
-    duplicate content occurrences stay four distinct occurrences with
-    four distinct refs. Only the digest is emitted.
+    ``sha256(source + kind + source_occurrence + content_digest)``. It is
+    NOT a memory id, NOT a content hash alone and NOT a global identity:
+    duplicate content occurrences stay distinct occurrences with
+    distinct refs. The builder and the validator both call THIS function
+    (the validator recomputes the expected ref from a row's own
+    persisted fields), so a random valid-looking 64-hex string can never
+    become trusted evidence identity.
     """
 
     payload = "\0".join(
         (
-            str(unit.source),
-            str(unit.kind),
-            str(unit.request_occurrence),
-            str(unit.content_digest),
+            str(source),
+            str(kind),
+            str(source_occurrence),
+            str(content_digest),
         )
     )
 
     return hashlib.sha256(
         payload.encode("utf-8")
     ).hexdigest()
+
+
+def _evidence_ref(unit: Any) -> str:
+    """Stable, occurrence-safe, request-local evidence reference."""
+
+    return evidence_ref_for_fields(
+        unit.source,
+        unit.kind,
+        unit.request_occurrence,
+        unit.content_digest,
+    )
 
 
 def _policy_binding(
@@ -380,6 +410,12 @@ def _row(
         "content_estimated_tokens": (
             unit.content_estimated_tokens
         ),
+        # The exact model-visible footprint (Frontend raw envelope, 0
+        # for OB). Kept separate from the body content size above.
+        "model_visible_chars": unit.model_visible_chars,
+        "model_visible_estimated_tokens": (
+            unit.model_visible_estimated_tokens
+        ),
         "currently_model_visible": (
             unit.currently_model_visible
         ),
@@ -492,10 +528,27 @@ def _ob_row(
 def _metrics(
     rows: list[dict[str, Any]],
     *,
-    unit_count: int,
     persisted_count: int,
     truncated_count: int,
 ) -> dict[str, Any]:
+    """FULL-scope metrics, computed from ALL planned rows.
+
+    ``rows`` is always the COMPLETE request plan (never the persisted
+    slice), so every count below shares ONE explicit scope: the full
+    request plan. ``persisted_count`` / ``truncated_count`` record how
+    many rows survived the persisted hard cap and how many were
+    truncated, and satisfy the algebra
+
+        unit_count == persisted_unit_count + truncated_unit_count
+        unit_count == frontend_unit_count + ob_unit_count
+        unit_count == direct_data_count + flash_cue_count
+                      + drop_count + unknown_count
+
+    A degraded / truncated artifact therefore never reports a
+    contradictory mixed scope such as ``unit_count = 70`` with
+    ``ob_unit_count = 64``.
+    """
+
     def is_source(row, source):
         return row.get("source") == source
 
@@ -518,7 +571,7 @@ def _metrics(
         )
 
     return {
-        "unit_count": unit_count,
+        "unit_count": len(rows),
         "persisted_unit_count": persisted_count,
         "truncated_unit_count": truncated_count,
         "frontend_unit_count": len(frontend_rows),
@@ -616,7 +669,7 @@ def _metrics(
                 for r in rows
             ),
         "current_model_visible_chars": sum(
-            r.get("content_chars", 0)
+            r.get("model_visible_chars", 0)
             for r in rows
             if r.get(
                 "currently_model_visible"
@@ -626,7 +679,7 @@ def _metrics(
         "current_model_visible_estimated_tokens":
             sum(
                 r.get(
-                    "content_estimated_tokens", 0
+                    "model_visible_estimated_tokens", 0
                 )
                 for r in rows
                 if r.get(
@@ -694,13 +747,13 @@ def build_memory_delivery_plan_artifact(
         else {}
     )
 
-    rows: list[dict[str, Any]] = []
+    all_rows: list[dict[str, Any]] = []
 
     for unit in units:
         if unit.source == SOURCE_FRONTEND:
-            rows.append(_frontend_row(unit))
+            all_rows.append(_frontend_row(unit))
         elif unit.source == SOURCE_OB:
-            rows.append(
+            all_rows.append(
                 _ob_row(
                     unit,
                     policy_available=(
@@ -710,11 +763,12 @@ def build_memory_delivery_plan_artifact(
                 )
             )
 
-    total = len(rows)
+    # Metrics are computed over the COMPLETE request plan BEFORE the
+    # persisted hard cap, so every counter shares one explicit scope and
+    # the algebra invariants hold. The persisted slice is separate.
+    persisted = all_rows[:MAX_DELIVERY_ROWS]
 
-    persisted = rows[:MAX_DELIVERY_ROWS]
-
-    truncated_count = total - len(persisted)
+    truncated_count = len(all_rows) - len(persisted)
 
     return {
         "version": VERSION,
@@ -745,8 +799,7 @@ def build_memory_delivery_plan_artifact(
         ),
         "rows": persisted,
         "metrics": _metrics(
-            persisted,
-            unit_count=total,
+            all_rows,
             persisted_count=len(persisted),
             truncated_count=truncated_count,
         ),
@@ -765,12 +818,14 @@ def _valid_row(row: Any) -> bool:
     A Frontend row must never look like an OB row and vice versa (see
     the source-specific invariants below), and a row's channel must
     match its eligibility verdict exactly.
+
+    ``evidence_ref`` is NOT merely checked for 64-hex shape: it is
+    INDEPENDENTLY recomputed from the row's own persisted fields with
+    the ONE shared helper, so a valid-looking random digest can never
+    become trusted evidence identity.
     """
 
     if not isinstance(row, dict):
-        return False
-
-    if not _is_sha256(row.get("evidence_ref")):
         return False
 
     source = row.get("source")
@@ -778,7 +833,30 @@ def _valid_row(row: Any) -> bool:
     if source not in (SOURCE_FRONTEND, SOURCE_OB):
         return False
 
+    kind = row.get("kind")
+
+    if not isinstance(kind, str):
+        return False
+
+    occurrence = row.get("source_occurrence")
+
+    if not _is_nonneg_int(occurrence):
+        return False
+
     if not _is_sha256(row.get("content_digest")):
+        return False
+
+    if not _is_sha256(row.get("evidence_ref")):
+        return False
+
+    if row.get("evidence_ref") != (
+        evidence_ref_for_fields(
+            source,
+            kind,
+            occurrence,
+            row.get("content_digest"),
+        )
+    ):
         return False
 
     if not _is_sha256(row.get("normalized_digest")):
@@ -789,6 +867,16 @@ def _valid_row(row: Any) -> bool:
 
     if not _is_nonneg_int(
         row.get("content_estimated_tokens")
+    ):
+        return False
+
+    if not _is_nonneg_int(
+        row.get("model_visible_chars")
+    ):
+        return False
+
+    if not _is_nonneg_int(
+        row.get("model_visible_estimated_tokens")
     ):
         return False
 
@@ -834,11 +922,6 @@ def _valid_row(row: Any) -> bool:
     if not _is_nonneg_int(row.get("source_index")):
         return False
 
-    if not _is_nonneg_int(
-        row.get("source_occurrence")
-    ):
-        return False
-
     if source == SOURCE_FRONTEND:
         return _valid_frontend_row(row)
 
@@ -867,6 +950,19 @@ def _valid_frontend_row(row: dict) -> bool:
         return False
 
     if row.get("retrieved") is not False:
+        return False
+
+    # The exact model-visible envelope always contains the extracted
+    # body, so the envelope footprint can never be smaller than the
+    # body content size.
+    if row.get("model_visible_chars") < row.get(
+        "content_chars"
+    ):
+        return False
+
+    if row.get(
+        "model_visible_estimated_tokens"
+    ) < row.get("content_estimated_tokens"):
         return False
 
     if row.get("policy_binding_available") is not None:
@@ -921,6 +1017,14 @@ def _valid_ob_row(row: dict) -> bool:
         return False
 
     if row.get("retrieved") is not True:
+        return False
+
+    # OB candidate content is never model-visible, so its model-visible
+    # footprint is exactly 0 -- never the body content size.
+    if row.get("model_visible_chars") != 0:
+        return False
+
+    if row.get("model_visible_estimated_tokens") != 0:
         return False
 
     binding = row.get("policy_binding_available")
@@ -1096,11 +1200,12 @@ def is_valid_memory_delivery_plan_artifact(
     if truncated is not (truncated_count > 0):
         return False
 
-    total = artifact.get("metrics", {}).get(
-        "unit_count"
-    ) if isinstance(
-        artifact.get("metrics"), dict
-    ) else None
+    metrics = artifact.get("metrics")
+
+    if not isinstance(metrics, dict):
+        return False
+
+    total = metrics.get("unit_count")
 
     if not _is_nonneg_int(total):
         return False
@@ -1108,21 +1213,70 @@ def is_valid_memory_delivery_plan_artifact(
     if total != len(rows) + truncated_count:
         return False
 
-    metrics = artifact.get("metrics")
-
-    if not isinstance(metrics, dict):
-        return False
-
     # These artifacts are research evidence: a hand-falsified counter is
-    # not trustworthy. Recompute the request metrics from the validated
-    # rows with the SAME builder helper and require agreement.
-    if metrics != _metrics(
+    # not trustworthy. Recompute the PERSISTED-scope metrics from the
+    # rows the validator can actually observe, with the SAME builder
+    # helper. Truncated rows are, by definition, not persisted, so this
+    # recomputation is an exact oracle only when nothing was dropped.
+    observed = _metrics(
         rows,
-        unit_count=total,
         persisted_count=len(rows),
         truncated_count=truncated_count,
+    )
+
+    if truncated_count == 0:
+        # No rows were dropped: the persisted scope IS the full scope,
+        # so the reported metrics must match the recomputation exactly.
+        return metrics == observed
+
+    # A truncated artifact cannot be fully re-derived (the dropped rows
+    # are gone), so the reported FULL-scope metrics are instead verified
+    # for internal coherence and bounded by what IS provable.
+    if set(metrics) != set(observed):
+        return False
+
+    for name in observed:
+        if not _is_nonneg_int(metrics.get(name)):
+            return False
+
+    if metrics["persisted_unit_count"] != len(rows):
+        return False
+
+    if metrics["truncated_unit_count"] != truncated_count:
+        return False
+
+    # Algebra: the full plan partitions by source and by channel, so
+    # every counter must share the SAME full-plan scope. This is the
+    # invariant that a mixed-scope counter (full unit_count with a
+    # persisted ob_unit_count) would break.
+    if total != (
+        metrics["frontend_unit_count"]
+        + metrics["ob_unit_count"]
     ):
         return False
+
+    if total != (
+        metrics["direct_data_count"]
+        + metrics["flash_cue_count"]
+        + metrics["drop_count"]
+        + metrics["unknown_count"]
+    ):
+        return False
+
+    # Each additive counter is the persisted count plus the contribution
+    # of at most ``truncated_count`` dropped rows; each sum metric can
+    # only grow.
+    for name, lower in observed.items():
+        value = metrics[name]
+
+        if value < lower:
+            return False
+
+        if (
+            name not in _SUM_METRIC_NAMES
+            and value > lower + truncated_count
+        ):
+            return False
 
     return True
 

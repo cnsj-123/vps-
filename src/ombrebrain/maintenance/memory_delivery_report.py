@@ -200,7 +200,9 @@ def build_report(
     current_model_visible_unit_count = 0
     current_model_visible_estimated_tokens = 0
 
-    rows_truncated_count = 0
+    truncated_unit_count = 0
+
+    truncated_artifact_count = 0
 
     for path in paths:
         artifact_count += 1
@@ -292,9 +294,12 @@ def build_report(
             )
         )
 
-        rows_truncated_count += _as_count(
+        truncated_unit_count += _as_count(
             artifact.get("rows_truncated_count")
         )
+
+        if artifact.get("rows_truncated") is True:
+            truncated_artifact_count += 1
 
     return {
         "version": VERSION,
@@ -340,8 +345,11 @@ def build_report(
         "current_model_visible_estimated_tokens": (
             current_model_visible_estimated_tokens
         ),
-        "rows_truncated_count": (
-            rows_truncated_count
+        "truncated_artifact_count": (
+            truncated_artifact_count
+        ),
+        "truncated_unit_count": (
+            truncated_unit_count
         ),
     }
 
@@ -398,7 +406,8 @@ def _render_text(
         "ob_drop_count",
         "ob_unknown_count",
         "policy_unavailable_ob_count",
-        "rows_truncated_count",
+        "truncated_artifact_count",
+        "truncated_unit_count",
     ):
         lines.append(
             "  %-42s %s"

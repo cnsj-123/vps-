@@ -84,10 +84,13 @@ SCOPE_CURRENT = "current"
 SCOPE_HISTORY = "history"
 SCOPE_RETRIEVAL = "retrieval"
 
-# Bounds on the in-memory unit pool. Real pools are tiny (a handful of
-# attachments plus a bounded Unified memory budget); this only prevents
-# an unbounded snapshot if a caller ever supplies one.
-MAX_EVIDENCE_UNITS = 512
+# There is deliberately NO silent truncation of the in-memory unit
+# pool. The snapshot is request-local and never persisted, OB Unified
+# memories are already tightly bounded upstream and the persisted
+# Delivery artifact carries its own explicit hard cap with honest
+# truncation telemetry. A silent slice here would let a downstream
+# consumer believe it observed the COMPLETE source set, so it is never
+# applied.
 
 
 @dataclass(frozen=True)
@@ -99,6 +102,16 @@ class MemorySourceEvidenceUnit:
     downstream shadow observer can reuse the real source object without
     reparsing; it is excluded from ``repr`` and is never persisted or
     logged. This is NOT a universal memory object.
+
+    ``content_chars`` / ``content_estimated_tokens`` measure the
+    extractable BODY content (comparable across sources).
+    ``model_visible_chars`` / ``model_visible_estimated_tokens`` measure
+    the text the provider request actually carries RIGHT NOW: for a
+    Frontend attachment that is the exact raw attachment envelope
+    (metadata + body), for an OB candidate it is 0 because OB content is
+    not model-visible. The two concepts are kept strictly separate and
+    are never collapsed. Only the numeric footprint leaves the
+    request-local snapshot; the raw envelope is never persisted.
     """
 
     source: str
@@ -110,6 +123,8 @@ class MemorySourceEvidenceUnit:
     normalized_digest: str
     content_chars: int
     content_estimated_tokens: int
+    model_visible_chars: int
+    model_visible_estimated_tokens: int
     currently_model_visible: bool
     retrieved: bool
     request_occurrence: int
@@ -187,6 +202,12 @@ def frontend_evidence_units(
     The inner body is never parsed: one attachment is one unit,
     regardless of the shape of its content (list-like text, JSON-like
     text, XML-like text, blank-line paragraphs or duplicate sentences).
+
+    The model-visible footprint is measured from the segment's exact
+    canonical ``raw_attachment`` envelope, never from the bare body. A
+    segment without a valid raw attachment has no proven model-visible
+    envelope, so it is refused rather than silently labelling its body
+    as the footprint. The live canonical path always supplies it.
     """
 
     units: list[MemorySourceEvidenceUnit] = []
@@ -201,6 +222,21 @@ def frontend_evidence_units(
             not isinstance(body, str)
             or not body.strip()
         ):
+            continue
+
+        raw_attachment = getattr(
+            segment,
+            "raw_attachment",
+            None,
+        )
+
+        if (
+            not isinstance(raw_attachment, str)
+            or not raw_attachment
+        ):
+            # No actual canonical envelope: there is no exact
+            # model-visible footprint to report, so this malformed
+            # unit is refused instead of being measured as its body.
             continue
 
         placement = getattr(
@@ -228,6 +264,15 @@ def frontend_evidence_units(
                 content_estimated_tokens=(
                     estimate_tokens(body)
                 ),
+                # The exact raw envelope (metadata + body) is what the
+                # provider request actually carries: this is the real
+                # model-visible footprint, larger than the body.
+                model_visible_chars=len(
+                    raw_attachment
+                ),
+                model_visible_estimated_tokens=(
+                    estimate_tokens(raw_attachment)
+                ),
                 # A Frontend attachment body is already in the
                 # model-visible request; it was attached by the
                 # frontend, not retrieved by the OB subsystem.
@@ -237,9 +282,6 @@ def frontend_evidence_units(
                 native_payload=segment,
             )
         )
-
-    if len(units) > MAX_EVIDENCE_UNITS:
-        return units[:MAX_EVIDENCE_UNITS]
 
     return units
 
@@ -276,7 +318,11 @@ def ob_evidence_units(
                     estimate_tokens(content)
                 ),
                 # OB candidate content is NOT in the live request; only
-                # a bounded cue / an explicit Recall may expose it.
+                # a bounded cue / an explicit Recall may expose it, so
+                # its model-visible footprint is exactly 0 and it is
+                # never currently model-visible.
+                model_visible_chars=0,
+                model_visible_estimated_tokens=0,
                 currently_model_visible=False,
                 retrieved=True,
                 request_occurrence=index,
@@ -286,9 +332,6 @@ def ob_evidence_units(
                 native_payload=item,
             )
         )
-
-    if len(units) > MAX_EVIDENCE_UNITS:
-        return units[:MAX_EVIDENCE_UNITS]
 
     return units
 
@@ -312,6 +355,13 @@ def ob_memories_from_snapshot(
     Anything else is ``ob_observation_available = false`` -- UNKNOWN is
     never quietly turned into "zero candidates". It never re-reads the
     shared conversation-level Unified file.
+
+    A valid EMPTY OB observation is the ONLY shape that yields
+    ``([], True)``: ``sections`` is a dict AND ``sections["memories"]``
+    is a list AND that list is empty. A malformed structure (missing /
+    ``None`` / non-dict ``sections``, missing / ``None`` / non-list
+    ``memories``) is UNAVAILABLE and yields ``([], False)`` -- zero
+    valid memories are never fabricated from malformed evidence.
     """
 
     unavailable = ([], False)
@@ -345,12 +395,12 @@ def ob_memories_from_snapshot(
     sections = unified.get("sections")
 
     if not isinstance(sections, dict):
-        return ([], True)
+        return unavailable
 
     memories = sections.get("memories")
 
     if not isinstance(memories, list):
-        return ([], True)
+        return unavailable
 
     return (memories, True)
 
