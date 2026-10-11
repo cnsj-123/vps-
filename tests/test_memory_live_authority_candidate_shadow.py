@@ -44,6 +44,7 @@ from ombrebrain.context.memory_live_authority_candidate_shadow import (
     STATUS_COMPATIBILITY_COVERED,
     STRATEGY,
     VERSION,
+    _final_body_control_walk,
     build_memory_live_authority_candidate_artifact,
     is_valid_memory_live_authority_candidate_artifact,
     log_memory_live_authority_candidate_report,
@@ -257,6 +258,71 @@ def _artifact_path(root, *, cid=CID, rid=RID):
         / cid
         / (rid + ".json")
     )
+
+
+def _observation(body, surface):
+    ok, observation = _final_body_control_walk(
+        body, surface.surface
+    )
+
+    assert ok, "control walk failed"
+
+    return observation
+
+
+def _build_artifact(units, body, *, policy=None):
+    """Build one valid artifact directly from the pure builder.
+
+    Exercises the REAL control walk so the privacy-safe per-row
+    footprint observation is the exact one the production path uses.
+    """
+
+    snap = _snap(units)
+
+    plan = _plan(snap, policy=policy)
+
+    migration = _migration(snap, plan, body=body)
+
+    surface = _surface(snap, plan, migration)
+
+    assert surface.ok
+
+    return build_memory_live_authority_candidate_artifact(
+        conversation_id=CID,
+        cognitive_request_id=RID,
+        source_unified_revision=REV,
+        delivery_plan=plan,
+        migration=migration,
+        control_observation=_observation(
+            body, surface
+        ),
+        final_body=body,
+    )
+
+
+def _frontend_only_artifact():
+    body = _frontend_body(_FRONTEND_SECRET)
+
+    return _build_artifact(
+        _frontend_units(body), body
+    )
+
+
+def _ob_unknown_artifact():
+    body = _frontend_body(_FRONTEND_SECRET)
+
+    units = (
+        _frontend_units(body)
+        + ob_evidence_units(
+            [_memory(_MEMID_SECRET, _OB_SECRET)]
+        )
+    )
+
+    return _build_artifact(units, body, policy=None)
+
+
+def _clone(artifact):
+    return json.loads(json.dumps(artifact))
 
 
 class CleanFrontendCandidateTests(unittest.TestCase):
@@ -828,27 +894,19 @@ class BuilderAndValidatorTests(unittest.TestCase):
             report["stored"], report.get("reason")
         )
 
-        # The pure builder path (no persistence) is validated directly.
-        built = (
-            build_memory_live_authority_candidate_artifact(
-                conversation_id=CID,
-                cognitive_request_id=RID,
-                source_unified_revision=REV,
-                delivery_plan=plan,
-                migration=migration,
-                control_observation={
-                    "verified_count": (
-                        report["metrics"][
-                            "frontend_exact_envelope_"
-                            "verified_count"
-                        ]
-                    )
-                },
-                final_body=body,
-            )
+        # The pure builder path (no persistence) is validated directly,
+        # using the REAL privacy-safe control observation.
+        return build_memory_live_authority_candidate_artifact(
+            conversation_id=CID,
+            cognitive_request_id=RID,
+            source_unified_revision=REV,
+            delivery_plan=plan,
+            migration=migration,
+            control_observation=_observation(
+                body, surface
+            ),
+            final_body=body,
         )
-
-        return built
 
     def test_pure_builder_matches_update(self):
         built = self._valid_artifact()
@@ -1019,9 +1077,9 @@ class BuilderAndValidatorTests(unittest.TestCase):
                 source_unified_revision=REV,
                 delivery_plan=plan,
                 migration=migration,
-                control_observation={
-                    "verified_count": 1
-                },
+                control_observation=_observation(
+                    body, surface
+                ),
                 final_body=body,
             )
         )
@@ -1112,6 +1170,441 @@ class PrivacyAndReportTests(unittest.TestCase):
                 row["content_digest"],
             ),
         )
+
+
+class ClosedSchemaForgeryTests(unittest.TestCase):
+    """The candidate artifact and every row use CLOSED key schemas."""
+
+    def test_frontend_control_action_forgery_is_rejected(self):
+        base = _frontend_only_artifact()
+
+        for label in ("drop", "flash_cue", "summarize"):
+            with self.subTest(label=label):
+                clone = _clone(base)
+                clone["frontend_control_action"] = label
+
+                self.assertFalse(
+                    is_valid_memory_live_authority_candidate_artifact(
+                        clone
+                    )
+                )
+
+        clone = _clone(base)
+        del clone["frontend_control_action"]
+
+        self.assertFalse(
+            is_valid_memory_live_authority_candidate_artifact(
+                clone
+            )
+        )
+
+    def test_unknown_top_level_field_is_rejected(self):
+        base = _frontend_only_artifact()
+
+        for field, value in (
+            ("raw_attachment", _FRONTEND_SECRET),
+            ("candidate_body", "PRIVATE BODY"),
+            ("memref", "memref_" + "0" * 32),
+            ("future_field", 1),
+        ):
+            with self.subTest(field=field):
+                clone = _clone(base)
+                clone[field] = value
+
+                self.assertFalse(
+                    is_valid_memory_live_authority_candidate_artifact(
+                        clone
+                    )
+                )
+
+    def test_unknown_row_field_is_rejected(self):
+        base = _frontend_only_artifact()
+
+        for field, value in (
+            ("cue", _CUE_SECRET),
+            ("memory_id", _MEMID_SECRET),
+            ("raw_attachment", _FRONTEND_SECRET),
+            ("candidate_fingerprint", "abc"),
+        ):
+            with self.subTest(field=field):
+                clone = _clone(base)
+                clone["rows"][0][field] = value
+
+                self.assertFalse(
+                    is_valid_memory_live_authority_candidate_artifact(
+                        clone
+                    )
+                )
+
+
+class ReplacementRequirementForgeryTests(
+    unittest.TestCase
+):
+
+    def test_frontend_requirement_none_is_rejected(self):
+        base = _frontend_only_artifact()
+
+        clone = _clone(base)
+        clone["rows"][0][
+            "replacement_requirement"
+        ] = "none"
+
+        self.assertFalse(
+            is_valid_memory_live_authority_candidate_artifact(
+                clone
+            )
+        )
+
+    def test_ob_unknown_requirement_none_is_rejected(self):
+        base = _ob_unknown_artifact()
+
+        clone = _clone(base)
+
+        row = next(
+            row
+            for row in clone["rows"]
+            if row["candidate_coverage"]
+            == CANDIDATE_COVERAGE_OB_UNKNOWN
+        )
+
+        row["replacement_requirement"] = "none"
+
+        self.assertFalse(
+            is_valid_memory_live_authority_candidate_artifact(
+                clone
+            )
+        )
+
+    def test_ob_cue_requirement_policy_resolution_is_rejected(
+        self,
+    ):
+        body = _frontend_body(_FRONTEND_SECRET)
+
+        eligible = _memory("m1", _OB_SECRET)
+
+        units = (
+            _frontend_units(body)
+            + ob_evidence_units([eligible])
+        )
+
+        base = _build_artifact(
+            units,
+            body,
+            policy=_policy(eligible=[eligible]),
+        )
+
+        clone = _clone(base)
+
+        row = next(
+            row
+            for row in clone["rows"]
+            if row["candidate_coverage"]
+            == CANDIDATE_COVERAGE_OB_CUE
+        )
+
+        row["replacement_requirement"] = (
+            "policy_resolution_required"
+        )
+
+        self.assertFalse(
+            is_valid_memory_live_authority_candidate_artifact(
+                clone
+            )
+        )
+
+
+def _rebalance_frontend_duplicate(clone):
+    """Rebalance every full-scope alias after duplicating one
+    Frontend row, so a rejection can ONLY come from duplicate
+    occurrence / evidence provenance.
+    """
+
+    metrics = clone["metrics"]
+
+    frontend_records = [
+        row
+        for row in clone["rows"]
+        if row["source"] == "frontend"
+    ]
+
+    frontend_count = len(frontend_records)
+
+    metrics["unit_count"] = len(clone["rows"])
+    metrics[
+        "frontend_controlled_direct_candidate_count"
+    ] = frontend_count
+    metrics["candidate_covered_unit_count"] = (
+        frontend_count
+    )
+    metrics["candidate_gap_unit_count"] = 0
+    metrics["remaining_gap_unit_count"] = 0
+    metrics["ob_policy_unknown_count"] = 0
+    metrics["ob_existing_cue_contract_count"] = 0
+    metrics[
+        "ob_existing_withhold_contract_count"
+    ] = 0
+    metrics["adopted_frontend_gap_count"] = (
+        frontend_count
+    )
+    metrics["frontend_exact_envelope_verified_count"] = (
+        frontend_count
+    )
+    metrics["source_migration_gap_unit_count"] = (
+        frontend_count
+    )
+    metrics[
+        "frontend_controlled_direct_model_visible_chars"
+    ] = sum(
+        row["model_visible_chars"]
+        for row in frontend_records
+    )
+    metrics[
+        "frontend_controlled_direct_model_visible"
+        "_estimated_tokens"
+    ] = sum(
+        row["model_visible_estimated_tokens"]
+        for row in frontend_records
+    )
+
+
+class OccurrenceUniquenessTests(unittest.TestCase):
+
+    def test_duplicated_row_with_balanced_algebra_is_rejected(
+        self,
+    ):
+        # A base artifact is ready and balances everywhere.
+        base = _frontend_only_artifact()
+
+        self.assertTrue(
+            is_valid_memory_live_authority_candidate_artifact(
+                base
+            )
+        )
+
+        clone = _clone(base)
+
+        duplicate = _clone(clone["rows"][0])
+
+        clone["rows"].append(duplicate)
+
+        _rebalance_frontend_duplicate(clone)
+
+        # The rejection comes from duplicate occurrence / evidence
+        # provenance, NOT from unbalanced arithmetic.
+        self.assertFalse(
+            is_valid_memory_live_authority_candidate_artifact(
+                clone
+            )
+        )
+
+    def test_duplicate_evidence_ref_changed_fields_is_rejected(
+        self,
+    ):
+        base = _frontend_only_artifact()
+
+        clone = _clone(base)
+
+        duplicate = _clone(clone["rows"][0])
+
+        # Same evidence_ref / occurrence, different footprint: the ref
+        # still recomputes, so only uniqueness can reject it.
+        duplicate["model_visible_chars"] += 1
+        duplicate[
+            "model_visible_estimated_tokens"
+        ] += 1
+
+        clone["rows"].append(duplicate)
+
+        _rebalance_frontend_duplicate(clone)
+
+        self.assertFalse(
+            is_valid_memory_live_authority_candidate_artifact(
+                clone
+            )
+        )
+
+
+class FootprintForgeryTests(unittest.TestCase):
+
+    def test_aggregate_token_metric_only_is_rejected(self):
+        base = _frontend_only_artifact()
+
+        clone = _clone(base)
+
+        clone["metrics"][
+            "frontend_controlled_direct_model_visible"
+            "_estimated_tokens"
+        ] += 1
+
+        self.assertFalse(
+            is_valid_memory_live_authority_candidate_artifact(
+                clone
+            )
+        )
+
+    def test_aggregate_char_metric_only_is_rejected(self):
+        base = _frontend_only_artifact()
+
+        clone = _clone(base)
+
+        clone["metrics"][
+            "frontend_controlled_direct_model_visible_chars"
+        ] += 1
+
+        self.assertFalse(
+            is_valid_memory_live_authority_candidate_artifact(
+                clone
+            )
+        )
+
+    def test_row_token_without_aggregate_is_rejected(self):
+        base = _frontend_only_artifact()
+
+        clone = _clone(base)
+
+        clone["rows"][0][
+            "model_visible_estimated_tokens"
+        ] += 1
+
+        self.assertFalse(
+            is_valid_memory_live_authority_candidate_artifact(
+                clone
+            )
+        )
+
+    def test_ob_row_nonzero_footprint_is_rejected(self):
+        base = _ob_unknown_artifact()
+
+        clone = _clone(base)
+
+        row = next(
+            row
+            for row in clone["rows"]
+            if row["candidate_coverage"]
+            == CANDIDATE_COVERAGE_OB_UNKNOWN
+        )
+
+        row["model_visible_chars"] = 5
+        row["model_visible_estimated_tokens"] = 5
+
+        self.assertFalse(
+            is_valid_memory_live_authority_candidate_artifact(
+                clone
+            )
+        )
+
+
+class ReadHelperTests(unittest.TestCase):
+
+    def test_malformed_file_returns_none(self):
+        body = _frontend_body(_FRONTEND_SECRET)
+
+        snap, plan, migration = _stack(body)
+
+        surface = _surface(snap, plan, migration)
+
+        with tempfile.TemporaryDirectory() as root:
+            _run(
+                root,
+                plan=plan,
+                migration=migration,
+                surface=surface,
+                final_body=body,
+            )
+
+            _artifact_path(root).write_text(
+                "{not json", encoding="utf-8"
+            )
+
+            self.assertIsNone(_read(root))
+
+    def test_valid_artifact_is_returned(self):
+        body = _frontend_body(_FRONTEND_SECRET)
+
+        snap, plan, migration = _stack(body)
+
+        surface = _surface(snap, plan, migration)
+
+        with tempfile.TemporaryDirectory() as root:
+            _run(
+                root,
+                plan=plan,
+                migration=migration,
+                surface=surface,
+                final_body=body,
+            )
+
+            artifact = _read(root)
+
+        self.assertIsNotNone(artifact)
+        self.assertEqual(
+            artifact["cognitive_request_id"], RID
+        )
+
+    def test_wrong_request_path_returns_none(self):
+        body = _frontend_body(_FRONTEND_SECRET)
+
+        snap, plan, migration = _stack(body)
+
+        surface = _surface(snap, plan, migration)
+
+        with tempfile.TemporaryDirectory() as root:
+            _run(
+                root,
+                plan=plan,
+                migration=migration,
+                surface=surface,
+                final_body=body,
+            )
+
+            # Copy the valid artifact under a DIFFERENT request path.
+            target = _artifact_path(root, rid=RID_OTHER)
+
+            target.write_text(
+                _artifact_path(root).read_text(
+                    encoding="utf-8"
+                ),
+                encoding="utf-8",
+            )
+
+            self.assertIsNone(
+                _read(root, rid=RID_OTHER)
+            )
+
+    def test_wrong_conversation_path_returns_none(self):
+        body = _frontend_body(_FRONTEND_SECRET)
+
+        snap, plan, migration = _stack(body)
+
+        surface = _surface(snap, plan, migration)
+
+        other_cid = "ctx_0123456789abcdee"
+
+        with tempfile.TemporaryDirectory() as root:
+            _run(
+                root,
+                plan=plan,
+                migration=migration,
+                surface=surface,
+                final_body=body,
+            )
+
+            # Copy the valid artifact under a DIFFERENT conversation
+            # directory.
+            target = _artifact_path(root, cid=other_cid)
+
+            target.parent.mkdir(parents=True, exist_ok=True)
+
+            target.write_text(
+                _artifact_path(root).read_text(
+                    encoding="utf-8"
+                ),
+                encoding="utf-8",
+            )
+
+            self.assertIsNone(
+                _read(root, cid=other_cid)
+            )
 
 
 if __name__ == "__main__":

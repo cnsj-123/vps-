@@ -8,6 +8,7 @@ from collections import Counter
 from typing import Any
 
 from ombrebrain.context.frontend_controlled_direct_surface import (
+    ACTION_PRESERVE_DIRECT_DATA,
     FrontendSurfaceResult,
     migration_bound_to_request,
     surface_bound_to_request,
@@ -17,6 +18,9 @@ from ombrebrain.context.memory_authority_migration_shadow import (
     COVERAGE_OB_CUE,
     COVERAGE_OB_UNKNOWN,
     COVERAGE_OB_WITHHOLD,
+    REQ_FRONTEND_CHANNEL,
+    REQ_NONE,
+    REQ_POLICY_RESOLUTION,
     delivery_plan_bound_to_request,
     is_valid_memory_authority_migration_artifact,
 )
@@ -136,6 +140,13 @@ _MIGRATION_VERSION = (
 # ALREADY persisted Migration rows, so hidden rows are never invented.
 MAX_CANDIDATE_ROWS = 64
 
+# The ONE closed v0 Frontend control action. The writer and the
+# authoritative validator MUST use this SAME constant, so a persisted
+# ``frontend_control_action`` can never be silently rewritten to a
+# ``drop`` / ``flash`` / any other label while the rest of the artifact
+# stays structurally valid.
+FRONTEND_CONTROL_ACTION = ACTION_PRESERVE_DIRECT_DATA
+
 # The CLOSED candidate interpretation enum. A Migration coverage maps
 # deterministically onto exactly ONE candidate coverage + handling.
 CANDIDATE_COVERAGE_FRONTEND = (
@@ -208,22 +219,19 @@ _FULL_RECALL_REQUIRED = "recall_required"
 _FULL_NONE = "none"
 _FULL_UNKNOWN = "unknown"
 
-_KNOWN_FULL_MODES = (
-    _FULL_ALREADY_PRESENT,
-    _FULL_RECALL_REQUIRED,
-    _FULL_NONE,
-    _FULL_UNKNOWN,
-)
-
 # The ONE deterministic candidate-row contract:
 #   (source, current_delivery_mode)
-#     -> (migration_coverage, candidate_handling, candidate_coverage,
-#         kind, full_content_access_mode, currently_model_visible)
-# It mirrors the source Migration row contract exactly, so a copied row
-# is never weakened into a shape Migration could not itself produce.
+#     -> (migration_coverage, replacement_requirement, candidate_handling,
+#         candidate_coverage, kind, full_content_access_mode,
+#         currently_model_visible)
+# It mirrors the source Migration row contract exactly -- including the
+# CLOSED replacement requirement -- so a copied row is never weakened
+# into a shape Migration could not itself produce. The replacement
+# requirements are REUSED from the Migration module, never duplicated.
 _ROW_CONTRACT = {
     (SOURCE_FRONTEND, _MODE_DIRECT_DATA): (
         COVERAGE_FRONTEND_GAP,
+        REQ_FRONTEND_CHANNEL,
         CANDIDATE_HANDLING_FRONTEND,
         CANDIDATE_COVERAGE_FRONTEND,
         KIND_FRONTEND_ATTACHMENT,
@@ -232,6 +240,7 @@ _ROW_CONTRACT = {
     ),
     (SOURCE_OB, _MODE_FLASH_CUE): (
         COVERAGE_OB_CUE,
+        REQ_NONE,
         CANDIDATE_HANDLING_OB_CUE,
         CANDIDATE_COVERAGE_OB_CUE,
         KIND_OB_CANDIDATE,
@@ -240,6 +249,7 @@ _ROW_CONTRACT = {
     ),
     (SOURCE_OB, _MODE_DROP): (
         COVERAGE_OB_WITHHOLD,
+        REQ_NONE,
         CANDIDATE_HANDLING_OB_WITHHOLD,
         CANDIDATE_COVERAGE_OB_WITHHOLD,
         KIND_OB_CANDIDATE,
@@ -248,6 +258,7 @@ _ROW_CONTRACT = {
     ),
     (SOURCE_OB, _MODE_UNKNOWN): (
         COVERAGE_OB_UNKNOWN,
+        REQ_POLICY_RESOLUTION,
         CANDIDATE_HANDLING_OB_UNKNOWN,
         CANDIDATE_COVERAGE_OB_UNKNOWN,
         KIND_OB_CANDIDATE,
@@ -255,6 +266,64 @@ _ROW_CONTRACT = {
         False,
     ),
 }
+
+# The EXACT top-level key set of a v1 Candidate artifact. The writer
+# emits exactly these keys; the validator requires exact equality, so a
+# forged artifact can never smuggle ``raw_attachment`` / ``candidate_body``
+# / ``memref`` / any arbitrary extension field past validation. Future
+# schema changes require a NEW artifact version.
+EXPECTED_TOP_LEVEL_KEYS = frozenset({
+    "version",
+    "mode",
+    "authority",
+    "strategy",
+    "live_authority",
+    "candidate_applied",
+    "live_cutover_ready",
+    "live_cutover_reason",
+    "conversation_id",
+    "cognitive_request_id",
+    "source_unified_revision",
+    "source_delivery_plan_version",
+    "source_migration_version",
+    "ob_control_strategy",
+    "created_at",
+    "frontend_control_action",
+    "compatibility_candidate_ready",
+    "candidate_coverage_status",
+    "candidate_body_byte_identical",
+    "final_body_sha256",
+    "candidate_body_sha256",
+    "final_body_bytes",
+    "candidate_body_bytes",
+    "source_rows_truncated",
+    "source_rows_truncated_count",
+    "rows",
+    "metrics",
+})
+
+# The EXACT row key set. A row may never carry hidden ``raw_attachment``
+# / ``body`` / ``cue`` / ``memref`` / ``memory_id`` /
+# ``candidate_fingerprint`` / arbitrary extension fields. Only the
+# privacy-safe numeric model-visible footprint is added beyond the
+# mirrored evidence fields.
+EXPECTED_ROW_KEYS = frozenset({
+    "evidence_ref",
+    "source",
+    "kind",
+    "source_scope",
+    "source_occurrence",
+    "content_digest",
+    "current_delivery_mode",
+    "current_full_content_access_mode",
+    "currently_model_visible",
+    "authority_coverage",
+    "replacement_requirement",
+    "candidate_coverage",
+    "candidate_handling",
+    "model_visible_chars",
+    "model_visible_estimated_tokens",
+})
 
 _FRONTEND_SCOPES = (SCOPE_CURRENT, SCOPE_HISTORY)
 
@@ -466,19 +535,39 @@ def _final_body_control_walk(
     if result.payload != payload:
         return False, {}
 
+    # The privacy-safe per-row footprint observation: only the numeric
+    # model-visible footprint plus the occurrence evidence ref. No raw
+    # envelope ever leaves this in-memory control walk.
+    frontend_rows = [
+        {
+            "evidence_ref": unit.evidence_ref,
+            "model_visible_chars": (
+                unit.model_visible_chars
+            ),
+            "model_visible_estimated_tokens": (
+                unit.model_visible_estimated_tokens
+            ),
+        }
+        for unit in bound
+    ]
+
     return True, {
         "frontend_occurrence_count": (
             occurrence_count
         ),
         "verified_count": occurrence_count,
+        "frontend_rows": frontend_rows,
     }
 
 
 def _candidate_row(
     row: dict[str, Any],
+    footprints: dict[str, tuple[int, int]],
 ) -> dict[str, Any]:
+    source = row.get("source")
+
     key = (
-        row.get("source"),
+        source,
         row.get("current_delivery_mode"),
     )
 
@@ -491,13 +580,35 @@ def _candidate_row(
 
     (
         _coverage,
+        _requirement,
         handling,
         candidate_coverage,
-    ) = contract[0], contract[1], contract[2]
+    ) = contract[0], contract[1], contract[2], contract[3]
+
+    # The privacy-safe numeric model-visible footprint. Frontend rows
+    # copy the EXACT bound surface footprint (bound by evidence_ref);
+    # OB rows are always exactly zero. No raw attachment / body / cue /
+    # memref is ever persisted.
+    if source == SOURCE_FRONTEND:
+        footprint = footprints.get(
+            row.get("evidence_ref")
+        )
+
+        if footprint is None:
+            raise ValueError(
+                "missing frontend footprint"
+            )
+
+        model_visible_chars, model_visible_tokens = (
+            footprint
+        )
+    else:
+        model_visible_chars = 0
+        model_visible_tokens = 0
 
     return {
         "evidence_ref": row.get("evidence_ref"),
-        "source": row.get("source"),
+        "source": source,
         "kind": row.get("kind"),
         "source_scope": row.get("source_scope"),
         "source_occurrence": row.get(
@@ -521,6 +632,10 @@ def _candidate_row(
         ),
         "candidate_coverage": candidate_coverage,
         "candidate_handling": handling,
+        "model_visible_chars": model_visible_chars,
+        "model_visible_estimated_tokens": (
+            model_visible_tokens
+        ),
     }
 
 
@@ -605,8 +720,20 @@ def build_memory_live_authority_candidate_artifact(
     No logging; deterministic except for ``created_at``.
     """
 
+    footprints = {
+        observation_row["evidence_ref"]: (
+            observation_row["model_visible_chars"],
+            observation_row[
+                "model_visible_estimated_tokens"
+            ],
+        )
+        for observation_row in control_observation[
+            "frontend_rows"
+        ]
+    }
+
     rows = [
-        _candidate_row(row)
+        _candidate_row(row, footprints)
         for row in migration["rows"]
     ]
 
@@ -652,7 +779,7 @@ def build_memory_live_authority_candidate_artifact(
         "ob_control_strategy": OB_CONTROL_STRATEGY,
         "created_at": now_iso(),
         "frontend_control_action": (
-            "preserve_direct_data"
+            FRONTEND_CONTROL_ACTION
         ),
         "compatibility_candidate_ready": ready,
         "candidate_coverage_status": (
@@ -679,9 +806,19 @@ def build_memory_live_authority_candidate_artifact(
 
 
 def _valid_candidate_row(row: Any) -> bool:
-    """One structurally + semantically valid candidate row."""
+    """One structurally + semantically valid candidate row.
+
+    The row key set is CLOSED: any unknown / hidden field (a raw
+    attachment, a cue, a memory id, an arbitrary extension) invalidates
+    the row and therefore the whole artifact. Only the privacy-safe
+    numeric model-visible footprint is allowed beyond the mirrored
+    evidence fields.
+    """
 
     if not isinstance(row, dict):
+        return False
+
+    if set(row.keys()) != EXPECTED_ROW_KEYS:
         return False
 
     source = row.get("source")
@@ -701,6 +838,7 @@ def _valid_candidate_row(row: Any) -> bool:
 
     (
         coverage,
+        requirement,
         handling,
         candidate_coverage,
         kind,
@@ -709,6 +847,9 @@ def _valid_candidate_row(row: Any) -> bool:
     ) = contract
 
     if row.get("authority_coverage") != coverage:
+        return False
+
+    if row.get("replacement_requirement") != requirement:
         return False
 
     if row.get("candidate_handling") != handling:
@@ -740,11 +881,6 @@ def _valid_candidate_row(row: Any) -> bool:
     elif row.get("source_scope") != SCOPE_RETRIEVAL:
         return False
 
-    if row.get("current_full_content_access_mode") not in (
-        _KNOWN_FULL_MODES
-    ):
-        return False
-
     occurrence = row.get("source_occurrence")
 
     if not _is_nonneg_int(occurrence):
@@ -767,6 +903,24 @@ def _valid_candidate_row(row: Any) -> bool:
         )
     ):
         return False
+
+    # Privacy-safe numeric footprint. A Frontend row carries the exact
+    # bound surface footprint; every OB row MUST be exactly zero.
+    chars = row.get("model_visible_chars")
+
+    if not _is_nonneg_int(chars):
+        return False
+
+    tokens = row.get(
+        "model_visible_estimated_tokens"
+    )
+
+    if not _is_nonneg_int(tokens):
+        return False
+
+    if source != SOURCE_FRONTEND:
+        if chars != 0 or tokens != 0:
+            return False
 
     return True
 
@@ -802,16 +956,24 @@ def is_valid_memory_live_authority_candidate_artifact(
 
     A complete, coherent
     ``memory-live-authority-candidate-shadow.v1`` artifact is valid;
-    anything else -- wrong version / mode / authority / strategy, a
-    ``live_authority`` / ``candidate_applied`` / ``live_cutover_ready``
-    that is not strictly False, a broken byte-identity proof, a forged
-    Frontend control label, a broken full-scope algebra, an incomplete
-    Frontend row set, or a ``compatibility_candidate_ready`` claim that
-    contradicts the remaining OB gaps -- is INVALID as a whole. Future /
-    newer versions are unsupported and therefore invalid.
+    anything else -- wrong version / mode / authority / strategy, an
+    unexpected or missing top-level field, a ``live_authority`` /
+    ``candidate_applied`` / ``live_cutover_ready`` that is not strictly
+    False, a forged ``frontend_control_action``, a broken byte-identity
+    proof, a broken full-scope algebra, an incomplete Frontend row set,
+    a duplicated occurrence / evidence ref, a forged row footprint, or a
+    ``compatibility_candidate_ready`` claim that contradicts the
+    remaining OB gaps -- is INVALID as a whole. Future / newer versions
+    are unsupported and therefore invalid.
     """
 
     if not isinstance(artifact, dict):
+        return False
+
+    # CLOSED top-level schema: exactly the writer's key set. A forged
+    # extra field (``raw_attachment`` / ``candidate_body`` / ``memref``
+    # / any extension) invalidates the whole artifact.
+    if set(artifact.keys()) != EXPECTED_TOP_LEVEL_KEYS:
         return False
 
     if artifact.get("version") != VERSION:
@@ -824,6 +986,12 @@ def is_valid_memory_live_authority_candidate_artifact(
         return False
 
     if artifact.get("strategy") != STRATEGY:
+        return False
+
+    if (
+        artifact.get("frontend_control_action")
+        != FRONTEND_CONTROL_ACTION
+    ):
         return False
 
     if artifact.get("live_authority") is not False:
@@ -937,6 +1105,31 @@ def is_valid_memory_live_authority_candidate_artifact(
     for row in rows:
         if not _valid_candidate_row(row):
             return False
+
+    # Occurrence / evidence provenance uniqueness. A duplicated row can
+    # never inflate an aggregate or fabricate an extra controlled
+    # occurrence: every evidence_ref is globally unique AND every
+    # (source, kind, source_scope, source_occurrence) occurrence is
+    # globally unique.
+    evidence_refs = [
+        row["evidence_ref"] for row in rows
+    ]
+
+    if len(evidence_refs) != len(set(evidence_refs)):
+        return False
+
+    occurrences = [
+        (
+            row["source"],
+            row["kind"],
+            row["source_scope"],
+            row["source_occurrence"],
+        )
+        for row in rows
+    ]
+
+    if len(occurrences) != len(set(occurrences)):
+        return False
 
     truncated = artifact.get("source_rows_truncated")
 
@@ -1059,6 +1252,33 @@ def is_valid_memory_live_authority_candidate_artifact(
     if frontend_rows != metrics[
         "frontend_controlled_direct_candidate_count"
     ]:
+        return False
+
+    # EXACT footprint binding. Because EVERY Frontend candidate row is
+    # persisted, the aggregate Frontend footprint metric MUST equal the
+    # exact sum of the Frontend row footprints -- a forged aggregate
+    # (or a single forged row footprint) can never balance the algebra.
+    frontend_model_visible_chars = sum(
+        row["model_visible_chars"]
+        for row in rows
+        if row["source"] == SOURCE_FRONTEND
+    )
+
+    if metrics[
+        "frontend_controlled_direct_model_visible_chars"
+    ] != frontend_model_visible_chars:
+        return False
+
+    frontend_model_visible_tokens = sum(
+        row["model_visible_estimated_tokens"]
+        for row in rows
+        if row["source"] == SOURCE_FRONTEND
+    )
+
+    if metrics[
+        "frontend_controlled_direct_model_visible"
+        "_estimated_tokens"
+    ] != frontend_model_visible_tokens:
         return False
 
     # compatibility_candidate_ready is true iff there are NO remaining
@@ -1470,7 +1690,13 @@ def read_memory_live_authority_candidate(
     conversation_id: Any,
     cognitive_request_id: Any,
 ) -> dict[str, Any] | None:
-    """Read one request-scoped Candidate artifact, or None. Read only."""
+    """Read one request-scoped Candidate artifact, or None. Read only.
+
+    A request-scoped read helper must never hand downstream code a
+    malformed / foreign / tampered artifact, so it returns an artifact
+    ONLY when the authoritative validator accepts it AND it is bound to
+    the REQUESTED conversation / request id. Anything else is None.
+    """
 
     if not (
         is_valid_conversation_id(conversation_id)
@@ -1480,9 +1706,28 @@ def read_memory_live_authority_candidate(
     ):
         return None
 
-    return read_json(
+    artifact = read_json(
         _path(
             conversation_id,
             cognitive_request_id,
         )
     )
+
+    if not is_valid_memory_live_authority_candidate_artifact(
+        artifact
+    ):
+        return None
+
+    if (
+        artifact.get("conversation_id")
+        != conversation_id
+    ):
+        return None
+
+    if (
+        artifact.get("cognitive_request_id")
+        != cognitive_request_id
+    ):
+        return None
+
+    return artifact
