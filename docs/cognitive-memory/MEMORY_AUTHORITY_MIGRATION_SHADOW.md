@@ -125,7 +125,15 @@ that would disappear if the direct mouth were removed with no replacement. It do
 
 The observer must not trust the Delivery Plan's **contract** when it can measure
 **actuality** on the final body. `observe_frontend_final_presence(final_body,
-source_evidence_snapshot)` returns `(available, verified)`:
+source_evidence_snapshot)` returns `(available, verified)`.
+
+The final Frontend body is canonicalized **exactly once** by Migration: the
+orchestration boundary performs the single observation, and the pure builder
+(`build_memory_authority_migration_artifact`) receives it as a precomputed value
+and never re-canonicalizes, never calls the Operit adapter and never rereads any
+request-global state. The Source Evidence observation of the **original
+forwarded body** is a **different** pass with its own single canonicalization;
+the two passes inspect different body stages and are not collapsed into one.
 
 - **`available`** is `false` whenever the final body cannot be canonicalized (via
   the existing canonicalizer / `OperitAdapter`) or a Frontend segment is malformed.
@@ -158,6 +166,12 @@ actual_ob_live_exposure_estimated_tokens
 actual_ob_live_exposure_byte_delta
 ```
 
+The receipt is read **at most once** per request: `observe_actual_ob_live_exposure`
+is computed exactly once at the orchestration boundary. When the body did **not**
+change (`pre_live_body == final_body`) no receipt is read at all; when the body
+**did** change the single read is required and must re-validate against the exact
+pre-live / final bytes.
+
 If a body changed but the receipt is missing or fails re-validation, the writer
 **refuses** the artifact rather than guess (`live exposure receipt mismatch`). A
 memory must never reach the model without the system being able to account for it.
@@ -178,6 +192,18 @@ artifact:
 
 At the request level the closed status enum is `blocked` / `covered`:
 `blocked` iff `contract_gap_unit_count > 0`, else `covered`.
+
+Migration rows mirror only the **already-persisted** Delivery rows, so the full
+scope is pinned exactly to the source Delivery truncation telemetry:
+
+```
+metrics.unit_count == len(rows) + source_rows_truncated_count
+```
+
+with `source_rows_truncated == false` requiring
+`source_rows_truncated_count == 0` and `metrics.unit_count == len(rows)`, so
+internally legal aggregate algebra can never invent arbitrary hidden rows beyond
+the source Delivery truncation counters.
 
 ## 7. Frontend direct bypass gap
 
@@ -230,6 +256,16 @@ row was exposed. v0 therefore never invents a per-row live-exposure mapping:
 - the **request-level actual exposure** stays a separate `current_exposure` fact
   and is never projected onto individual rows.
 
+`current_exposure` and `metrics` persist the **same** real exposure facts, so the
+authoritative validator requires the two views to agree **exactly** (Frontend
+direct count / chars / tokens, live exposed count / tokens, and
+`actual_model_visible_memory_estimated_tokens == frontend direct tokens + live
+exposure tokens`). The mouth booleans are derived from those same facts
+(`frontend_direct_mouth_active == frontend_direct_unit_count > 0`,
+`ob_live_cue_mouth_active == actual_ob_live_exposure_applied`,
+`dual_mouth_active == both`). A duplicated factual representation that disagrees
+invalidates the whole artifact — there is no "one of them is authoritative" rule.
+
 ## 12. Direct-mouth removal impact semantics
 
 The impact of removing the Frontend direct mouth is expressed as the **current
@@ -281,6 +317,52 @@ built from A's own snapshot / plan even if B writes its Delivery Plan to disk in
 between. Request-local evidence is the runtime authority; conversation-scoped
 files remain observability.
 
+### 15.1 Evidence readiness gate (AVAILABLE + zero units ≠ UNAVAILABLE)
+
+The Source Evidence and Delivery contracts explicitly distinguish:
+
+```
+AVAILABLE + zero units   ->  valid EMPTY evidence
+UNAVAILABLE              ->  NOT observable
+```
+
+Migration readiness preserves that distinction. For a STORED artifact, the
+request-local Source Evidence Snapshot **and** the request-local Delivery Plan
+must each independently report BOTH source planes available
+(`frontend_observation_available is True` **and** `ob_observation_available is
+True`), and the two availability views must **agree**. If either plane is
+unavailable, or the availability bits disagree:
+
+```
+stored = false
+decision = no_record
+reason = source_observation_unavailable
+```
+
+`UNAVAILABLE` never silently becomes `contract_gap_unit_count = 0` /
+`contract_coverage_status = covered`. An available source with zero units stays
+valid empty evidence. No new "unavailable migration gap" row enum is invented:
+if a whole source plane cannot be observed truthfully, v0 persists **no readiness
+conclusion**.
+
+Request identity is not semantic identity, so the Delivery Plan must also
+describe exactly the same source occurrence pool (per-source split and full
+total) as the Source Evidence Snapshot:
+
+```
+plan.metrics.frontend_unit_count == #SOURCE_FRONTEND units in snapshot
+plan.metrics.ob_unit_count       == #SOURCE_OB units in snapshot
+plan.metrics.unit_count          == len(snapshot.units)
+```
+
+On any disagreement:
+
+```
+stored = false
+decision = no_record
+reason = source_delivery_evidence_mismatch
+```
+
 ## 16. Privacy
 
 The persisted artifact and every log line carry only:
@@ -293,6 +375,16 @@ The persisted artifact and every log line carry only:
 No memory text, cue, attachment body, memory id, memref or candidate fingerprint
 is ever emitted or persisted. `current_exposure` stores only body **sha256** and
 byte lengths, never body content.
+
+Persisted Migration rows also carry a privacy-safe `content_digest` (`sha256`
+only) **for one reason only**: the authoritative validator can recompute the row's
+occurrence `evidence_ref` from the row's own fields with the **existing** shared
+Delivery helper (`evidence_ref_for_fields`), so a random valid-looking 64-hex
+value can never become trusted occurrence provenance. It is **not** a semantic
+identity claim and it is **not** raw content. The row's derived coverage /
+replacement labels are also closed against the upstream Delivery row contract, so
+a copied row can never be weakened into a shape the Delivery Plan could not itself
+have produced.
 
 ## 17. Reporter
 
