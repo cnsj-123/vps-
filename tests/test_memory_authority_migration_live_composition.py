@@ -20,6 +20,9 @@ from ombrebrain.context.memory_flash_live_exposure import (
     is_valid_live_exposure_artifact,
     read_live_memory_exposure,
 )
+from ombrebrain.context.memory_flash import (
+    candidate_memory_id,
+)
 from ombrebrain.context.memory_recall_surface import (
     resolve_recall_ref,
 )
@@ -516,18 +519,28 @@ class RealFlashSurfaceLiveExposureMigrationTests(
         )
 
         # POSITIVE PROOF #1: the retained source fixture really carries
-        # the sentinel as its raw OB memory id.
+        # the sentinel as its raw OB memory id, and that exact string is
+        # contract-valid under the canonical memory-id extraction (no
+        # validator is weakened to accept it).
         self.assertEqual(
             memory_fixture["id"], _SENTINEL_MEMID
         )
-
-        # POSITIVE PROOF #2: the REAL candidate that the coordinator
-        # retrieved is the SAME object, so the sentinel genuinely
-        # entered the request-local source path.
-        bound = (
-            unified_module._CONTEXT_SERVICE
-            .get_candidates.return_value
+        self.assertEqual(
+            candidate_memory_id(memory_fixture),
+            _SENTINEL_MEMID,
         )
+
+        # POSITIVE PROOF #2: the coordinator REALLY performed the
+        # request-local source read AND that read handed back the SAME
+        # retained fixture object, so the sentinel genuinely entered the
+        # real candidate path before any downstream privacy boundary.
+        service = unified_module._CONTEXT_SERVICE
+
+        self.assertGreaterEqual(
+            service.get_candidates.await_count, 1
+        )
+
+        bound = service.get_candidates.return_value
 
         self.assertIs(
             bound["memories"][0], memory_fixture
