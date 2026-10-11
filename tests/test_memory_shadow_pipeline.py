@@ -70,6 +70,9 @@ _DELIVERY_ENV = (
 _ARBITRATION_ENV = (
     "OMBRE_GATEWAY_CONTEXT_MEMORY_SOURCE_ARBITRATION_SHADOW"
 )
+_MIGRATION_ENV = (
+    "OMBRE_GATEWAY_CONTEXT_MEMORY_AUTHORITY_MIGRATION_SHADOW"
+)
 
 _UPSTREAM_FLAGS = (
     "OMBRE_GATEWAY_CONTEXT_SHADOW",
@@ -89,6 +92,7 @@ _UPSTREAM_FLAGS = (
     _LEDGER_ENV,
     _DELIVERY_ENV,
     _ARBITRATION_ENV,
+    _MIGRATION_ENV,
 )
 
 _ISOLATED_ENV = {
@@ -1917,6 +1921,600 @@ class RealPipelineDeliveryInterleavingTests(
         # The forwarded body was never mutated by the shadow.
         self.assertEqual(results["A"], _body())
         self.assertEqual(results["B"], _body())
+
+
+class MigrationFlagMatrixTests(
+    RealPipelineTestCase,
+):
+    """Migration-only / delivery / arbitration matrix on the real chain."""
+
+    def _migration_files(self, cid):
+        directory = self.path(
+            "memory_authority_migration",
+            cid,
+        )
+
+        if not directory.is_dir():
+            return []
+
+        return list(directory.iterdir())
+
+    def _plan_files(self, cid):
+        directory = self.path(
+            "memory_delivery_plan",
+            cid,
+        )
+
+        if not directory.is_dir():
+            return []
+
+        return list(directory.iterdir())
+
+    async def test_migration_only_flag_drives_chain(self):
+        self.bind(
+            [
+                _memory("m1", "first memory"),
+                _memory("m2", "second memory"),
+            ]
+        )
+
+        environ = {
+            **_ISOLATED_ENV,
+            _MIGRATION_ENV: "1",
+        }
+
+        with patch.dict(
+            os.environ,
+            environ,
+            clear=False,
+        ):
+            selected = await (
+                coordinator.run_context_pipeline(
+                    _body()
+                )
+            )
+
+        cid = self.conversation_id()
+
+        # The Unified chain runs even with every legacy Context flag off.
+        for path in (
+            self.path("snapshots", cid + ".json"),
+            self.path("compact", cid + ".json"),
+            self.path(
+                "context_candidate",
+                cid + ".json",
+            ),
+            self.path(
+                "unified_context_candidate",
+                cid + ".json",
+            ),
+        ):
+            with self.subTest(path=path.name):
+                self.assertTrue(path.is_file())
+
+        # The Delivery Plan is built exactly once as required upstream
+        # evidence for the Migration comparison.
+        self.assertEqual(
+            len(self._plan_files(cid)), 1
+        )
+
+        migration_files = self._migration_files(cid)
+
+        self.assertEqual(len(migration_files), 1)
+
+        artifact = json.loads(
+            migration_files[0].read_text(
+                encoding="utf-8"
+            )
+        )
+
+        self.assertEqual(
+            artifact["version"],
+            "memory-authority-migration-shadow.v1",
+        )
+        self.assertEqual(
+            artifact["authority"], "comparison_only"
+        )
+        self.assertFalse(artifact["live_authority"])
+        self.assertFalse(
+            artifact["live_cutover_ready"]
+        )
+
+        # No live memory channel is activated by the migration flag.
+        names = {
+            path.name
+            for path in self.path().rglob("*")
+        }
+
+        self.assertNotIn("memory_flash", names)
+        self.assertNotIn(
+            "memory_live_exposure", names
+        )
+        self.assertFalse(
+            any(
+                "recall_surface" in name
+                for name in names
+            )
+        )
+
+        # No provider body mutation at all.
+        self.assertEqual(selected, _body())
+
+    async def test_delivery_and_migration_share_one_plan(
+        self,
+    ):
+        self.bind([_memory("m1", "shared memory")])
+
+        environ = {
+            **_ISOLATED_ENV,
+            _DELIVERY_ENV: "1",
+            _MIGRATION_ENV: "1",
+        }
+
+        plans = []
+        migrated = []
+
+        real_delivery = (
+            coordinator.update_memory_delivery_plan
+        )
+        real_migration = (
+            coordinator.update_memory_authority_migration
+        )
+
+        def spy_delivery(*args, **kwargs):
+            result = real_delivery(*args, **kwargs)
+
+            if result.get("stored"):
+                plans.append(result["plan"])
+
+            return result
+
+        def spy_migration(*args, **kwargs):
+            migrated.append(
+                kwargs.get("delivery_plan")
+            )
+
+            return real_migration(*args, **kwargs)
+
+        with patch.dict(
+            os.environ,
+            environ,
+            clear=False,
+        ):
+            with patch.object(
+                coordinator,
+                "update_memory_delivery_plan",
+                side_effect=spy_delivery,
+            ), patch.object(
+                coordinator,
+                "update_memory_authority_migration",
+                side_effect=spy_migration,
+            ):
+                await coordinator.run_context_pipeline(
+                    _body()
+                )
+
+        # The plan is built EXACTLY once, not once per observer.
+        self.assertEqual(len(plans), 1)
+        self.assertEqual(len(migrated), 1)
+
+        # The migration consumed the SAME request-local plan object
+        # the delivery builder produced (identity, not equality).
+        self.assertIs(migrated[0], plans[0])
+
+    async def test_arbitration_delivery_migration_share_one_evidence(
+        self,
+    ):
+        self.bind([_memory("m1", "shared memory")])
+
+        environ = {
+            **_ISOLATED_ENV,
+            _ARBITRATION_ENV: "1",
+            _DELIVERY_ENV: "1",
+            _MIGRATION_ENV: "1",
+        }
+
+        real_build = (
+            evidence_module
+            .build_memory_source_evidence_snapshot
+        )
+
+        with patch.dict(
+            os.environ,
+            environ,
+            clear=False,
+        ):
+            with patch.object(
+                evidence_module,
+                "build_memory_source_evidence_snapshot",
+                side_effect=real_build,
+            ) as build_mock:
+                await coordinator.run_context_pipeline(
+                    _body()
+                )
+
+        # ONE Source Evidence build is shared by all three consumers.
+        self.assertEqual(build_mock.call_count, 1)
+
+        cid = self.conversation_id()
+
+        self.assertEqual(
+            len(self._plan_files(cid)), 1
+        )
+        self.assertEqual(
+            len(self._migration_files(cid)), 1
+        )
+        self.assertEqual(
+            len(
+                list(
+                    self.path(
+                        "memory_source_arbitration",
+                        cid,
+                    ).iterdir()
+                )
+            ),
+            1,
+        )
+
+    async def test_migration_off_is_a_true_noop(self):
+        self.bind([_memory("m1", "only memory")])
+
+        with patch.dict(
+            os.environ,
+            _ISOLATED_ENV,
+            clear=False,
+        ):
+            selected = await (
+                coordinator.run_context_pipeline(
+                    _body()
+                )
+            )
+
+        # With the migration flag off, no migration tree is created and
+        # the exact existing body behaviour is unchanged.
+        self.assertFalse(
+            self.path(
+                "memory_authority_migration"
+            ).exists()
+        )
+        self.assertEqual(selected, _body())
+
+    def test_real_pipeline_ab_interleaving_is_isolated(
+        self,
+    ):
+        memory_a = "mem_A_111111111111"
+        memory_b = "mem_B_222222222222"
+
+        local = threading.local()
+
+        class _Service:
+
+            async def get_candidates(
+                self,
+                query="",
+            ):
+                return _source_candidates(
+                    [
+                        _memory(
+                            local.memory_id,
+                            "cue " + local.memory_id,
+                        )
+                    ]
+                )
+
+        bind_context_service(_Service())
+
+        observed: dict = {}
+
+        a_ready = threading.Event()
+        release_a = threading.Event()
+
+        first_lock = threading.Lock()
+        state = {"first": True}
+
+        real_observe = (
+            coordinator
+            .observe_memory_authority_migration
+        )
+
+        def spy_observe(*args, **kwargs):
+            workspace = kwargs.get("workspace")
+
+            ident = threading.get_ident()
+
+            observed[ident] = {
+                "workspace": workspace,
+                "pre_live_body":
+                    kwargs.get("pre_live_body"),
+                "final_body":
+                    kwargs.get("final_body"),
+            }
+
+            is_first = False
+
+            with first_lock:
+                if state["first"]:
+                    state["first"] = False
+                    is_first = True
+
+            if (
+                is_first
+                and workspace is not None
+                and workspace.memory_delivery_plan
+                is not None
+            ):
+                # A has built its REAL request-local Source Evidence
+                # and Delivery Plan. Pause BEFORE the comparison.
+                a_ready.set()
+                release_a.wait(30)
+
+            return real_observe(*args, **kwargs)
+
+        results: dict = {}
+
+        def run(name, memory_id):
+            local.memory_id = memory_id
+
+            results[name] = asyncio.run(
+                coordinator.run_context_pipeline(
+                    _body()
+                )
+            )
+
+        environ = {
+            **_ISOLATED_ENV,
+            _MIGRATION_ENV: "1",
+        }
+
+        with patch.dict(
+            os.environ,
+            environ,
+            clear=False,
+        ):
+            with patch.object(
+                coordinator,
+                "observe_memory_authority_migration",
+                side_effect=spy_observe,
+            ):
+                thread_a = threading.Thread(
+                    target=run,
+                    args=("A", memory_a),
+                )
+                thread_a.start()
+
+                self.assertTrue(
+                    a_ready.wait(30),
+                    "request A never built its evidence",
+                )
+
+                # B runs to completion on the SAME conversation and
+                # overwrites the conversation-scoped latest artifacts.
+                run("B", memory_b)
+
+                b_thread_id = threading.get_ident()
+
+                a_thread_id = None
+
+                for ident in observed:
+                    if ident != b_thread_id:
+                        a_thread_id = ident
+
+                self.assertIsNotNone(a_thread_id)
+
+                self.assertTrue(thread_a.is_alive())
+
+                release_a.set()
+                thread_a.join(30)
+
+                self.assertFalse(thread_a.is_alive())
+
+        workspace_a = observed[a_thread_id]["workspace"]
+        workspace_b = observed[b_thread_id]["workspace"]
+
+        snap_a = workspace_a.memory_source_evidence
+        snap_b = workspace_b.memory_source_evidence
+
+        plan_a = workspace_a.memory_delivery_plan
+        plan_b = workspace_b.memory_delivery_plan
+
+        rid_a = snap_a.cognitive_request_id
+        rid_b = snap_b.cognitive_request_id
+
+        self.assertNotEqual(rid_a, rid_b)
+
+        # A's runtime workspace holds A's OWN request-local evidence.
+        self.assertEqual(
+            plan_a["cognitive_request_id"], rid_a
+        )
+        self.assertEqual(
+            plan_b["cognitive_request_id"], rid_b
+        )
+
+        digests_a = {
+            unit.content_digest
+            for unit in snap_a.units
+        }
+        digests_b = {
+            unit.content_digest
+            for unit in snap_b.units
+        }
+
+        self.assertTrue(digests_a)
+        self.assertTrue(digests_b)
+        self.assertEqual(digests_a & digests_b, set())
+
+        # The final body A observed is A's own returned body.
+        self.assertEqual(
+            results["A"], _body()
+        )
+        self.assertEqual(
+            results["B"], _body()
+        )
+        self.assertEqual(
+            observed[a_thread_id]["final_body"],
+            _body(),
+        )
+
+        cid = self.conversation_id()
+
+        artifacts = {}
+
+        for path in self._migration_files(cid):
+            artifact = json.loads(
+                path.read_text(encoding="utf-8")
+            )
+            artifacts[
+                artifact["cognitive_request_id"]
+            ] = artifact
+
+        migration_a = artifacts[rid_a]
+        migration_b = artifacts[rid_b]
+
+        refs_a = {
+            row["evidence_ref"]
+            for row in migration_a["rows"]
+        }
+        refs_b = {
+            row["evidence_ref"]
+            for row in migration_b["rows"]
+        }
+
+        # Migration A carries ONLY A evidence; zero B.
+        self.assertEqual(
+            migration_a["source_unified_revision"],
+            snap_a.source_unified_revision,
+        )
+        self.assertEqual(
+            {
+                row["evidence_ref"]
+                for row in plan_a["rows"]
+            },
+            refs_a,
+        )
+        self.assertEqual(refs_a & refs_b, set())
+
+    async def test_migration_off_is_a_true_noop(self):
+        self.bind([_memory("m1", "only memory")])
+
+        with patch.dict(
+            os.environ,
+            _ISOLATED_ENV,
+            clear=False,
+        ):
+            selected = await (
+                coordinator.run_context_pipeline(
+                    _body()
+                )
+            )
+
+        # With the migration flag off, no migration tree is created and
+        # the exact existing body behaviour is unchanged.
+        self.assertFalse(
+            self.path(
+                "memory_authority_migration"
+            ).exists()
+        )
+        self.assertEqual(selected, _body())
+
+
+class MigrationBodyAuthorityTests(
+    RealPipelineTestCase,
+):
+    """The observer reads the ACTUAL final body and cannot replace it."""
+
+    async def test_observer_receives_actual_final_body(self):
+        self.bind([_memory("m1", "only memory")])
+
+        final_body = _body() + b" "
+
+        seen = []
+
+        real_observe = (
+            coordinator.observe_memory_authority_migration
+        )
+
+        def spy_observe(*args, **kwargs):
+            seen.append(
+                kwargs.get("final_body")
+            )
+
+            return real_observe(*args, **kwargs)
+
+        environ = {
+            **_ISOLATED_ENV,
+            _MIGRATION_ENV: "1",
+        }
+
+        with patch.dict(
+            os.environ,
+            environ,
+            clear=False,
+        ):
+            with patch.object(
+                coordinator,
+                "select_live_memory_flash_exposure",
+                return_value=final_body,
+            ), patch.object(
+                coordinator,
+                "observe_memory_authority_migration",
+                side_effect=spy_observe,
+            ):
+                returned = await (
+                    coordinator.run_context_pipeline(
+                        _body()
+                    )
+                )
+
+        # The observer received the ACTUAL returned body, not the
+        # forward_body it was derived from.
+        self.assertTrue(seen)
+        self.assertEqual(seen[-1], returned)
+        self.assertEqual(returned, final_body)
+        self.assertNotEqual(returned, _body())
+
+    async def test_observer_cannot_mutate_returned_body(self):
+        self.bind([_memory("m1", "only memory")])
+
+        effects = (
+            RuntimeError("boom"),
+            lambda *args, **kwargs: {
+                "stored": False,
+                "mode": "shadow_only",
+                "decision": "no_record",
+                "reason": "malformed",
+            },
+            lambda *args, **kwargs: b"replacement-body",
+        )
+
+        for effect in effects:
+            with self.subTest(
+                effect=repr(effect)
+            ):
+                environ = {
+                    **_ISOLATED_ENV,
+                    _MIGRATION_ENV: "1",
+                }
+
+                with patch.dict(
+                    os.environ,
+                    environ,
+                    clear=False,
+                ):
+                    with patch.object(
+                        coordinator,
+                        "update_memory_authority_migration",
+                        side_effect=effect,
+                    ):
+                        returned = await (
+                            coordinator
+                            .run_context_pipeline(
+                                _body()
+                            )
+                        )
+
+                # Whatever the comparison writer does, the exact body
+                # chosen before Migration is returned.
+                self.assertEqual(returned, _body())
 
 
 if __name__ == "__main__":
