@@ -1241,6 +1241,155 @@ class DeliveryEvidenceRefTests(unittest.TestCase):
         )
 
 
+class TruncatedArtifactCoherenceTests(unittest.TestCase):
+    """Closed v0 source/channel identities hold even when rows truncate.
+
+    A truncated artifact drops hidden rows, so the broad algebra alone
+    cannot pin every counter. The source-specific row contract still
+    pins them: a source that is NOT observation-available contributes no
+    rows at all, so a forged hidden count for such a source is rejected
+    as a whole.
+    """
+
+    def test_rejects_forged_hidden_frontend_when_frontend_unavailable(
+        self,
+    ):
+        memories = [
+            _memory("m%d" % index, "OB-%d" % index)
+            for index in range(MAX_DELIVERY_ROWS + 1)
+        ]
+
+        # Every persisted row is OB and Frontend is not observable.
+        artifact = _build(
+            _ob_units(memories),
+            frontend_available=False,
+        )
+
+        self.assertFalse(
+            artifact["frontend_observation_available"]
+        )
+        self.assertTrue(artifact["rows_truncated"])
+        self.assertTrue(
+            all(
+                row["source"] == evidence.SOURCE_OB
+                for row in artifact["rows"]
+            )
+        )
+        self.assertTrue(
+            is_valid_memory_delivery_plan_artifact(
+                artifact
+            )
+        )
+
+        # Attacker forges hidden Frontend units the source contract
+        # forbids, while keeping the broad algebra self-consistent: the
+        # source split, the channel split and every closed identity all
+        # still add up.
+        artifact["metrics"].update(
+            {
+                "unit_count": MAX_DELIVERY_ROWS + 1,
+                "frontend_unit_count": 1,
+                "ob_unit_count": MAX_DELIVERY_ROWS,
+                "direct_data_count": 1,
+                "frontend_direct_data_count": 1,
+                "current_model_visible_count": 1,
+                "full_content_already_present_count": 1,
+                "unknown_count": MAX_DELIVERY_ROWS,
+                "ob_unknown_count": MAX_DELIVERY_ROWS,
+                "base_policy_unavailable_ob_count":
+                    MAX_DELIVERY_ROWS,
+            }
+        )
+
+        # The forgery is otherwise well-formed -- broad algebra alone
+        # would accept it -- so the closed-channel guard is exactly what
+        # rejects it.
+        with patch.object(
+            delivery,
+            "_closed_channel_metrics_ok",
+            return_value=True,
+        ):
+            self.assertTrue(
+                is_valid_memory_delivery_plan_artifact(
+                    artifact
+                )
+            )
+
+        self.assertFalse(
+            is_valid_memory_delivery_plan_artifact(
+                artifact
+            )
+        )
+
+    def test_rejects_forged_hidden_ob_when_ob_unavailable(self):
+        frontend = _frontend_units(
+            *[
+                "F-%d" % index
+                for index in range(MAX_DELIVERY_ROWS + 1)
+            ]
+        )
+
+        # Every persisted row is Frontend and OB is not observable.
+        artifact = _build(frontend, ob_available=False)
+
+        self.assertTrue(
+            artifact["frontend_observation_available"]
+        )
+        self.assertFalse(
+            artifact["ob_observation_available"]
+        )
+        self.assertTrue(artifact["rows_truncated"])
+        self.assertTrue(
+            all(
+                row["source"] == evidence.SOURCE_FRONTEND
+                for row in artifact["rows"]
+            )
+        )
+        self.assertTrue(
+            is_valid_memory_delivery_plan_artifact(
+                artifact
+            )
+        )
+
+        # Attacker forges hidden OB units the source contract forbids,
+        # keeping the broad algebra self-consistent.
+        artifact["metrics"].update(
+            {
+                "unit_count": MAX_DELIVERY_ROWS + 1,
+                "frontend_unit_count": MAX_DELIVERY_ROWS,
+                "ob_unit_count": 1,
+                "direct_data_count": MAX_DELIVERY_ROWS,
+                "frontend_direct_data_count":
+                    MAX_DELIVERY_ROWS,
+                "current_model_visible_count":
+                    MAX_DELIVERY_ROWS,
+                "full_content_already_present_count":
+                    MAX_DELIVERY_ROWS,
+                "flash_cue_count": 1,
+                "ob_flash_cue_count": 1,
+                "full_content_recall_required_count": 1,
+                "base_policy_unavailable_ob_count": 1,
+            }
+        )
+
+        with patch.object(
+            delivery,
+            "_closed_channel_metrics_ok",
+            return_value=True,
+        ):
+            self.assertTrue(
+                is_valid_memory_delivery_plan_artifact(
+                    artifact
+                )
+            )
+
+        self.assertFalse(
+            is_valid_memory_delivery_plan_artifact(
+                artifact
+            )
+        )
+
+
 class DeliveryIsolationTests(unittest.TestCase):
     """Request-local evidence survives a concurrent overwrite."""
 

@@ -397,6 +397,124 @@ class InvalidArtifactTests(unittest.TestCase):
         )
 
 
+class TruncatedForgeryRejectionTests(unittest.TestCase):
+    """Forged hidden source counts are rejected by whole, zero aggregate."""
+
+    def test_forged_hidden_frontend_when_unavailable_is_rejected(
+        self,
+    ):
+        memories = [
+            _memory("m%d" % index, "OB-%d" % index)
+            for index in range(MAX_DELIVERY_ROWS + 1)
+        ]
+
+        with tempfile.TemporaryDirectory() as root:
+            _persist(
+                root,
+                units=_ob_units(memories),
+                frontend_available=False,
+            )
+            path = _delivery_dir(root) / (RID + ".json")
+            artifact = json.loads(
+                path.read_text(encoding="utf-8")
+            )
+            artifact["metrics"].update(
+                {
+                    "unit_count": MAX_DELIVERY_ROWS + 1,
+                    "frontend_unit_count": 1,
+                    "ob_unit_count": MAX_DELIVERY_ROWS,
+                    "direct_data_count": 1,
+                    "frontend_direct_data_count": 1,
+                    "current_model_visible_count": 1,
+                    "full_content_already_present_count": 1,
+                    "unknown_count": MAX_DELIVERY_ROWS,
+                    "ob_unknown_count": MAX_DELIVERY_ROWS,
+                    "base_policy_unavailable_ob_count":
+                        MAX_DELIVERY_ROWS,
+                }
+            )
+            path.write_text(
+                json.dumps(artifact), encoding="utf-8"
+            )
+            report = reporter.build_report(root=root)
+
+        self.assertEqual(
+            report["artifact_count"], 1
+        )
+        self.assertEqual(
+            report["valid_artifact_count"], 0
+        )
+        self.assertEqual(
+            report["invalid_artifact_count"], 1
+        )
+        # Reject-by-whole: an invalid artifact adds ZERO to every
+        # aggregate statistic.
+        self.assertEqual(report["unit_count"], 0)
+        self.assertEqual(
+            report["frontend_unit_count"], 0
+        )
+        self.assertEqual(report["ob_unit_count"], 0)
+        self.assertEqual(
+            report["direct_data_count"], 0
+        )
+
+    def test_forged_hidden_ob_when_unavailable_is_rejected(
+        self,
+    ):
+        frontend = _frontend_units(
+            *[
+                "F-%d" % index
+                for index in range(MAX_DELIVERY_ROWS + 1)
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as root:
+            _persist(
+                root,
+                units=frontend,
+                ob_available=False,
+            )
+            path = _delivery_dir(root) / (RID + ".json")
+            artifact = json.loads(
+                path.read_text(encoding="utf-8")
+            )
+            artifact["metrics"].update(
+                {
+                    "unit_count": MAX_DELIVERY_ROWS + 1,
+                    "frontend_unit_count":
+                        MAX_DELIVERY_ROWS,
+                    "ob_unit_count": 1,
+                    "direct_data_count": MAX_DELIVERY_ROWS,
+                    "frontend_direct_data_count":
+                        MAX_DELIVERY_ROWS,
+                    "current_model_visible_count":
+                        MAX_DELIVERY_ROWS,
+                    "full_content_already_present_count":
+                        MAX_DELIVERY_ROWS,
+                    "flash_cue_count": 1,
+                    "ob_flash_cue_count": 1,
+                    "full_content_recall_required_count": 1,
+                    "base_policy_unavailable_ob_count": 1,
+                }
+            )
+            path.write_text(
+                json.dumps(artifact), encoding="utf-8"
+            )
+            report = reporter.build_report(root=root)
+
+        self.assertEqual(
+            report["valid_artifact_count"], 0
+        )
+        self.assertEqual(
+            report["invalid_artifact_count"], 1
+        )
+        self.assertEqual(report["unit_count"], 0)
+        self.assertEqual(report["ob_unit_count"], 0)
+        self.assertEqual(
+            report["flash_cue_count"], 0
+        )
+
+
 class ReadOnlyTests(unittest.TestCase):
 
     def test_report_never_writes_or_deletes(self):

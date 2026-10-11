@@ -1668,5 +1668,256 @@ class DeliveryFlagMatrixTests(
         self.assertIs(arbitration_seen[0], built[0])
 
 
+class RealPipelineDeliveryInterleavingTests(
+    RealPipelineTestCase,
+):
+    """REAL coordinator A/B interleaving keeps request-local evidence.
+
+    Unlike the lower-level direct-updater test
+    (``DeliveryIsolationTests.test_ab_interleaving_keeps_evidence_isolated``,
+    which constructs its own snapshot), this acceptance test exercises the
+    REAL path:
+
+        run_context_pipeline / real coordinator
+            -> real request-local Unified snapshot
+                -> real build_memory_source_evidence_snapshot
+                    -> real Delivery Plan
+
+    No manually constructed ``MemorySourceEvidenceSnapshot``; no sleeps. The
+    pause is a deterministic ``threading.Event`` hooked around the REAL
+    ``build_memory_source_evidence_snapshot`` call. Request A is paused AFTER
+    it builds its real request-local snapshot and BEFORE Delivery consumes it,
+    while request B runs to completion on the SAME conversation and overwrites
+    the conversation-scoped latest Unified.
+    """
+
+    def test_real_pipeline_ab_interleaving_is_isolated(
+        self,
+    ):
+        memory_a = "mem_A_111111111111"
+        memory_b = "mem_B_222222222222"
+
+        local = threading.local()
+
+        class _Service:
+
+            async def get_candidates(
+                self,
+                query="",
+            ):
+                return _source_candidates(
+                    [
+                        _memory(
+                            local.memory_id,
+                            "cue " + local.memory_id,
+                        )
+                    ]
+                )
+
+        bind_context_service(_Service())
+
+        built: dict = {}
+        delivered: dict = {}
+
+        a_built = threading.Event()
+        release_a = threading.Event()
+
+        first_lock = threading.Lock()
+        state = {"first": True}
+
+        real_build = (
+            evidence_module
+            .build_memory_source_evidence_snapshot
+        )
+        real_delivery = (
+            coordinator.update_memory_delivery_plan
+        )
+
+        def spy_build(*args, **kwargs):
+            snapshot = real_build(*args, **kwargs)
+
+            ident = threading.get_ident()
+
+            built[ident] = snapshot
+
+            is_first = False
+
+            with first_lock:
+                if state["first"]:
+                    state["first"] = False
+                    is_first = True
+
+            if is_first:
+                # Request A has built its REAL request-local Source
+                # Evidence snapshot. Pause before Delivery consumes it.
+                a_built.set()
+                release_a.wait(30)
+
+            return snapshot
+
+        def spy_delivery(*args, **kwargs):
+            delivered[threading.get_ident()] = (
+                kwargs.get("source_evidence_snapshot")
+            )
+
+            return real_delivery(*args, **kwargs)
+
+        results: dict = {}
+
+        def run(name, memory_id):
+            local.memory_id = memory_id
+
+            results[name] = asyncio.run(
+                coordinator.run_context_pipeline(
+                    _body()
+                )
+            )
+
+        environ = {
+            **_ISOLATED_ENV,
+            _DELIVERY_ENV: "1",
+        }
+
+        with patch.dict(
+            os.environ,
+            environ,
+            clear=False,
+        ):
+            with patch.object(
+                evidence_module,
+                "build_memory_source_evidence_snapshot",
+                side_effect=spy_build,
+            ), patch.object(
+                coordinator,
+                "update_memory_delivery_plan",
+                side_effect=spy_delivery,
+            ):
+                thread_a = threading.Thread(
+                    target=run,
+                    args=("A", memory_a),
+                )
+                thread_a.start()
+
+                # A is paused inside the REAL adapter, after building its
+                # real snapshot and before Delivery consumes it.
+                self.assertTrue(
+                    a_built.wait(30),
+                    "request A never built its source evidence",
+                )
+
+                # Request B runs to completion on the SAME conversation.
+                # It overwrites the conversation-scoped latest Unified.
+                run("B", memory_b)
+
+                a_thread_id = None
+                b_thread_id = threading.get_ident()
+
+                for ident in built:
+                    if ident != b_thread_id:
+                        a_thread_id = ident
+
+                self.assertIsNotNone(a_thread_id)
+
+                cid = (
+                    self.conversation_id()
+                )
+
+                unified = self.read_json(
+                    "unified_context_candidate",
+                    cid + ".json",
+                )
+
+                # PROOF: B overwrote the conversation-scoped latest
+                # Unified while A was still paused.
+                self.assertEqual(
+                    [
+                        item["id"]
+                        for item in unified["sections"][
+                            "memories"
+                        ]
+                    ],
+                    [memory_b],
+                )
+
+                # A is still paused -- it has not been released yet.
+                self.assertTrue(thread_a.is_alive())
+
+                release_a.set()
+                thread_a.join(30)
+
+                self.assertFalse(thread_a.is_alive())
+
+        snap_a = built[a_thread_id]
+        snap_b = built[b_thread_id]
+
+        rid_a = snap_a.cognitive_request_id
+        rid_b = snap_b.cognitive_request_id
+
+        self.assertNotEqual(rid_a, rid_b)
+
+        # PROOF: each Delivery consumed the exact SAME object that its own
+        # real adapter built (object identity, not equality).
+        self.assertIs(delivered[a_thread_id], snap_a)
+        self.assertIs(delivered[b_thread_id], snap_b)
+
+        plan_dir = self.path(
+            "memory_delivery_plan",
+            cid,
+        )
+
+        plans = {}
+
+        for path in plan_dir.iterdir():
+            artifact = json.loads(
+                path.read_text(encoding="utf-8")
+            )
+            plans[
+                artifact["cognitive_request_id"]
+            ] = artifact
+
+        plan_a = plans[rid_a]
+        plan_b = plans[rid_b]
+
+        digests_a = {
+            unit.content_digest
+            for unit in snap_a.units
+        }
+        digests_b = {
+            unit.content_digest
+            for unit in snap_b.units
+        }
+
+        self.assertTrue(digests_a)
+        self.assertTrue(digests_b)
+        self.assertEqual(digests_a & digests_b, set())
+
+        rows_a = {
+            row["content_digest"]
+            for row in plan_a["rows"]
+        }
+        rows_b = {
+            row["content_digest"]
+            for row in plan_b["rows"]
+        }
+
+        # A plan is bound to A and carries ONLY A evidence; zero B.
+        self.assertEqual(
+            plan_a["cognitive_request_id"], rid_a
+        )
+        self.assertEqual(rows_a, digests_a)
+        self.assertEqual(rows_a & digests_b, set())
+
+        # B plan is bound to B and carries ONLY B evidence; zero A.
+        self.assertEqual(
+            plan_b["cognitive_request_id"], rid_b
+        )
+        self.assertEqual(rows_b, digests_b)
+        self.assertEqual(rows_b & digests_a, set())
+
+        # The forwarded body was never mutated by the shadow.
+        self.assertEqual(results["A"], _body())
+        self.assertEqual(results["B"], _body())
+
+
 if __name__ == "__main__":
     unittest.main()
