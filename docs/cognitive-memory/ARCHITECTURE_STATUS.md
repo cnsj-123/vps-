@@ -9,9 +9,9 @@ and the code disagree, the code is correct and this document is wrong.
 
 - Repository source of truth: the tree at the baseline commit below.
 - Baseline: `origin/feature/gateway-v2`
-- Baseline HEAD: `2815c934892b7a2ea79b303453e959f6829f0ef1`
-  (merge of PR #4, `trae/lifecycle-shadow-comparison-v0` — Legacy vs
-  Cognitive Lifecycle Shadow Comparison v0)
+- Baseline HEAD: `cdf67e54303f121f6be7bde2c7fda6cbfbb0be8a`
+  (merge of PR #5, `trae/unified-memory-delivery-shadow-v0` — Source-Neutral
+  Memory Evidence + Unified Delivery Plan Shadow v0)
 - Audit date context: originally written for the Frontend Memory Arbitration
   Shadow task (branch `trae/frontend-memory-arbitration-shadow-v1`), then
   updated for the Request-local Cognitive Workspace Foundation v0 task
@@ -24,11 +24,14 @@ and the code disagree, the code is correct and this document is wrong.
   updated for the Legacy vs Cognitive Lifecycle Shadow Comparison v0 task
   (branch `trae/lifecycle-shadow-comparison-v0`, base
   `01b5948ab1b14c2a65ddebea31611f2e5321aa74`; merged into `feature/gateway-v2`
-  as PR #4, the current baseline HEAD
-  `2815c934892b7a2ea79b303453e959f6829f0ef1`), then updated for the
-  Source-Neutral Memory Evidence + Unified Delivery Plan Shadow v0 task
-  (branch `trae/unified-memory-delivery-shadow-v0`, base
-  `2815c934892b7a2ea79b303453e959f6829f0ef1`).
+  as PR #4), then updated for the Source-Neutral Memory Evidence + Unified
+  Delivery Plan Shadow v0 task (branch `trae/unified-memory-delivery-shadow-v0`,
+  base `2815c934892b7a2ea79b303453e959f6829f0ef1`; merged into
+  `feature/gateway-v2` as PR #5, the current baseline HEAD
+  `cdf67e54303f121f6be7bde2c7fda6cbfbb0be8a`), then updated for the Memory
+  Authority Migration Shadow v0 task (branch
+  `trae/memory-authority-migration-shadow-v0`, base
+  `cdf67e54303f121f6be7bde2c7fda6cbfbb0be8a`).
 
 Companion documents:
 
@@ -46,6 +49,12 @@ Companion documents:
   Unified Memory Delivery Plan Shadow v0 (`memory-delivery-plan-shadow.v1`) — a
   `SHADOW CONTROL PLANE` proposal experiment. It is a WORKING EXPERIMENT, not an
   ADR and not a frozen specification.
+- **`docs/cognitive-memory/MEMORY_AUTHORITY_MIGRATION_SHADOW.md`** documents the
+  Memory Authority Migration Shadow v0 (`memory-authority-migration-shadow.v1`) —
+  a MIGRATION READINESS OBSERVATION that compares the actual final model-facing
+  memory exposure of a request against a single-authority control-contract
+  coverage. It is a WORKING EXPERIMENT / SHADOW OBSERVATION, not an ADR, not live
+  authority and not a frozen specification.
 
 Current experiment status:
 
@@ -63,6 +72,8 @@ Frontend/OB Source Arbitration
 Source-Neutral Memory Evidence Adapter
     ↓
 Unified Memory Delivery Plan Shadow
+    ↓
+Memory Authority Migration Shadow
 ```
 
 The lifecycle comparison **adds comparison evidence only**. It does **not** unify
@@ -79,6 +90,16 @@ The delivery experiment is likewise a proposal only. Explicitly:
   mouth is observed as an existing baseline and left untouched (§4, §2.26);
 - **`NOT storage has been unified`** — each source keeps its own storage,
   granularity and retrieval semantics (§2.25).
+
+The migration experiment is an **observation of readiness only**. Explicitly:
+
+- **`migration readiness evidence exists`** — this is true (§2.27);
+- **`NOT unified Memory authority is live`** — the Migration Shadow has
+  `authority=comparison_only` / `live_authority=false` and changes no forwarded
+  body;
+- **`NOT Frontend direct mouth removed`** — the Frontend attachment mouth is
+  observed as an existing baseline and left untouched (§4, §2.27);
+- **`NOT cutover approved`** — `live_cutover_ready` is always `false` in v0 (§2.27).
 
 Everything below is derived by reading the real modules listed next to each
 stage. Where a claim could not be verified from code it is explicitly marked
@@ -602,7 +623,7 @@ not two candidates for one job. See §8 for the current reality and why the old
 | --- | --- |
 | Owner | `src/ombrebrain/context/context_request_workspace.py` (`ContextRequestWorkspace`) |
 | Input | the exact artifacts THIS Context pass produced |
-| Output | in-memory runtime authority: `conversation_id`, `cognitive_request_id`, `conversation_candidate`, `unified`, `memory_shadow_snapshot`, `confidence_report`, `preview`, `gate`, `context_chain_fresh` |
+| Output | in-memory runtime authority: `conversation_id`, `cognitive_request_id`, `conversation_candidate`, `unified`, `memory_shadow_snapshot`, `confidence_report`, `preview`, `gate`, `context_chain_fresh`, `memory_source_evidence` (§2.25), `memory_delivery_plan` (§2.26), `memory_authority_migration` (§2.27) |
 | Persisted | **none** — in-memory only, one per gateway request |
 | Shadow/Live | runtime authority (not an observer, not a mutator itself) |
 | Flag | none (always created; every consumer keeps its existing flag + fallback) |
@@ -825,6 +846,86 @@ even when hidden rows were truncated (see
 
 Fail-open: a delivery fault is *missing delivery data* and nothing else.
 
+### 2.27 Memory Authority Migration Shadow (v0)
+
+| Field | Value |
+| --- | --- |
+| Owner | `src/ombrebrain/context/memory_authority_migration_shadow.py` (`memory-authority-migration-shadow.v1`) (+ read-only reporter `src/ombrebrain/maintenance/memory_authority_migration_report.py`) |
+| Input | THIS request's already-built `workspace.memory_source_evidence` + `workspace.memory_delivery_plan` + the exact `pre_live_body` / `final_body` bytes |
+| Output | one privacy-safe, request-scoped comparison artifact (current exposure + closed coverage rows + full-scope metrics); **no** live effect |
+| Persisted | `memory_authority_migration/{conversation_id}/{cognitive_request_id}.json` |
+| Shadow/Live | **SHADOW ONLY / COMPARISON ONLY**, default OFF |
+| Flag | `OMBRE_GATEWAY_CONTEXT_MEMORY_AUTHORITY_MIGRATION_SHADOW` (requires Delivery Plan evidence; enables NO live memory channel) |
+| Mutates provider request | no |
+| Mutates canonical memory | no |
+| Lifecycle effect | none |
+| Downstream | none for the live request (evidence only); request-local `workspace.memory_authority_migration` for THIS request |
+
+It is the **next observation layer** after the Delivery Plan Shadow: it measures
+the readiness of that proposal to become a single model-facing memory authority by
+comparing the **actual final provider body** with the Delivery Plan's
+**control contract**.
+
+Pipeline placement (strictly post-final-body; the returned bytes are byte-identical):
+
+```
+forward_body -> Real Injection -> selected_body
+    -> Live Memory Flash Exposure -> final_body
+        -> Memory Authority Migration Shadow (READ final_body) -> return EXACT SAME final_body
+```
+
+Artifact contract:
+
+- `mode="shadow_only"`, `authority="comparison_only"`,
+  `hypothesis="single_model_facing_memory_authority.v1"`, `live_authority=false`,
+  **`live_cutover_ready=false` always**;
+- `live_cutover_reason` ∈ {`contract_gaps_present`,
+  `unified_live_renderer_not_implemented`} — even a zero-gap request is not
+  ready because the unified live renderer does not exist;
+- `contract_coverage_status` ∈ {`blocked`, `covered`} — `blocked` iff
+  `contract_gap_unit_count > 0`.
+
+Closed coverage mapping (one row → exactly one coverage; anything else invalidates
+the whole artifact):
+
+```
+frontend + direct_data -> gap_frontend_direct_bypass        (replacement: controlled_frontend_channel_required)
+ob       + flash_cue   -> covered_ob_controlled_cue_contract     (replacement: none)
+ob       + drop        -> covered_ob_controlled_withhold_contract (replacement: none)
+ob       + unknown     -> gap_ob_policy_unknown              (replacement: policy_resolution_required)
+```
+
+Key properties:
+
+- **Actual final-body Frontend verification** — `frontend_final_presence_verified`
+  is true only when the final body's Frontend occurrence **multiset** exactly
+  equals THIS request's Source Evidence Frontend multiset
+  (`(scope, content_digest, model_visible_chars, model_visible_estimated_tokens)`),
+  so duplicate identical attachments stay distinct and a mismatch is never
+  silently "covered". `frontend_final_observation_available` is false when the
+  final body cannot be canonicalized.
+- **Actual Live Exposure observation** — the request-level Live Exposure receipt
+  (request-scoped) is the only source of `actual_ob_live_exposed_count` /
+  `actual_ob_live_exposure_estimated_tokens`; it is **never** projected onto
+  individual delivery rows (`OB actual exposure != per-row contract coverage`).
+  A changed body without a valid receipt makes the writer refuse the artifact.
+- **Counterfactual loss, not savings** —
+  `counterfactual_loss_if_direct_mouth_removed_without_replacement_*` equals the
+  **current** Frontend model-visible footprint (a "loss if removed with no
+  replacement" number), never a tokens-saved claim.
+- **Privacy** — only counts, booleans, enums, revisions and `sha256` digests; no
+  memory text, cue, attachment body, memory id, memref or fingerprint.
+  `current_exposure` stores body **sha256** + byte lengths only.
+
+It is a **comparison with no live authority**: it never calls
+`select_context_injected_body` / `select_live_memory_flash_body`, never builds a
+hypothetical target body, never removes / gates / rewrites a Frontend attachment,
+never introduces a Frontend renderer / memref / Recall, never performs a memory
+mutation, and never answers the still-open Delivery questions A–H. It consumes only
+request-local evidence, so two concurrent requests on the same conversation cannot
+contaminate each other. See
+[MEMORY_AUTHORITY_MIGRATION_SHADOW.md](MEMORY_AUTHORITY_MIGRATION_SHADOW.md).
+
 ---
 
 ## 3. What the cache rewriters do to attachments (relevant to Frontend Memory)
@@ -910,6 +1011,14 @@ implicitly drives the upstream chain it consumes.
   `observe_context_sources` / `observe_unified_preview_gate` to run the
   upstream Conversation→Unified chain for this request (they are consumers, not
   observability-only toggles).
+- `..._MEMORY_AUTHORITY_MIGRATION_SHADOW` needs the request-local Delivery Plan
+  evidence, so it **MAY drive** the Delivery Plan (and thus the Source Evidence
+  Snapshot and the upstream chain) for THIS request even when
+  `..._MEMORY_DELIVERY_SHADOW` itself is OFF. It does **not** activate any live
+  memory channel: it never turns on Memory Flash, Recall Surface, Live Memory
+  Flash Exposure, Lifecycle Surfacing, Lifecycle Comparison, Context Real
+  Injection, Source Arbitration or Exposure Ledger. `Migration Shadow needs
+  Delivery Plan evidence, but does not activate any live memory channel.`
 - `..._MEMORY_SOURCE_ARBITRATION_SHADOW` now reuses the request-local
   **Source-Neutral Memory Evidence** adapter (§2.25) instead of reparsing the
   forwarded body / snapshot itself, but it remains **observation-only
@@ -941,6 +1050,7 @@ Shadow flags that never mutate the provider request:
 `..._LIFECYCLE_COMPARISON_SHADOW`,
 `..._MEMORY_SOURCE_ARBITRATION_SHADOW`,
 `..._MEMORY_DELIVERY_SHADOW`,
+`..._MEMORY_AUTHORITY_MIGRATION_SHADOW`,
 `OMBRE_GATEWAY_MEMORY_LIFECYCLE_SHADOW`.
 
 Flags that can mutate the provider request:
@@ -1098,6 +1208,24 @@ demonstrated correctness / data-integrity / authority violations.
   intentionally excluded from Delivery v0).
 - No new memory system (Episodic / Semantic / Relation / Prospective / Wake /
   Emotion / Attachment).
+
+### Explicitly NOT done in the Memory Authority Migration Shadow v0 task
+
+- No migration and no live cutover; the observer is default OFF and
+  comparison-only, and `live_cutover_ready` is always `false`.
+- No hypothetical target body (`frontend_removed_body` / `unified_memory_body` /
+  `target_body`); the counterfactual is numeric-only.
+- No Frontend removal / gating / rewriting / deletion; no Frontend renderer,
+  memref, Recall or stable item identity; the Frontend direct mouth stays live
+  and untouched.
+- No OB direct full-content path; no per-row projection of the request-level Live
+  Exposure receipt.
+- No retrieval / memory mutation (no touch / reinforce / archive / delete /
+  restore / record_usage / lifecycle write).
+- No live unified renderer / selector; no provider-body mutation; no change to
+  `selected_body` / `final_body`.
+- No resolution of the still-open Delivery questions A–H; no Lifecycle
+  composition; no cross-source conflict / semantic-overlap policy.
 
 ---
 

@@ -14,7 +14,13 @@ Companion documents:
 
 - [`ARCHITECTURE_STATUS.md`](ARCHITECTURE_STATUS.md) — the reality map of the
   whole cognitive-memory chain (this experiment is recorded there as §2.25 /
-  §2.26).
+  §2.26; the follow-on Migration Shadow as §2.27).
+- [`MEMORY_AUTHORITY_MIGRATION_SHADOW.md`](MEMORY_AUTHORITY_MIGRATION_SHADOW.md) —
+  the **next observation layer**: it measures the readiness of this Delivery Plan
+  to become a single model-facing memory authority, by comparing the actual final
+  body against this plan's control contract. It consumes this experiment's
+  request-local Source Evidence Snapshot and Delivery Plan; it never changes the
+  forwarded body.
 - [`LIFECYCLE_AUTHORITY_MAP.md`](LIFECYCLE_AUTHORITY_MAP.md) and
   [`LIFECYCLE_SHADOW_COMPARISON.md`](LIFECYCLE_SHADOW_COMPARISON.md) — the
   lifecycle plane, which this experiment **intentionally does not consume**.
@@ -456,6 +462,29 @@ At minimum, all of the following, none of which v0 does:
    content-integrity checks the existing Real Injection path has;
 7. a rollout / kill-switch design and an authority audit proving no source's
    existing guarantees are weakened.
+
+The **Memory Authority Migration Shadow v0**
+([`MEMORY_AUTHORITY_MIGRATION_SHADOW.md`](MEMORY_AUTHORITY_MIGRATION_SHADOW.md))
+is the follow-on observation layer that **measures** readiness against exactly
+these prerequisites. It compares the actual final provider body with this plan's
+control contract and reports, per request, the Frontend direct bypass gap, the OB
+controlled cue / withhold coverage, the OB `unknown` gap and the counterfactual
+loss of removing the direct mouth.
+
+Measuring readiness does **not** solve any prerequisite. After the Migration
+Shadow, the following remain **NOT solved**:
+
+- a Frontend controlled replacement channel (questions A, D — item 4 / 6);
+- Frontend Recall (question D);
+- cross-source conflict policy (question F — item 1);
+- semantic overlap policy (question G — item 2);
+- Lifecycle composition (question E — item 5);
+- the live unified renderer (item 6);
+- the rollout / kill-switch (item 7).
+
+The Migration Shadow itself asserts `live_cutover_ready=false` for every request,
+including one with zero measured gaps, precisely because the live renderer
+(item 6) and the rollout design (item 7) still do not exist.
 
 Until then Delivery stays a **proposal with no live authority**.
 

@@ -65,6 +65,12 @@ class ContextRequestWorkspace:
     # with no live authority and never changes the forwarded body.
     memory_delivery_plan: dict[str, Any] | None = None
 
+    # Request-local Memory Authority Migration Shadow artifact THIS
+    # request produced. Request-local, privacy-safe and comparison-only:
+    # it has NO live authority and never mutates a downstream body. It
+    # is bound only when a valid stored comparison was produced.
+    memory_authority_migration: dict[str, Any] | None = None
+
     # Confidence Gate report for THIS request (observer only).
     confidence_report: dict[str, Any] | None = None
 

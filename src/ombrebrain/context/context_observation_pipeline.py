@@ -172,12 +172,24 @@ def observe_context_sources(body: bytes) -> str | None:
         )
     )
 
+    # Memory Authority Migration Shadow. It is comparison-only, but it
+    # CONSUMES the request-local Delivery Plan as required upstream
+    # evidence, so enabling it alone must also drive the same upstream
+    # chain. It never activates a live memory channel.
+    memory_authority_migration_enabled = _truthy(
+        os.environ.get(
+            "OMBRE_GATEWAY_CONTEXT_MEMORY_"
+            "AUTHORITY_MIGRATION_SHADOW"
+        )
+    )
+
     memory_downstream_enabled = (
         confidence_gate_enabled
         or memory_flash_enabled
         or exposure_ledger_enabled
         or memory_arbitration_enabled
         or memory_delivery_enabled
+        or memory_authority_migration_enabled
     )
 
     if not (
