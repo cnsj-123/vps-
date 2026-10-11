@@ -104,14 +104,62 @@ def _reject_constant(name: str) -> Any:
     )
 
 
+def _iter_artifact_paths(base: Path):
+    """Deterministic lexical traversal yielding artifact files one at a
+    time.
+
+    It sorts directory names and, within one conversation directory,
+    file names, then yields files lazily. Callers stop consuming as soon
+    as the requested limit is reached, so the full tree is NEVER
+    enumerated before slicing: files in conversation directories beyond
+    the one that reaches the limit are never even listed.
+    """
+
+    try:
+        conversation_dirs = sorted(
+            base.iterdir(),
+            key=lambda item: item.name,
+        )
+    except OSError:
+        return
+
+    for conversation_dir in conversation_dirs:
+        try:
+            if not conversation_dir.is_dir():
+                continue
+        except OSError:
+            continue
+
+        try:
+            children = sorted(
+                (
+                    child
+                    for child in conversation_dir.iterdir()
+                    if child.is_file()
+                    and child.suffix == ".json"
+                ),
+                key=lambda item: item.name,
+            )
+        except OSError:
+            continue
+
+        for child in children:
+            yield child
+
+
 def _artifact_paths(
     root: Path,
     *,
     limit: int,
 ) -> list[Path]:
-    """Deterministic, bounded list of artifact files (read-only)."""
+    """Deterministic, BOUNDED list of artifact files (read-only).
 
-    if limit < 0:
+    The limit is a real traversal bound: traversal STOPS as soon as
+    ``limit`` files have been selected, so a huge state tree is never
+    enumerated before slicing. ``limit <= 0`` selects no file at all.
+    """
+
+    if limit <= 0:
         return []
 
     base = root / _CANDIDATE_DIRNAME
@@ -121,15 +169,21 @@ def _artifact_paths(
 
     paths: list[Path] = []
 
-    for path in base.rglob("*.json"):
-        if path.is_file():
-            paths.append(path)
+    for path in _iter_artifact_paths(base):
+        paths.append(path)
 
-    paths.sort(
-        key=lambda item: item.as_posix()
-    )
+        if len(paths) >= limit:
+            break
 
-    return paths[:limit]
+    return paths
+
+
+def _path_identity(path: Path) -> tuple[str, str]:
+    """Derive ``(conversation_id, cognitive_request_id)`` from the
+    artifact path ``<base>/<conversation_id>/<cognitive_request_id>.json``.
+    """
+
+    return path.parent.name, path.stem
 
 
 def _load_artifact(
@@ -213,6 +267,23 @@ def build_report(
             )
         ):
             # Invalid as a WHOLE: contributes zero to every statistic.
+            invalid_artifact_count += 1
+            continue
+
+        # PATH BINDING: the artifact must belong to the exact path it
+        # was found under. A valid artifact copied under another request
+        # filename or conversation directory is NOT a second valid
+        # observation and contributes ZERO statistics.
+        path_conversation_id, path_request_id = (
+            _path_identity(path)
+        )
+
+        if (
+            artifact.get("conversation_id")
+            != path_conversation_id
+            or artifact.get("cognitive_request_id")
+            != path_request_id
+        ):
             invalid_artifact_count += 1
             continue
 

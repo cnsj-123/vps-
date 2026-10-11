@@ -458,11 +458,18 @@ class CandidateOnlyFlagMatrixTests(
             candidate_module,
             "build_memory_live_authority_candidate_artifact",
             side_effect=spy_candidate_build,
-        ):
+        ), patch.object(
+            coordinator,
+            "select_context_injected_body",
+        ) as injection_spy:
             selection = await self._run(
                 forward_body,
                 {_CANDIDATE_ENV: "1"},
             )
+
+        # REAL Context Injection was never even invoked: Candidate alone
+        # must not reach the live injection selector.
+        injection_spy.assert_not_called()
 
         self.assertEqual(counts["source"], 1)
         self.assertEqual(counts["policy"], 1)
@@ -506,6 +513,22 @@ class CandidateOnlyFlagMatrixTests(
         )
         self.assertFalse(artifact["live_cutover_ready"])
         self.assertFalse(artifact["live_authority"])
+
+        # Candidate ONLY: every live stage's own artifact / receipt
+        # directory must be ABSENT, not merely inferred from the
+        # unchanged body.
+        for live_dir in (
+            "memory_flash",
+            "recall_surface",
+            "memory_live_exposure",
+            "exposure_ledger",
+            "injection_preview",
+        ):
+            with self.subTest(live_dir=live_dir):
+                self.assertFalse(
+                    (Path(self.root) / live_dir).exists(),
+                    live_dir,
+                )
 
     async def test_delivery_migration_candidate_share_one_chain(
         self,
@@ -830,11 +853,17 @@ class RealObLiveExposureCompositionTests(
 
         metrics = artifact["metrics"]
 
-        # The OB live channel is delegated, not re-implemented.
+        # The OB live channel is delegated, not re-implemented. In THIS
+        # test REAL Live Exposure actually occurred under the test's
+        # known-valid Surfacing Policy path, so the Candidate MUST observe
+        # the OB controlled cue contract and MUST NOT report the policy
+        # unknown: a real live-exposed OB cue must never be silently
+        # recorded as "policy unknown".
         self.assertGreaterEqual(
-            metrics["ob_existing_cue_contract_count"]
-            + metrics["ob_policy_unknown_count"],
-            1,
+            metrics["ob_existing_cue_contract_count"], 1
+        )
+        self.assertEqual(
+            metrics["ob_policy_unknown_count"], 0
         )
         self.assertEqual(
             metrics[
@@ -1231,11 +1260,21 @@ class StaticSafetyTests(unittest.TestCase):
         "get_candidates",
         "embedding",
         "rerank",
+        # Lifecycle mutation / write identifiers. Candidate / Controlled
+        # Surface production must never reach a live memory mutation
+        # path. The check stays AST / identifier based, so a mention in a
+        # comment or docstring never creates a false positive.
+        "touch",
         "touch_many",
-        "reinforce",
-        "record_usage",
+        "delete",
         "archive",
         "restore",
+        "restore_archived",
+        "reinforce",
+        "record_usage",
+        "write_memory",
+        "apply_lifecycle_surfacing_gate",
+        "update_memory_lifecycle_comparison",
     )
 
     def _identifiers(self, source_path):

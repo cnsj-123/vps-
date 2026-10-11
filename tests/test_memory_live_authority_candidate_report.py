@@ -239,6 +239,28 @@ class EmptyScanTests(unittest.TestCase):
 
         self.assertEqual(report["artifact_count"], 0)
 
+    def test_zero_limit_opens_no_artifact(self):
+        body = _frontend_body("MEM-A")
+
+        with tempfile.TemporaryDirectory() as root:
+            _persist(
+                root,
+                units=_frontend_units_from(body),
+                body=body,
+            )
+
+            with patch.object(
+                reporter,
+                "_load_artifact",
+                wraps=reporter._load_artifact,
+            ) as opened:
+                report = reporter.build_report(
+                    root=root, limit=0
+                )
+
+        self.assertEqual(report["artifact_count"], 0)
+        self.assertEqual(opened.call_count, 0)
+
 
 class AggregationTests(unittest.TestCase):
 
@@ -342,11 +364,57 @@ class AggregationTests(unittest.TestCase):
                     rid="ctxreq_" + str(index) * 32,
                 )
 
-            report = reporter.build_report(
-                root=root, limit=2
-            )
+            with patch.object(
+                reporter,
+                "_load_artifact",
+                wraps=reporter._load_artifact,
+            ) as opened:
+                report = reporter.build_report(
+                    root=root, limit=2
+                )
 
         self.assertEqual(report["artifact_count"], 2)
+
+        # The limit is a REAL traversal / parse bound: with 3 artifacts
+        # on disk only 2 were ever opened.
+        self.assertEqual(opened.call_count, 2)
+
+    def test_ordering_is_deterministic_across_runs(self):
+        with tempfile.TemporaryDirectory() as root:
+            for index in range(5):
+                body = _frontend_body("MEM-%d" % index)
+
+                _persist(
+                    root,
+                    units=_frontend_units_from(body),
+                    body=body,
+                    rid="ctxreq_" + str(index) * 32,
+                )
+
+            seen: list[str] = []
+
+            real_load = reporter._load_artifact
+
+            def record(path):
+                seen.append(path.as_posix())
+                return real_load(path)
+
+            with patch.object(
+                reporter, "_load_artifact", side_effect=record
+            ):
+                reporter.build_report(root=root, limit=3)
+
+            first = list(seen)
+
+            seen.clear()
+
+            with patch.object(
+                reporter, "_load_artifact", side_effect=record
+            ):
+                reporter.build_report(root=root, limit=3)
+
+        self.assertEqual(first, seen)
+        self.assertEqual(len(first), 3)
 
 
 class InvalidArtifactTests(unittest.TestCase):
@@ -508,6 +576,148 @@ class InvalidArtifactTests(unittest.TestCase):
 
         self.assertEqual(
             report["invalid_artifact_count"], 1
+        )
+
+    def test_unknown_field_forgery_rejected_by_whole(self):
+        body = _frontend_body("MEM-A")
+
+        with tempfile.TemporaryDirectory() as root:
+            _persist(
+                root,
+                units=_frontend_units_from(body),
+                body=body,
+            )
+            path = _candidate_dir(root) / (
+                RID + ".json"
+            )
+            artifact = json.loads(
+                path.read_text(encoding="utf-8")
+            )
+            artifact["raw_attachment"] = (
+                _SENTINEL_FRONTEND
+            )
+            path.write_text(
+                json.dumps(artifact), encoding="utf-8"
+            )
+            report = reporter.build_report(root=root)
+
+        self.assertEqual(report["artifact_count"], 1)
+        self.assertEqual(
+            report["valid_artifact_count"], 0
+        )
+        self.assertEqual(
+            report["invalid_artifact_count"], 1
+        )
+        self.assertEqual(
+            report[
+                "frontend_controlled_direct_candidate_count"
+            ],
+            0,
+        )
+        self.assertEqual(
+            report[
+                "compatibility_candidate_ready"
+                "_request_count"
+            ],
+            0,
+        )
+
+
+class PathBindingTests(unittest.TestCase):
+    """A valid artifact copied under a foreign path is NOT a second
+    valid observation."""
+
+    def _copy(self, root, *, filename, directory=None):
+        source = _candidate_dir(root) / (RID + ".json")
+
+        target_dir = (
+            _candidate_dir(root)
+            if directory is None
+            else (
+                Path(root)
+                / "memory_live_authority_candidate"
+                / directory
+            )
+        )
+
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        target = target_dir / filename
+
+        target.write_text(
+            source.read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+
+        return target
+
+    def test_copied_artifact_wrong_request_path_is_invalid(
+        self,
+    ):
+        body = _frontend_body("MEM-A")
+
+        with tempfile.TemporaryDirectory() as root:
+            _persist(
+                root,
+                units=_frontend_units_from(body),
+                body=body,
+            )
+
+            self._copy(
+                root,
+                filename=(
+                    "ctxreq_" + "b" * 32 + ".json"
+                ),
+            )
+
+            report = reporter.build_report(root=root)
+
+        self.assertEqual(report["artifact_count"], 2)
+        self.assertEqual(
+            report["valid_artifact_count"], 1
+        )
+        self.assertEqual(
+            report["invalid_artifact_count"], 1
+        )
+        self.assertEqual(
+            report[
+                "frontend_controlled_direct_candidate_count"
+            ],
+            1,
+        )
+
+    def test_copied_artifact_wrong_conversation_path_is_invalid(
+        self,
+    ):
+        body = _frontend_body("MEM-A")
+
+        with tempfile.TemporaryDirectory() as root:
+            _persist(
+                root,
+                units=_frontend_units_from(body),
+                body=body,
+            )
+
+            self._copy(
+                root,
+                filename=RID + ".json",
+                directory="ctx_0123456789abcdee",
+            )
+
+            report = reporter.build_report(root=root)
+
+        self.assertEqual(report["artifact_count"], 2)
+        self.assertEqual(
+            report["valid_artifact_count"], 1
+        )
+        self.assertEqual(
+            report["invalid_artifact_count"], 1
+        )
+        self.assertEqual(
+            report[
+                "frontend_controlled_direct_candidate_count"
+            ],
+            1,
         )
 
 

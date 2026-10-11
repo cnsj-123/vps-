@@ -255,6 +255,20 @@ never reads a conversation-global "latest". The Frontend Controlled Surface is b
 cached or given to the model. Two concurrent requests on the same conversation cannot
 contaminate each other.
 
+### Read-only aggregate reporter
+
+`memory_live_authority_candidate_report.py` aggregates the persisted artifacts without
+creating a database, a rolling accumulator or any runtime authority. It **path-binds**
+every file: a candidate artifact is accepted only when its embedded conversation /
+request ids match the `<conversation_id>/<cognitive_request_id>.json` path it was read
+from, so one request artifact copied under a foreign request filename or conversation
+directory is counted invalid and contributes **zero** to every statistic. Its `--limit`
+(default 500) is a **real traversal bound**, not post-scan slicing: a deterministic
+lexical traversal (sorted directory names, then sorted file names) yields files lazily
+and stops as soon as the limit is reached, so a large state tree is never fully
+enumerated before the bound is applied. The reporter never emits a "safe to cut over"
+state and never mutates anything it reads.
+
 ## 15. Privacy
 
 Persisted artifacts and logs carry only privacy-safe data: request-binding ids,
@@ -267,6 +281,25 @@ only mode / stored / decision / reason / strategy / `source_unified_revision` /
 `compatibility_candidate_ready` / `candidate_coverage_status` / counts and metrics —
 no conversation id, request id, evidence ref, digest, memory id, memref, cue or
 attachment text.
+
+The v1 candidate artifact and **every** candidate row use **closed key schemas**: the
+validator requires the exact key set the writer emits, so an unknown field — a raw
+attachment, a body, a cue, a memory id, a memref or any future extension — makes the
+**whole artifact invalid**. This makes the artifact contract itself forbid secrets,
+rather than relying only on the writer not emitting them. A new field therefore
+requires a new artifact version.
+
+Each candidate row additionally carries a **privacy-safe numeric footprint**
+(`model_visible_chars`, `model_visible_estimated_tokens`). Frontend rows copy the exact
+in-memory bound surface footprint; OB rows are always exactly zero. Only these numbers
+are persisted — never the raw envelope, cue, memref or body. Because the complete
+Frontend row set is always persisted, the aggregate Frontend footprint metric must
+equal the exact sum of the Frontend row footprints, so a forged aggregate or a single
+forged row footprint cannot balance the algebra.
+
+`read_memory_live_authority_candidate(...)` is request-scoped and read-only, and it
+re-validates: it returns an artifact only when the authoritative validator accepts it
+**and** its embedded conversation / request ids match the requested ones.
 
 ## 16. compatibility_candidate_ready
 
