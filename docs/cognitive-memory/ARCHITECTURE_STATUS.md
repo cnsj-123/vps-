@@ -9,9 +9,9 @@ and the code disagree, the code is correct and this document is wrong.
 
 - Repository source of truth: the tree at the baseline commit below.
 - Baseline: `origin/feature/gateway-v2`
-- Baseline HEAD: `cdf67e54303f121f6be7bde2c7fda6cbfbb0be8a`
-  (merge of PR #5, `trae/unified-memory-delivery-shadow-v0` — Source-Neutral
-  Memory Evidence + Unified Delivery Plan Shadow v0)
+- Baseline HEAD: `5831b93fb04341157027c635e10163f0a1396e30`
+  (merge of PR #6, `trae/memory-authority-migration-shadow-v0` — Memory
+  Authority Migration Shadow v0: current exposure vs control coverage)
 - Audit date context: originally written for the Frontend Memory Arbitration
   Shadow task (branch `trae/frontend-memory-arbitration-shadow-v1`), then
   updated for the Request-local Cognitive Workspace Foundation v0 task
@@ -27,11 +27,16 @@ and the code disagree, the code is correct and this document is wrong.
   as PR #4), then updated for the Source-Neutral Memory Evidence + Unified
   Delivery Plan Shadow v0 task (branch `trae/unified-memory-delivery-shadow-v0`,
   base `2815c934892b7a2ea79b303453e959f6829f0ef1`; merged into
-  `feature/gateway-v2` as PR #5, the current baseline HEAD
+  `feature/gateway-v2` as PR #5, the historical baseline HEAD
   `cdf67e54303f121f6be7bde2c7fda6cbfbb0be8a`), then updated for the Memory
   Authority Migration Shadow v0 task (branch
   `trae/memory-authority-migration-shadow-v0`, base
-  `cdf67e54303f121f6be7bde2c7fda6cbfbb0be8a`).
+  `cdf67e54303f121f6be7bde2c7fda6cbfbb0be8a`; merged into
+  `feature/gateway-v2` as PR #6, the current baseline HEAD
+  `5831b93fb04341157027c635e10163f0a1396e30`), then updated for the Controlled
+  Frontend Direct Channel + Unified Memory Authority Compatibility Candidate
+  Shadow v0 task (branch `trae/frontend-controlled-direct-candidate-v0`, base
+  `5831b93fb04341157027c635e10163f0a1396e30`).
 
 Companion documents:
 
@@ -55,6 +60,15 @@ Companion documents:
   memory exposure of a request against a single-authority control-contract
   coverage. It is a WORKING EXPERIMENT / SHADOW OBSERVATION, not an ADR, not live
   authority and not a frozen specification.
+- **`docs/cognitive-memory/FRONTEND_CONTROLLED_DIRECT_CHANNEL.md`** documents the
+  Frontend Controlled Direct Surface
+  (`frontend-controlled-direct-surface.v1`) and the Unified Memory Authority
+  Compatibility Candidate Shadow v0
+  (`memory-live-authority-candidate-shadow.v1`) — a ZERO-BEHAVIOUR-CHANGE
+  COMPATIBILITY MIGRATION LANE that explicitly authorizes the CURRENT Frontend
+  direct exposure while keeping the model-visible body byte-for-byte identical.
+  It is a WORKING EXPERIMENT / COMPATIBILITY MIGRATION LANE, not an ADR, not live
+  authority and not a frozen specification.
 
 Current experiment status:
 
@@ -74,6 +88,10 @@ Source-Neutral Memory Evidence Adapter
 Unified Memory Delivery Plan Shadow
     ↓
 Memory Authority Migration Shadow
+    ↓
+Frontend Controlled Direct Surface
+    ↓
+Unified Memory Authority Compatibility Candidate Shadow
 ```
 
 The lifecycle comparison **adds comparison evidence only**. It does **not** unify
@@ -100,6 +118,23 @@ The migration experiment is an **observation of readiness only**. Explicitly:
 - **`NOT Frontend direct mouth removed`** — the Frontend attachment mouth is
   observed as an existing baseline and left untouched (§4, §2.27);
 - **`NOT cutover approved`** — `live_cutover_ready` is always `false` in v0 (§2.27).
+
+The compatibility candidate experiment is a **zero-behaviour-change migration
+lane**, not a live cutover. Explicitly:
+
+- **`compatibility candidate exists`** — this is true (§2.28): unified control can
+  explicitly authorize the CURRENT Frontend direct exposure;
+- **`NOT live unified authority exists`** — the Candidate has
+  `authority=candidate_only`, `live_authority=false`, `candidate_applied=false`
+  and changes no forwarded body (the returned bytes remain the already-selected
+  `final_body`);
+- **`NOT Frontend mouth removed`** — every Frontend occurrence is authorized as
+  `preserve_direct_data` (low-level `keep_exact`); nothing is stripped;
+- **`NOT Frontend converted to Flash`** — no Frontend cue / memref / Recall /
+  item identity is introduced; OB control is delegated to the existing OB plane;
+- **`NOT live cutover approved`** — `live_cutover_ready` is always `false` in v0
+  (§2.28), and the candidate body is proven byte-identical to the actual
+  `final_body`.
 
 Everything below is derived by reading the real modules listed next to each
 stage. Where a claim could not be verified from code it is explicitly marked
@@ -926,6 +961,98 @@ request-local evidence, so two concurrent requests on the same conversation cann
 contaminate each other. See
 [MEMORY_AUTHORITY_MIGRATION_SHADOW.md](MEMORY_AUTHORITY_MIGRATION_SHADOW.md).
 
+### 2.28 Frontend Controlled Direct Surface + Unified Memory Authority Compatibility Candidate Shadow (v0)
+
+| Field | Value |
+| --- | --- |
+| Owner | `src/ombrebrain/context/frontend_controlled_direct_surface.py` (`frontend-controlled-direct-surface.v1`) + `src/ombrebrain/context/memory_live_authority_candidate_shadow.py` (`memory-live-authority-candidate-shadow.v1`) (+ read-only reporter `src/ombrebrain/maintenance/memory_live_authority_candidate_report.py`) |
+| Input | THIS request's already-built `workspace.memory_source_evidence` + `workspace.memory_delivery_plan` + `workspace.memory_authority_migration` + the exact `final_body` bytes; the canonical attachment transform in `src/ombrebrain/gateway/canonicalizer.py` |
+| Output | an in-memory-only Frontend Controlled Direct Surface (exact raw attachment envelopes, never persisted / logged) and one privacy-safe, request-scoped Candidate artifact; **no** live effect |
+| Persisted | `memory_live_authority_candidate/{conversation_id}/{cognitive_request_id}.json` (the surface itself is **never** persisted) |
+| Shadow/Live | **SHADOW ONLY / CANDIDATE ONLY**, default OFF |
+| Flag | `OMBRE_GATEWAY_CONTEXT_MEMORY_LIVE_AUTHORITY_CANDIDATE_SHADOW` (requires Migration + Delivery + Source Evidence as upstream evidence; enables NO live memory channel) |
+| Mutates provider request | no |
+| Mutates canonical memory | no |
+| Lifecycle effect | none |
+| Downstream | none for the live request (evidence only); request-local `workspace.frontend_controlled_direct_surface` / `workspace.memory_live_authority_candidate` for THIS request |
+
+It is the **first target-body candidate** this repository allows, and a
+deliberately ultra-narrow one. The Migration Shadow observes the CURRENT Frontend
+path as a **gap** (`gap_frontend_direct_bypass` /
+`controlled_frontend_channel_required`). The Candidate maps that **same occurrence**
+to `preserve_direct_data` → `covered_frontend_controlled_direct_candidate`: the exact
+current Frontend direct exposure **could be controller-owned without changing its
+content**. It does not claim Frontend `direct_data` is the final policy.
+
+Pipeline placement (strictly post-final-body; the returned bytes are byte-identical):
+
+```
+forward_body -> Real Injection -> selected_body
+    -> Live Memory Flash Exposure -> final_body
+        -> Memory Authority Migration Shadow (READ final_body)
+            -> Frontend Controlled Direct Surface (in-memory, built once)
+                -> Unified Memory Authority Compatibility Candidate (READ final_body)
+                    -> return THE ORIGINAL final_body
+```
+
+Artifact contract:
+
+- `mode="shadow_only"`, `authority="candidate_only"`,
+  `strategy="compatibility_preserve_current_frontend_direct.v1"`,
+  `live_authority=false`, `candidate_applied=false`,
+  **`live_cutover_ready=false` always**;
+- `ob_control_strategy="delegate_existing_ob_control_plane"` — OB is delegated to
+  the existing OB control plane; OB unknown stays a gap (`gap_ob_policy_unknown` /
+  `unresolved_ob_policy`), never resolved to `drop`;
+- `candidate_coverage_status` ∈ {`blocked`, `compatibility_covered`} — `blocked`
+  iff `remaining_gap_unit_count > 0`;
+- `compatibility_candidate_ready` is true only when both source planes are
+  available, Source Evidence / Delivery / Migration bindings are valid, every
+  persisted Frontend occurrence has a control row, exact final raw envelope binding
+  succeeds, every Frontend action is `preserve_direct_data`, the candidate body is
+  byte-identical to the final body and `remaining_gap_unit_count == 0`. It does
+  **not** mean live cutover is approved.
+
+Closed candidate mapping (one row → exactly one candidate coverage / handling):
+
+```
+frontend + direct_data -> covered_frontend_controlled_direct_candidate / controlled_direct_passthrough
+ob       + flash_cue   -> covered_ob_existing_cue_contract            / delegated_existing_ob_cue_control
+ob       + drop        -> covered_ob_existing_withhold_contract       / delegated_existing_ob_withhold_control
+ob       + unknown     -> gap_ob_policy_unknown                       / unresolved_ob_policy
+```
+
+Key properties:
+
+- **Exact raw envelope binding** — stricter than Migration: the bound final
+  attachment envelope must equal the source-native raw envelope **in memory**. If
+  the body content is equal but the raw envelope differs, no Candidate is produced
+  (`frontend_exact_envelope_binding_unavailable`).
+- **Byte-identical candidate body** — every v0 action is `keep_exact`, so the
+  rewritten payload deep-equals the decoded final payload and the candidate body is
+  **defined as the original `final_body` bytes** (never re-serialized). A stored
+  artifact proves `candidate_body_sha256 == final_body_sha256`,
+  `candidate_body_bytes == final_body_bytes` and `candidate_body_byte_identical=true`.
+- **Frontend row completeness** — persisted Frontend Delivery / Migration rows must
+  equal the full-scope Frontend unit counts; any hidden Frontend row refuses the
+  Candidate (`frontend_control_rows_incomplete`). Hidden OB rows stay aggregate-only.
+- **No new Frontend identity** — `evidence_ref` stays a request-occurrence
+  reference; no Frontend memref / Recall / Flash / item id is introduced.
+- **Privacy** — only counts, booleans, enums, revisions, sizes and `sha256`
+  digests; no body, raw attachment, memory id, cue, memref or user text. The
+  in-memory surface may hold the exact raw attachment but is never serialized.
+- **Fail-open** — any failure (binding mismatch, incomplete rows, envelope
+  mismatch, transform fault, validator fault, persistence fault) leaves the
+  already-selected `final_body` untouched; the coordinator ignores any body-like
+  value the Candidate code might return.
+
+It is a **candidate with no live authority**: it never calls
+`select_context_injected_body` / `select_live_memory_flash_body`, never re-runs
+retrieval / arbitration / policy / Migration, never reads a conversation-global
+"latest", never removes / gates / rewrites a Frontend attachment, never reinforces a
+memory, and never implements a live selector / rollout / kill switch. See
+[FRONTEND_CONTROLLED_DIRECT_CHANNEL.md](FRONTEND_CONTROLLED_DIRECT_CHANNEL.md).
+
 ---
 
 ## 3. What the cache rewriters do to attachments (relevant to Frontend Memory)
@@ -1226,6 +1353,30 @@ demonstrated correctness / data-integrity / authority violations.
   `selected_body` / `final_body`.
 - No resolution of the still-open Delivery questions A–H; no Lifecycle
   composition; no cross-source conflict / semantic-overlap policy.
+
+### Explicitly NOT done in the Controlled Frontend Direct Channel + Unified Authority Compatibility Candidate Shadow v0 task
+
+- No live cutover and no live unified authority; the Candidate is default OFF,
+  candidate-only, and `live_authority` / `candidate_applied` / `live_cutover_ready`
+  are always `false`.
+- No live unified selector, no live feature flag for authority, no canary /
+  percentage rollout, no live-selector receipt, no kill switch, no rollback
+  contract, no actual Frontend stripping / DROP.
+- No Frontend Flash / cue / memref / Recall / stable item identity; the Frontend
+  attachment mouth stays live and untouched and `evidence_ref` remains a
+  request-occurrence reference only.
+- No OB re-implementation: OB control is delegated to the existing controlled OB
+  plane via `ob_control_strategy=delegate_existing_ob_control_plane`, and OB
+  unknown stays a gap.
+- No semantic dedup / cross-source ranking / LLM arbitration / Frontend↔OB merge;
+  duplicate identical Frontend attachments stay distinct.
+- No retrieval / memory mutation (no touch / reinforce / archive / delete /
+  restore / record_usage / lifecycle write); no provider-body mutation (the
+  returned bytes are the exact `final_body`).
+- No new shared-latest reads; only request-local workspace authority is consumed.
+- No resolution of the still-open Delivery questions A–H; the long-term questions
+  ("when should Frontend become Flash?" / "should some Frontend bundles stay
+  direct?") remain open.
 
 ---
 

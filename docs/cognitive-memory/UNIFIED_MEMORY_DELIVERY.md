@@ -617,6 +617,47 @@ PYTHONPATH=src python -m ombrebrain.maintenance.memory_delivery_report \
 
 ---
 
+## Controlled Frontend compatibility lane now has a candidate design (still NOT live authority)
+
+A follow-on experiment now records that the Frontend `direct_data` gap this plan
+proposes can be **adopted** by unified control **without changing a single byte the
+model sees**:
+
+```
+Unified Memory Delivery Plan Shadow
+    ↓
+Memory Authority Migration Shadow
+    ↓
+Frontend Controlled Direct Surface
+    ↓
+Unified Memory Authority Compatibility Candidate Shadow
+```
+
+The Candidate answers only one bounded question — whether the CURRENT Frontend
+direct exposure could be controller-owned as `preserve_direct_data` while the
+candidate body stays byte-for-byte identical to the actual `final_body`. It is a
+**ZERO-BEHAVIOUR-CHANGE compatibility migration lane**, explicitly:
+
+- **`controlled Frontend compatibility lane now has a candidate design`** — true
+  (see [`FRONTEND_CONTROLLED_DIRECT_CHANNEL.md`](FRONTEND_CONTROLLED_DIRECT_CHANNEL.md)
+  and `ARCHITECTURE_STATUS.md` §2.28);
+- **`NOT live authority`** — `live_authority` / `candidate_applied` /
+  `live_cutover_ready` are always `false`; the plan remains a proposal;
+- **`NOT Frontend converted to Flash`** — no Frontend cue / memref / Recall / item
+  identity; OB is delegated to the existing OB control plane.
+
+Everything below remains **unresolved** (this plan does not answer it):
+
+- when to convert Frontend to Flash;
+- Frontend item identity;
+- Frontend Recall;
+- semantic overlap policy;
+- cross-source priority / conflicts;
+- Lifecycle composition;
+- live rollout / kill switch.
+
+---
+
 ## Explicit non-goals of this experiment
 
 Not implemented, and must not be read into this work:
