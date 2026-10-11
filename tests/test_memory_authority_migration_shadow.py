@@ -26,8 +26,10 @@ from ombrebrain.context.memory_authority_migration_shadow import (
     COVERAGE_OB_CUE,
     COVERAGE_OB_UNKNOWN,
     COVERAGE_OB_WITHHOLD,
+    REASON_EVIDENCE_MISMATCH,
     REASON_GAPS_PRESENT,
     REASON_NO_RENDERER,
+    REASON_SOURCE_UNAVAILABLE,
     REQ_FRONTEND_CHANNEL,
     REQ_NONE,
     REQ_POLICY_RESOLUTION,
@@ -148,6 +150,33 @@ def _snap(units, *, rid=RID, revision=REV):
         source_unified_revision=revision,
         frontend_observation_available=True,
         ob_observation_available=True,
+        units=tuple(units),
+    )
+
+
+def _snap_avail(
+    units,
+    *,
+    frontend_available=True,
+    ob_available=True,
+    rid=RID,
+    revision=REV,
+):
+    """A snapshot with EXPLICIT source availability bits.
+
+    ``AVAILABLE + zero units`` and ``UNAVAILABLE`` are different states
+    and must stay distinguishable.
+    """
+
+    return MemorySourceEvidenceSnapshot(
+        version=evidence._VERSION,
+        conversation_id=CID,
+        cognitive_request_id=rid,
+        source_unified_revision=revision,
+        frontend_observation_available=(
+            frontend_available
+        ),
+        ob_observation_available=ob_available,
         units=tuple(units),
     )
 
@@ -1260,6 +1289,669 @@ class PrivacyTests(unittest.TestCase):
 
         self.assertNotIn("ctx_", logs)
         self.assertNotIn("ctxreq_", logs)
+
+
+class SourceAvailabilityTests(unittest.TestCase):
+    """AVAILABLE + zero units stays valid EMPTY evidence; UNAVAILABLE
+    never silently becomes EMPTY / COVERED, and the Delivery Plan must
+    describe exactly the same source occurrence pool."""
+
+    def test_available_zero_frontend_is_valid_empty(self):
+        empty = _frontend_body()
+
+        snap = _snap_avail([])
+
+        with tempfile.TemporaryDirectory() as root:
+            report = _run(
+                root,
+                snap=snap,
+                plan=_plan(snap),
+                pre_live=empty,
+                final=empty,
+            )
+
+        self.assertTrue(report["stored"])
+
+        artifact = report["artifact"]
+
+        self.assertTrue(
+            artifact[
+                "frontend_final_observation_available"
+            ]
+        )
+        self.assertTrue(
+            artifact["frontend_final_presence_verified"]
+        )
+        self.assertEqual(
+            artifact["metrics"]["unit_count"], 0
+        )
+        self.assertEqual(
+            artifact["contract_coverage_status"],
+            STATUS_COVERED,
+        )
+
+    def test_unavailable_frontend_is_no_record(self):
+        snap = _snap_avail(
+            [], frontend_available=False
+        )
+
+        with tempfile.TemporaryDirectory() as root:
+            report = _run(
+                root,
+                snap=snap,
+                plan=_plan(snap),
+                pre_live=_frontend_body(),
+                final=_frontend_body(),
+            )
+
+            self.assertFalse(
+                _migration_dir(root).exists()
+            )
+
+        self.assertFalse(report["stored"])
+        self.assertEqual(
+            report["reason"],
+            REASON_SOURCE_UNAVAILABLE,
+        )
+
+    def test_unavailable_ob_is_never_covered(self):
+        snap = _snap_avail([], ob_available=False)
+
+        with tempfile.TemporaryDirectory() as root:
+            report = _run(
+                root,
+                snap=snap,
+                plan=_plan(snap),
+                pre_live=_frontend_body(),
+                final=_frontend_body(),
+            )
+
+            self.assertFalse(
+                _migration_dir(root).exists()
+            )
+
+        self.assertFalse(report["stored"])
+        self.assertEqual(
+            report["reason"],
+            REASON_SOURCE_UNAVAILABLE,
+        )
+        # UNAVAILABLE must never become a covered readiness claim.
+        self.assertNotEqual(
+            report.get("contract_coverage_status"),
+            STATUS_COVERED,
+        )
+
+    def test_snapshot_and_delivery_availability_disagree(
+        self,
+    ):
+        empty = _frontend_body()
+
+        snap = _snap_avail([])
+
+        # Same request identity, but the Delivery Plan observed the OB
+        # plane as UNAVAILABLE: the two availability views disagree.
+        plan = _plan(
+            _snap_avail([], ob_available=False)
+        )
+
+        with tempfile.TemporaryDirectory() as root:
+            report = _run(
+                root,
+                snap=snap,
+                plan=plan,
+                pre_live=empty,
+                final=empty,
+            )
+
+        self.assertFalse(report["stored"])
+        self.assertEqual(
+            report["reason"],
+            REASON_SOURCE_UNAVAILABLE,
+        )
+
+    def test_source_pool_count_mismatch_is_refused(self):
+        m1 = _memory("m1", "OB-A")
+        m2 = _memory("m2", "OB-B")
+
+        snap = _snap_avail(_ob_units([m1, m2]))
+
+        # Two OB units in the snapshot, one in the Delivery Plan.
+        plan = _plan(_snap_avail(_ob_units([m1])))
+
+        with tempfile.TemporaryDirectory() as root:
+            report = _run(
+                root,
+                snap=snap,
+                plan=plan,
+                pre_live=_frontend_body(),
+                final=_frontend_body(),
+            )
+
+        self.assertFalse(report["stored"])
+        self.assertEqual(
+            report["reason"],
+            REASON_EVIDENCE_MISMATCH,
+        )
+
+    def test_total_unit_count_mismatch_is_refused(self):
+        body = _frontend_body("MEM-A")
+
+        frontend_units = _frontend_units_from(body)
+
+        m1 = _memory("m1", "OB-A")
+
+        snap = _snap_avail(
+            frontend_units + _ob_units([m1])
+        )
+
+        # The Frontend split agrees but the full total does not.
+        plan = _plan(_snap_avail(frontend_units))
+
+        with tempfile.TemporaryDirectory() as root:
+            report = _run(
+                root,
+                snap=snap,
+                plan=plan,
+                pre_live=body,
+                final=body,
+            )
+
+        self.assertFalse(report["stored"])
+        self.assertEqual(
+            report["reason"],
+            REASON_EVIDENCE_MISMATCH,
+        )
+
+
+class ObservationOnceTests(unittest.TestCase):
+    """Real request facts are observed EXACTLY ONCE; the builder is pure
+    over the precomputed observations."""
+
+    def _spy_run(
+        self,
+        root,
+        *,
+        snap,
+        plan,
+        pre_live,
+        final,
+        receipt=None,
+    ):
+        real_canonicalize = migration._canonicalize
+
+        counter = {"canonicalize": 0}
+
+        def spy_canonicalize(body):
+            counter["canonicalize"] += 1
+            return real_canonicalize(body)
+
+        with patch.dict(
+            os.environ,
+            {"OMBRE_CONTEXT_STATE_DIR": str(root)},
+            clear=False,
+        ), patch.object(
+            migration,
+            "_canonicalize",
+            side_effect=spy_canonicalize,
+        ), patch.object(
+            migration,
+            "read_live_memory_exposure",
+            return_value=receipt,
+        ) as read_mock:
+            report = update_memory_authority_migration(
+                conversation_id=CID,
+                cognitive_request_id=RID,
+                source_evidence_snapshot=snap,
+                delivery_plan=plan,
+                source_unified_revision=REV,
+                pre_live_body=pre_live,
+                final_body=final,
+            )
+
+        return report, counter["canonicalize"], read_mock
+
+    def test_final_canonicalized_once_and_no_receipt_when_unchanged(
+        self,
+    ):
+        body = _frontend_body("MEM-A")
+
+        snap = _snap(_frontend_units_from(body))
+
+        with tempfile.TemporaryDirectory() as root:
+            report, canonicalize, read_mock = (
+                self._spy_run(
+                    root,
+                    snap=snap,
+                    plan=_plan(snap),
+                    pre_live=body,
+                    final=body,
+                )
+            )
+
+        self.assertTrue(report["stored"])
+        self.assertEqual(canonicalize, 1)
+        self.assertEqual(read_mock.call_count, 0)
+
+    def test_receipt_read_once_when_body_changed(self):
+        pre_live = _frontend_body("MEM-A")
+        final = _frontend_body_with_lead(
+            "cue", "MEM-A"
+        )
+
+        snap = _snap(_frontend_units_from(final))
+
+        with tempfile.TemporaryDirectory() as root:
+            report, canonicalize, read_mock = (
+                self._spy_run(
+                    root,
+                    snap=snap,
+                    plan=_plan(snap),
+                    pre_live=pre_live,
+                    final=final,
+                    receipt=_receipt(pre_live, final),
+                )
+            )
+
+        self.assertTrue(report["stored"])
+        self.assertEqual(canonicalize, 1)
+        self.assertEqual(read_mock.call_count, 1)
+
+    def test_builder_is_pure_over_precomputed_observations(
+        self,
+    ):
+        body = _frontend_body("MEM-A")
+
+        snap = _snap(_frontend_units_from(body))
+
+        plan = _plan(snap)
+
+        frontend_observation = (
+            observe_frontend_final_presence(body, snap)
+        )
+
+        live_observation = (
+            migration.observe_actual_ob_live_exposure(
+                conversation_id=CID,
+                cognitive_request_id=RID,
+                pre_live_body=body,
+                final_body=body,
+            )
+        )
+
+        live_ok, live_fact = live_observation
+
+        self.assertTrue(live_ok)
+
+        with patch.object(
+            migration,
+            "_canonicalize",
+            side_effect=AssertionError(
+                "builder canonicalized the body"
+            ),
+        ), patch.object(
+            migration,
+            "read_live_memory_exposure",
+            side_effect=AssertionError(
+                "builder read a receipt"
+            ),
+        ):
+            artifact = (
+                build_memory_authority_migration_artifact(
+                    conversation_id=CID,
+                    cognitive_request_id=RID,
+                    source_unified_revision=REV,
+                    delivery_plan=plan,
+                    frontend_observation=(
+                        frontend_observation
+                    ),
+                    live_exposure_observation=(
+                        live_fact
+                    ),
+                    pre_live_body=body,
+                    final_body=body,
+                )
+            )
+
+        self.assertTrue(
+            is_valid_memory_authority_migration_artifact(
+                artifact
+            )
+        )
+
+
+class DuplicatedFactForgeryTests(unittest.TestCase):
+    """A duplicated exposure fact that disagrees invalidates the WHOLE
+    artifact."""
+
+    def _valid(self):
+        body = _frontend_body("MEM-A")
+
+        snap = _snap(_frontend_units_from(body))
+
+        with tempfile.TemporaryDirectory() as root:
+            report = _run(
+                root,
+                snap=snap,
+                plan=_plan(snap),
+                pre_live=body,
+                final=body,
+            )
+
+        return report["artifact"]
+
+    def test_metric_live_exposed_count_disagreement_is_rejected(
+        self,
+    ):
+        artifact = self._valid()
+
+        artifact["metrics"][
+            "actual_ob_live_exposed_count"
+        ] += 1
+
+        self.assertFalse(
+            is_valid_memory_authority_migration_artifact(
+                artifact
+            )
+        )
+
+    def test_current_exposure_live_count_disagreement_is_rejected(
+        self,
+    ):
+        artifact = self._valid()
+
+        artifact["current_exposure"][
+            "actual_ob_live_exposed_count"
+        ] += 1
+
+        self.assertFalse(
+            is_valid_memory_authority_migration_artifact(
+                artifact
+            )
+        )
+
+    def test_metric_frontend_token_disagreement_is_rejected(
+        self,
+    ):
+        artifact = self._valid()
+
+        artifact["metrics"][
+            "frontend_direct_model_visible"
+            "_estimated_tokens"
+        ] += 1
+
+        self.assertFalse(
+            is_valid_memory_authority_migration_artifact(
+                artifact
+            )
+        )
+
+    def test_forged_dual_mouth_active_is_rejected(self):
+        artifact = self._valid()
+
+        self.assertFalse(
+            artifact["ob_live_cue_mouth_active"]
+        )
+
+        artifact["dual_mouth_active"] = True
+
+        self.assertFalse(
+            is_valid_memory_authority_migration_artifact(
+                artifact
+            )
+        )
+
+
+class TruncationInvariantTests(unittest.TestCase):
+    """Migration rows mirror ONLY persisted Delivery rows, so the full
+    ``unit_count`` is EXACTLY persisted rows + source truncation."""
+
+    def _artifact(self, root, count):
+        units = _ob_units(
+            [
+                _memory(
+                    "m%d" % index,
+                    "OB-CONTENT-%d" % index,
+                )
+                for index in range(count)
+            ]
+        )
+
+        snap = _snap(units)
+
+        empty = _frontend_body()
+
+        report = _run(
+            root,
+            snap=snap,
+            plan=_plan(snap, policy=None),
+            pre_live=empty,
+            final=empty,
+        )
+
+        self.assertTrue(report["stored"])
+
+        return report["artifact"]
+
+    def test_exact_untruncated_identity(self):
+        with tempfile.TemporaryDirectory() as root:
+            artifact = self._artifact(root, 64)
+
+        self.assertFalse(
+            artifact["source_rows_truncated"]
+        )
+        self.assertEqual(
+            artifact["source_rows_truncated_count"], 0
+        )
+        self.assertEqual(len(artifact["rows"]), 64)
+        self.assertEqual(
+            artifact["metrics"]["unit_count"], 64
+        )
+        self.assertTrue(
+            is_valid_memory_authority_migration_artifact(
+                artifact
+            )
+        )
+
+    def test_exact_truncated_identity_64_70_6(self):
+        with tempfile.TemporaryDirectory() as root:
+            artifact = self._artifact(root, 70)
+
+        self.assertTrue(
+            artifact["source_rows_truncated"]
+        )
+        self.assertEqual(
+            artifact["source_rows_truncated_count"], 6
+        )
+        self.assertEqual(len(artifact["rows"]), 64)
+        self.assertEqual(
+            artifact["metrics"]["unit_count"], 70
+        )
+        self.assertTrue(
+            is_valid_memory_authority_migration_artifact(
+                artifact
+            )
+        )
+
+    def test_truncated_count_disagreement_is_rejected(self):
+        with tempfile.TemporaryDirectory() as root:
+            artifact = self._artifact(root, 70)
+
+        artifact["source_rows_truncated_count"] = 5
+
+        self.assertFalse(
+            is_valid_memory_authority_migration_artifact(
+                artifact
+            )
+        )
+
+    def test_claimed_total_beyond_truncation_is_rejected(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as root:
+            artifact = self._artifact(root, 70)
+
+        artifact["metrics"]["unit_count"] = 71
+
+        self.assertFalse(
+            is_valid_memory_authority_migration_artifact(
+                artifact
+            )
+        )
+
+    def test_truncation_flag_contradiction_is_rejected(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as root:
+            artifact = self._artifact(root, 70)
+
+        artifact["source_rows_truncated"] = False
+
+        self.assertFalse(
+            is_valid_memory_authority_migration_artifact(
+                artifact
+            )
+        )
+
+
+class RowContractForgeryTests(unittest.TestCase):
+    """The migration row is closed against the upstream Delivery
+    contract; no field may be weakened after copying."""
+
+    def _valid(self):
+        body = _frontend_body("MEM-A")
+
+        snap = _snap(_frontend_units_from(body))
+
+        with tempfile.TemporaryDirectory() as root:
+            report = _run(
+                root,
+                snap=snap,
+                plan=_plan(snap),
+                pre_live=body,
+                final=body,
+            )
+
+        return report["artifact"]
+
+    def _assert_rejected(self, mutate):
+        artifact = self._valid()
+        mutate(artifact["rows"][0])
+
+        self.assertFalse(
+            is_valid_memory_authority_migration_artifact(
+                artifact
+            )
+        )
+
+    def test_wrong_kind_is_rejected(self):
+        self._assert_rejected(
+            lambda row: row.__setitem__(
+                "kind", "ob_candidate"
+            )
+        )
+
+    def test_wrong_full_access_mode_is_rejected(self):
+        self._assert_rejected(
+            lambda row: row.__setitem__(
+                "current_full_content_access_mode",
+                "none",
+            )
+        )
+
+    def test_wrong_scope_is_rejected(self):
+        self._assert_rejected(
+            lambda row: row.__setitem__(
+                "source_scope", "retrieval"
+            )
+        )
+
+    def test_wrong_visibility_is_rejected(self):
+        self._assert_rejected(
+            lambda row: row.__setitem__(
+                "currently_model_visible", False
+            )
+        )
+
+    def test_wrong_delivery_mode_is_rejected(self):
+        self._assert_rejected(
+            lambda row: row.__setitem__(
+                "current_delivery_mode", "drop"
+            )
+        )
+
+
+class EvidenceRefForgeryTests(unittest.TestCase):
+    """A valid-looking 64-hex string must not become trusted occurrence
+    provenance: the ref is recomputed from the row's own fields."""
+
+    def _two_row(self):
+        body = _frontend_body("MEM-A")
+
+        snap = _snap(
+            _frontend_units_from(body)
+            + _ob_units([_memory("m1", "OB-A")])
+        )
+
+        with tempfile.TemporaryDirectory() as root:
+            report = _run(
+                root,
+                snap=snap,
+                plan=_plan(snap, policy=None),
+                pre_live=body,
+                final=body,
+            )
+
+        artifact = report["artifact"]
+
+        self.assertEqual(len(artifact["rows"]), 2)
+
+        return artifact
+
+    def test_random_evidence_ref_is_rejected(self):
+        artifact = self._two_row()
+
+        artifact["rows"][0]["evidence_ref"] = "a" * 64
+
+        self.assertFalse(
+            is_valid_memory_authority_migration_artifact(
+                artifact
+            )
+        )
+
+    def test_swapped_evidence_refs_are_rejected(self):
+        artifact = self._two_row()
+
+        self.assertNotEqual(
+            artifact["rows"][0]["evidence_ref"],
+            artifact["rows"][1]["evidence_ref"],
+        )
+
+        (
+            artifact["rows"][0]["evidence_ref"],
+            artifact["rows"][1]["evidence_ref"],
+        ) = (
+            artifact["rows"][1]["evidence_ref"],
+            artifact["rows"][0]["evidence_ref"],
+        )
+
+        self.assertFalse(
+            is_valid_memory_authority_migration_artifact(
+                artifact
+            )
+        )
+
+    def test_changed_content_digest_without_ref_is_rejected(
+        self,
+    ):
+        artifact = self._two_row()
+
+        artifact["rows"][0]["content_digest"] = "b" * 64
+
+        self.assertFalse(
+            is_valid_memory_authority_migration_artifact(
+                artifact
+            )
+        )
 
 
 class StaticSafetyTests(unittest.TestCase):
