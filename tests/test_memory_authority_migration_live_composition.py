@@ -20,6 +20,9 @@ from ombrebrain.context.memory_flash_live_exposure import (
     is_valid_live_exposure_artifact,
     read_live_memory_exposure,
 )
+from ombrebrain.context.memory_recall_surface import (
+    resolve_recall_ref,
+)
 from ombrebrain.context.unified_context_candidate import (
     bind_context_service,
 )
@@ -415,19 +418,30 @@ class RealFlashSurfaceLiveExposureMigrationTests(
     async def _dual_mouth_run(self):
         forward_body = _body(attachment=True)
 
-        self.bind(
-            [_memory("m1", _SENTINEL_LIVE_CUE)]
+        # The sentinel is the ACTUAL raw OB memory id of the real
+        # source candidate, so the downstream privacy assertions are
+        # not vacuous. The exact fixture object is retained and bound.
+        memory_fixture = _memory(
+            _SENTINEL_MEMID,
+            _SENTINEL_LIVE_CUE,
         )
+
+        self.bind([memory_fixture])
 
         selection = await self._run(
             forward_body, dict(self._FLAGS)
         )
 
-        return forward_body, selection
+        return forward_body, selection, memory_fixture
 
     async def test_real_dual_mouth_composition(self):
-        forward_body, selection = (
+        forward_body, selection, memory_fixture = (
             await self._dual_mouth_run()
+        )
+
+        # Positive proof the sentinel really is the source memory id.
+        self.assertEqual(
+            memory_fixture["id"], _SENTINEL_MEMID
         )
 
         self.assertNotEqual(
@@ -497,8 +511,30 @@ class RealFlashSurfaceLiveExposureMigrationTests(
     async def test_real_migration_evidence_leaks_no_live_cue_or_memref(
         self,
     ):
-        forward_body, selection = (
+        forward_body, selection, memory_fixture = (
             await self._dual_mouth_run()
+        )
+
+        # POSITIVE PROOF #1: the retained source fixture really carries
+        # the sentinel as its raw OB memory id.
+        self.assertEqual(
+            memory_fixture["id"], _SENTINEL_MEMID
+        )
+
+        # POSITIVE PROOF #2: the REAL candidate that the coordinator
+        # retrieved is the SAME object, so the sentinel genuinely
+        # entered the request-local source path.
+        bound = (
+            unified_module._CONTEXT_SERVICE
+            .get_candidates.return_value
+        )
+
+        self.assertIs(
+            bound["memories"][0], memory_fixture
+        )
+        self.assertEqual(
+            bound["memories"][0]["id"],
+            _SENTINEL_MEMID,
         )
 
         receipt = read_live_memory_exposure(
@@ -515,6 +551,23 @@ class RealFlashSurfaceLiveExposureMigrationTests(
         self.assertTrue(memrefs)
 
         memref = memrefs[0]
+
+        # POSITIVE PROOF #3: the REAL generated memref that reached the
+        # live body resolves back to exactly the sentinel raw memory id
+        # in THIS request's Recall Surface. This ties the sentinel to
+        # the actual live channel before any privacy boundary.
+        self.assertEqual(
+            resolve_recall_ref(
+                conversation_id=(
+                    selection.conversation_id
+                ),
+                cognitive_request_id=(
+                    selection.cognitive_request_id
+                ),
+                memref=memref,
+            ),
+            _SENTINEL_MEMID,
+        )
 
         # The real cue / memref DO exist in the live model-facing body
         # (that is the intentional existing channel).
