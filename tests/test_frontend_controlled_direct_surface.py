@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 import unittest
 from unittest.mock import patch
 
+from ombrebrain.context import (
+    frontend_controlled_direct_surface as surface_module,
+)
 from ombrebrain.context import (
     memory_delivery_shadow as delivery,
 )
@@ -12,15 +16,19 @@ from ombrebrain.context import (
 )
 from ombrebrain.context.frontend_controlled_direct_surface import (
     ACTION_PRESERVE_DIRECT_DATA,
+    REASON_BUILD_FAILED,
     REASON_DELIVERY_NOT_BOUND,
     REASON_ENVELOPE_UNAVAILABLE,
     REASON_EVIDENCE_NOT_BOUND,
+    REASON_INVALID_CONVERSATION,
+    REASON_INVALID_REQUEST,
     REASON_INVALID_REVISION,
     REASON_MIGRATION_NOT_BOUND,
     REASON_ROWS_INCOMPLETE,
     REASON_ROW_BINDING_UNAVAILABLE,
     REASON_SOURCE_UNAVAILABLE,
     VERSION,
+    FrontendControlledDirectUnit,
     build_frontend_controlled_direct_surface,
     migration_bound_to_request,
     surface_bound_to_request,
@@ -445,6 +453,206 @@ class FrontendControlledDirectSurfaceTests(
         self.assertEqual(
             result.reason, REASON_EVIDENCE_NOT_BOUND
         )
+
+
+class FrontendControlledDirectContractHardeningTests(
+    unittest.TestCase,
+):
+    """Contract hardening for the closed v0 controlled surface."""
+
+    def test_invalid_conversation_is_refused(self) -> None:
+        snap, plan, migration, _ = _triple("x")
+
+        result = _build(
+            snap, plan, migration, cid="not-a-conversation"
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(
+            result.reason, REASON_INVALID_CONVERSATION
+        )
+
+    def test_invalid_request_is_refused(self) -> None:
+        snap, plan, migration, _ = _triple("x")
+
+        result = _build(
+            snap, plan, migration, rid="not-a-request"
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(
+            result.reason, REASON_INVALID_REQUEST
+        )
+
+    def test_unavailable_frontend_plane_is_refused(
+        self,
+    ) -> None:
+        body = _frontend_body("x")
+        units = _frontend_units_from(body)
+
+        snap = _snap(units, frontend=False)
+        plan = _plan(_snap(units, frontend=True))
+        migration = _migration(plan, body)
+
+        result = _build(snap, plan, migration)
+
+        self.assertFalse(result.ok)
+        self.assertEqual(
+            result.reason, REASON_SOURCE_UNAVAILABLE
+        )
+        self.assertIsNone(result.surface)
+
+    def test_build_fault_fails_closed(self) -> None:
+        snap, plan, migration, _ = _triple("x")
+
+        with patch.object(
+            surface_module,
+            "evidence_ref_for_fields",
+            side_effect=RuntimeError("boom"),
+        ):
+            result = _build(snap, plan, migration)
+
+        self.assertFalse(result.ok)
+        self.assertEqual(
+            result.reason, REASON_BUILD_FAILED
+        )
+        self.assertIsNone(result.surface)
+
+    def test_migration_binding_rejects_non_shadow_variants(
+        self,
+    ) -> None:
+        _, _, migration, _ = _triple("x")
+
+        self.assertTrue(
+            migration_bound_to_request(
+                migration,
+                conversation_id=CID,
+                cognitive_request_id=RID,
+                source_unified_revision=REV,
+            )
+        )
+
+        tampering = (
+            ("live_authority", True),
+            ("mode", "live"),
+            ("authority", "live_authority"),
+            ("live_cutover_ready", True),
+            (
+                "frontend_final_observation_available",
+                False,
+            ),
+            ("frontend_final_presence_verified", False),
+            ("conversation_id", "ctx_ffffffffffffffff"),
+            ("cognitive_request_id", "ctxreq_" + "b" * 32),
+            ("source_unified_revision", REV + 1),
+        )
+
+        for field, value in tampering:
+            tampered = dict(migration)
+            tampered[field] = value
+
+            self.assertFalse(
+                migration_bound_to_request(
+                    tampered,
+                    conversation_id=CID,
+                    cognitive_request_id=RID,
+                    source_unified_revision=REV,
+                ),
+                "unbound: %s" % field,
+            )
+
+    def test_surface_binding_rejects_foreign_and_malformed(
+        self,
+    ) -> None:
+        snap, plan, migration, _ = _triple("x")
+
+        surface = _build(
+            snap, plan, migration
+        ).surface
+
+        self.assertFalse(
+            surface_bound_to_request(
+                {},
+                conversation_id=CID,
+                cognitive_request_id=RID,
+                source_unified_revision=REV,
+            )
+        )
+
+        self.assertFalse(
+            surface_bound_to_request(
+                dataclasses.replace(
+                    surface,
+                    conversation_id="ctx_ffffffffffffffff",
+                ),
+                conversation_id=CID,
+                cognitive_request_id=RID,
+                source_unified_revision=REV,
+            )
+        )
+
+        self.assertFalse(
+            surface_bound_to_request(
+                dataclasses.replace(
+                    surface,
+                    version="frontend-controlled-direct-surface.v2",
+                ),
+                conversation_id=CID,
+                cognitive_request_id=RID,
+                source_unified_revision=REV,
+            )
+        )
+
+    def test_native_envelope_is_compare_and_repr_excluded(
+        self,
+    ) -> None:
+        left = FrontendControlledDirectUnit(
+            evidence_ref="e" * 64,
+            source_occurrence=0,
+            source_scope="current",
+            content_digest="d" * 64,
+            model_visible_chars=1,
+            model_visible_estimated_tokens=1,
+            native_raw_attachment="RAW-ENVELOPE-A",
+        )
+
+        right = FrontendControlledDirectUnit(
+            evidence_ref="e" * 64,
+            source_occurrence=0,
+            source_scope="current",
+            content_digest="d" * 64,
+            model_visible_chars=1,
+            model_visible_estimated_tokens=1,
+            native_raw_attachment="RAW-ENVELOPE-B",
+        )
+
+        # ``native_raw_attachment`` is compare=False: the raw envelope is
+        # never part of equality / hashing, so it can never leak through
+        # a structural identity check.
+        self.assertEqual(left, right)
+        self.assertNotIn("RAW-ENVELOPE", repr(left))
+
+    def test_high_level_action_enum_is_preserve_only(
+        self,
+    ) -> None:
+        self.assertEqual(
+            ACTION_PRESERVE_DIRECT_DATA,
+            "preserve_direct_data",
+        )
+
+        # The high-level v0 surface policy exposes NO flash / recall /
+        # drop / summarize action.
+        for forbidden in (
+            "ACTION_FLASH",
+            "ACTION_RECALL",
+            "ACTION_DROP",
+            "ACTION_SUMMARIZE",
+            "ACTION_WITHHOLD",
+        ):
+            self.assertFalse(
+                hasattr(surface_module, forbidden),
+                forbidden,
+            )
 
 
 if __name__ == "__main__":
