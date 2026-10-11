@@ -1079,6 +1079,96 @@ def _valid_ob_row(row: dict) -> bool:
     return False
 
 
+def _closed_channel_metrics_ok(
+    artifact: dict[str, Any],
+    metrics: dict[str, Any],
+) -> bool:
+    """The closed-v0 source/channel identities a FULL plan must satisfy.
+
+    These follow from the source-specific row contract and hold even when
+    hidden rows were truncated, because the reported metrics are
+    FULL-scope: every Frontend row is direct_data + already_present +
+    currently_model_visible and never a cue / drop; every OB row is
+    flash_cue / drop / unknown and never direct_data and never currently
+    model-visible. A forged hidden count that would require a row shape
+    the source contract forbids is therefore rejected as a whole.
+    """
+
+    frontend = metrics["frontend_unit_count"]
+    ob = metrics["ob_unit_count"]
+
+    # A source that is NOT observation-available contributes no rows at
+    # all -- availability is never silently turned into forged hidden
+    # counts.
+    if not artifact["frontend_observation_available"]:
+        for name in (
+            "frontend_unit_count",
+            "frontend_direct_data_count",
+            "current_model_visible_count",
+            "full_content_already_present_count",
+        ):
+            if metrics[name] != 0:
+                return False
+
+    if not artifact["ob_observation_available"]:
+        for name in (
+            "ob_unit_count",
+            "ob_flash_cue_count",
+            "ob_drop_count",
+            "ob_unknown_count",
+            "base_policy_available_ob_count",
+            "base_policy_unavailable_ob_count",
+            "full_content_recall_required_count",
+        ):
+            if metrics[name] != 0:
+                return False
+
+    # Closed-channel identities: the Frontend side is fully direct-data,
+    # the OB side is exactly cue + drop + unknown.
+    if not (
+        metrics["direct_data_count"]
+        == frontend
+        == metrics["frontend_direct_data_count"]
+        == metrics["current_model_visible_count"]
+        == metrics["full_content_already_present_count"]
+    ):
+        return False
+
+    if ob != (
+        metrics["ob_flash_cue_count"]
+        + metrics["ob_drop_count"]
+        + metrics["ob_unknown_count"]
+    ):
+        return False
+
+    if metrics["flash_cue_count"] != (
+        metrics["ob_flash_cue_count"]
+    ):
+        return False
+
+    if metrics["drop_count"] != metrics["ob_drop_count"]:
+        return False
+
+    if metrics["unknown_count"] != (
+        metrics["ob_unknown_count"]
+    ):
+        return False
+
+    if metrics["full_content_recall_required_count"] != (
+        metrics["ob_flash_cue_count"]
+    ):
+        return False
+
+    if (
+        metrics["base_policy_available_ob_count"]
+        + metrics["base_policy_unavailable_ob_count"]
+        != ob
+    ):
+        return False
+
+    return True
+
+
 def is_valid_memory_delivery_plan_artifact(
     artifact: Any,
 ) -> bool:
@@ -1238,6 +1328,12 @@ def is_valid_memory_delivery_plan_artifact(
     for name in observed:
         if not _is_nonneg_int(metrics.get(name)):
             return False
+
+    # The closed-v0 source/channel identities hold for the FULL plan even
+    # when hidden rows were truncated, so a forged hidden count that the
+    # source contract forbids is rejected here.
+    if not _closed_channel_metrics_ok(artifact, metrics):
+        return False
 
     if metrics["persisted_unit_count"] != len(rows):
         return False

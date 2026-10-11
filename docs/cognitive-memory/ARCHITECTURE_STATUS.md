@@ -759,6 +759,11 @@ The coordinator builds the snapshot **exactly once** per request and shares it
 between the Arbitration observer and the Delivery Shadow, so the forwarded body
 is canonicalized and the OB side is bound a single time.
 
+The snapshot describes the **complete** source set for the request: v0 applies
+**no silent evidence cap**. Only the *persisted Delivery artifact* is bounded
+(`MAX_DELIVERY_ROWS`) with explicit truncation telemetry, and its aggregate
+metrics are full-plan scope (§2.26).
+
 ### 2.26 Unified Memory Delivery Plan Shadow (v0)
 
 | Field | Value |
@@ -802,6 +807,15 @@ Recall, never reinforces, never writes a memory and never changes the forwarded
 body. It never evaluates the Surfacing Policy itself; the base policy is passed
 in already computed. Lifecycle is intentionally excluded from v0 (see
 [UNIFIED_MEMORY_DELIVERY.md](UNIFIED_MEMORY_DELIVERY.md) §15).
+
+Bounded persisted rows, full-scope metrics: `rows` is capped at
+`MAX_DELIVERY_ROWS` (explicit `rows_truncated` / `rows_truncated_count`
+telemetry), while `metrics` is computed from the **complete** request plan
+before the cap, so `unit_count == persisted_unit_count + truncated_unit_count`
+and the source / channel algebra holds at full-plan scope. The single
+authoritative validator also enforces the closed-v0 source / channel identities
+even when hidden rows were truncated (see
+[UNIFIED_MEMORY_DELIVERY.md](UNIFIED_MEMORY_DELIVERY.md) §18a).
 
 Fail-open: a delivery fault is *missing delivery data* and nothing else.
 

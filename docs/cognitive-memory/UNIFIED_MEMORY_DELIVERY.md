@@ -81,6 +81,7 @@ Two vocabularies must never be conflated:
 - **Source-neutral** — the small **control** vocabulary the consumers agree on:
   `source`, `kind`, `granularity`, `source_scope`, `content_digest`,
   `normalized_digest`, `content_chars`, `content_estimated_tokens`,
+  `model_visible_chars`, `model_visible_estimated_tokens`,
   `currently_model_visible`, `retrieved`, `request_occurrence`.
 
 The adapter (contract `memory-source-evidence.v1`) normalizes **only** the
@@ -89,6 +90,23 @@ control metadata. It keeps the real source object as an in-memory-only
 source object rather than reparse it. It never calls that payload a universal
 "memory". `native_payload` is excluded from `repr`, is not serializable, and is
 never persisted or logged.
+
+Two size concepts are kept strictly separate and are never collapsed:
+
+- `content_chars` / `content_estimated_tokens` measure the extractable **body**
+  content, so they stay comparable across sources.
+- `model_visible_chars` / `model_visible_estimated_tokens` measure the text the
+  provider request **actually carries right now**:
+  - **Frontend:** `content_*` is the attachment **inner body**;
+    `model_visible_*` is the **exact canonical raw attachment envelope**
+    (metadata + body), which is genuinely in the live request.
+  - **OB:** `content_*` is the candidate content; `model_visible_*` is
+    **exactly `0`** because OB content is not in the live request before a cue /
+    Recall (only a bounded cue or an explicit Recall may expose it later).
+
+Only the numeric footprint leaves the request-local snapshot. The **raw
+envelope itself is never persisted**, never logged and never model-facing in a
+new way — it already exists in the request; the adapter only measures it.
 
 ## 4. Frontend attachment granularity
 
@@ -128,7 +146,13 @@ Hard rules:
   / the request body / a cache key / a header, and is never model-visible.
 - **Not JSON-serializable** by construction (`native_payload` references carry
   real source content).
-- **Bounded** to `MAX_EVIDENCE_UNITS = 512` against an unbounded caller pool.
+- **No silent truncation.** v0 does **not** slice the source evidence pool:
+  the snapshot describes the **complete** source set for the request, so no
+  downstream consumer can believe it observed everything while a hidden cap
+  quietly dropped units. (The previous `MAX_EVIDENCE_UNITS = 512` line has been
+  removed; the code intentionally applies no such cap. The OB Unified memories
+  are already tightly bounded upstream, and the **persisted Delivery artifact**
+  carries its own explicit hard cap — see §18 and the aggregate reporter below.)
 - **Binding is strict**: `is_bound_to_request(snapshot, conversation_id=...,
   cognitive_request_id=..., expected_unified_revision=...)`. A foreign /
   mismatched / stale snapshot is rejected, never partially reused.
@@ -355,6 +379,66 @@ The reporter prints only finite aggregate numbers.
 - Persistence uses the shared `atomic_write` primitive, so a partially written
   file is never observed.
 
+### 18a. Bounded persisted rows vs full-scope metrics
+
+Source Evidence is not truncated (§6), but the **persisted** Delivery artifact is
+a persisted-per-request row list and is bounded by an explicit hard cap:
+
+```
+MAX_DELIVERY_ROWS = 64
+```
+
+The cap is **explicit and carries telemetry** — it is never a silent drop:
+
+- `rows` holds at most `MAX_DELIVERY_ROWS` persisted rows;
+- `rows_truncated` (bool) and `rows_truncated_count` (int) record exactly how
+  many rows were dropped by the cap.
+
+Crucially, the **aggregate metrics are computed from the FULL request plan
+before** the persisted-row cap is applied, so every counter shares ONE explicit
+scope (the complete request) and never reports a contradictory mixed scope such
+as `unit_count = 70` with `ob_unit_count = 64`. The scope algebra is:
+
+```
+unit_count == persisted_unit_count + truncated_unit_count
+unit_count == frontend_unit_count + ob_unit_count
+unit_count == direct_data_count + flash_cue_count
+            + drop_count + unknown_count
+```
+
+The validator additionally enforces the closed-v0 source/channel identities on
+the FULL-scope metrics **even when hidden rows were truncated** (a forged hidden
+count that the source contract forbids is rejected as a whole):
+
+```
+frontend_observation_available == false
+    -> frontend_unit_count == frontend_direct_data_count
+       == current_model_visible_count
+       == full_content_already_present_count == 0
+
+ob_observation_available == false
+    -> ob_unit_count == ob_flash_cue_count == ob_drop_count
+       == ob_unknown_count == base_policy_available_ob_count
+       == base_policy_unavailable_ob_count
+       == full_content_recall_required_count == 0
+
+direct_data_count == frontend_unit_count == frontend_direct_data_count
+                  == current_model_visible_count
+                  == full_content_already_present_count
+
+ob_unit_count == ob_flash_cue_count + ob_drop_count + ob_unknown_count
+flash_cue_count == ob_flash_cue_count
+drop_count == ob_drop_count
+unknown_count == ob_unknown_count
+full_content_recall_required_count == ob_flash_cue_count
+base_policy_available_ob_count + base_policy_unavailable_ob_count == ob_unit_count
+```
+
+A truncated artifact cannot be fully re-derived (the dropped rows are gone), so
+the reported FULL-scope metrics are verified for internal coherence and bounded
+by what is provable, while `persisted_unit_count` and `truncated_unit_count` are
+checked exactly.
+
 ## 19. What must happen before Delivery can become live authority
 
 At minimum, all of the following, none of which v0 does:
@@ -435,12 +519,34 @@ maintenance / research tool, **not** a runtime authority:
   artifact);
 - it validates each artifact with the **same** authoritative v0 validator the
   writer uses; an artifact that fails validation is counted as `invalid` and
-  contributes **zero** to every statistic (reject-by-whole);
+  contributes **zero** to every statistic (reject-by-whole — including a
+  truncated artifact whose hidden counts contradict the closed-v0 source /
+  channel contract);
 - a missing artifact and a malformed artifact are counted separately
   (`artifact_count` vs `invalid_artifact_count`), so "no data" is never reported
   as "zero units";
 - reads are bounded by `--limit` (default `500`; a negative limit is clamped to
   `0`, never "scan everything").
+
+Each per-request artifact's `metrics` is **full-plan scope** (§18a) and carries:
+
+| field | meaning |
+| --- | --- |
+| `unit_count` | complete request plan size |
+| `persisted_unit_count` | rows kept (≤ `MAX_DELIVERY_ROWS`) |
+| `truncated_unit_count` | rows dropped by the persisted cap |
+
+The aggregate report exposes `unit_count` (Σ full-plan), plus
+`truncated_unit_count` (Σ dropped rows) and `truncated_artifact_count` (number of
+artifacts that were truncated). Every per-source / per-channel counter it prints
+is summed over the same full-plan scope, so the aggregate obeys the same algebra
+as each artifact:
+
+```
+unit_count == frontend_unit_count + ob_unit_count
+unit_count == direct_data_count + flash_cue_count
+            + drop_count + unknown_count
+```
 
 Example (synthetic fixture only; never run over real user memory data for
 validation):
@@ -453,18 +559,29 @@ PYTHONPATH=src python -m ombrebrain.maintenance.memory_delivery_report \
 ```json
 {
   "artifact_count": 1,
-  "invalid_artifact_count": 0,
-  "valid_artifact_count": 1,
-  "unit_count": 2,
-  "frontend_unit_count": 1,
-  "ob_unit_count": 1,
+  "current_model_visible_estimated_tokens": 32,
+  "current_model_visible_unit_count": 1,
   "direct_data_count": 1,
-  "unknown_count": 1,
+  "drop_count": 0,
+  "flash_cue_count": 0,
   "frontend_direct_data_count": 1,
+  "frontend_unit_count": 1,
+  "invalid_artifact_count": 0,
+  "mode": "shadow_only",
+  "ob_drop_count": 0,
+  "ob_flash_cue_count": 0,
+  "ob_unit_count": 1,
   "ob_unknown_count": 1,
   "policy_unavailable_ob_count": 1,
   "report": "aggregate_only",
-  "mode": "shadow_only",
+  "request_with_both_count": 1,
+  "request_with_frontend_count": 1,
+  "request_with_ob_count": 1,
+  "truncated_artifact_count": 0,
+  "truncated_unit_count": 0,
+  "unit_count": 2,
+  "unknown_count": 1,
+  "valid_artifact_count": 1,
   "version": "memory-delivery-plan-shadow.v1"
 }
 ```
