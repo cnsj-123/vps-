@@ -9,17 +9,26 @@ and the code disagree, the code is correct and this document is wrong.
 
 - Repository source of truth: the tree at the baseline commit below.
 - Baseline: `origin/feature/gateway-v2`
-- Baseline HEAD: `ab586b34d0265a713d3e3ed3ac60741246093ed2`
-  (merge of PR#2, `trae/request-local-cognitive-workspace-v0`)
+- Baseline HEAD: `2815c934892b7a2ea79b303453e959f6829f0ef1`
+  (merge of PR #4, `trae/lifecycle-shadow-comparison-v0` — Legacy vs
+  Cognitive Lifecycle Shadow Comparison v0)
 - Audit date context: originally written for the Frontend Memory Arbitration
   Shadow task (branch `trae/frontend-memory-arbitration-shadow-v1`), then
   updated for the Request-local Cognitive Workspace Foundation v0 task
-  (branch `trae/request-local-cognitive-workspace-v0`), then updated for the
-  Memory Lifecycle Authority Map + Dual-Authority Guardrails v0 task
-  (branch `trae/lifecycle-authority-audit-v0`), then updated for the
-  Legacy vs Cognitive Lifecycle Shadow Comparison v0 task
+  (branch `trae/request-local-cognitive-workspace-v0`; the then-current
+  `feature/gateway-v2` baseline was
+  `ab586b34d0265a713d3e3ed3ac60741246093ed2`, merge of PR #2 — a historical
+  merge point, since superseded, and NOT the current repository baseline),
+  then updated for the Memory Lifecycle Authority Map + Dual-Authority
+  Guardrails v0 task (branch `trae/lifecycle-authority-audit-v0`), then
+  updated for the Legacy vs Cognitive Lifecycle Shadow Comparison v0 task
   (branch `trae/lifecycle-shadow-comparison-v0`, base
-  `01b5948ab1b14c2a65ddebea31611f2e5321aa74`).
+  `01b5948ab1b14c2a65ddebea31611f2e5321aa74`; merged into `feature/gateway-v2`
+  as PR #4, the current baseline HEAD
+  `2815c934892b7a2ea79b303453e959f6829f0ef1`), then updated for the
+  Source-Neutral Memory Evidence + Unified Delivery Plan Shadow v0 task
+  (branch `trae/unified-memory-delivery-shadow-v0`, base
+  `2815c934892b7a2ea79b303453e959f6829f0ef1`).
 
 Companion documents:
 
@@ -32,6 +41,11 @@ Companion documents:
   experiment that reads both planes to record where their current semantics
   differ. It is also a WORKING EXPERIMENT / SHADOW OBSERVATION, not an ADR or a
   frozen specification.
+- **`docs/cognitive-memory/UNIFIED_MEMORY_DELIVERY.md`** documents the
+  Source-Neutral Memory Evidence Adapter (`memory-source-evidence.v1`) and the
+  Unified Memory Delivery Plan Shadow v0 (`memory-delivery-plan-shadow.v1`) — a
+  `SHADOW CONTROL PLANE` proposal experiment. It is a WORKING EXPERIMENT, not an
+  ADR and not a frozen specification.
 
 Current experiment status:
 
@@ -41,9 +55,30 @@ Lifecycle Authority Map
 Lifecycle Shadow Comparison
 ```
 
-The comparison **adds comparison evidence only**. It does **not** unify lifecycle
-authority, does **not** decide which lifecycle policy wins, and does **not**
-resolve OA-2. `comparison evidence exists` — **not** `migration solved`.
+and now, in parallel:
+
+```
+Frontend/OB Source Arbitration
+    ↓
+Source-Neutral Memory Evidence Adapter
+    ↓
+Unified Memory Delivery Plan Shadow
+```
+
+The lifecycle comparison **adds comparison evidence only**. It does **not** unify
+lifecycle authority, does **not** decide which lifecycle policy wins, and does
+**not** resolve OA-2. `comparison evidence exists` — **not** `migration solved`.
+
+The delivery experiment is likewise a proposal only. Explicitly:
+
+- **`source-neutral delivery proposal exists`** — this is true (§2.25, §2.26);
+- **`NOT unified model-facing authority is live`** — Delivery Shadow has
+  `live_authority=false` / `authority=proposal_only` and changes no forwarded
+  body;
+- **`NOT Frontend direct path has been removed`** — the Frontend attachment
+  mouth is observed as an existing baseline and left untouched (§4, §2.26);
+- **`NOT storage has been unified`** — each source keeps its own storage,
+  granularity and retrieval semantics (§2.25).
 
 Everything below is derived by reading the real modules listed next to each
 stage. Where a claim could not be verified from code it is explicitly marked
@@ -699,6 +734,97 @@ request (it is part of `memory_observer_enabled`). It works while the Flash /
 Ledger / Surface stages are OFF, and when it is enabled **without** Flash it
 writes only the comparison artifact.
 
+### 2.25 Source-Neutral Memory Evidence Adapter (v0)
+
+| Field | Value |
+| --- | --- |
+| Owner | `src/ombrebrain/context/memory_source_evidence.py` (`memory-source-evidence.v1`) |
+| Input | THIS request's `forward_body` + THIS request's `memory_shadow_snapshot` |
+| Output | one request-bound, **in-memory-only** `MemorySourceEvidenceSnapshot` (source-neutral control vocabulary + source-native `native_payload` refs) |
+| Persisted | **none** — in-memory only, never serialized, never logged, never model-visible |
+| Shadow/Live | evidence adapter (no runtime authority, no mutation) |
+| Flag | none — built when an enabled consumer (Arbitration Shadow and/or Delivery Shadow) needs it |
+| Mutates provider request | no |
+| Mutates canonical memory | no |
+| Lifecycle effect | none |
+| Downstream | Memory Source Arbitration Shadow, Unified Memory Delivery Plan Shadow |
+
+It normalizes **only** control metadata (source, kind, granularity, scope,
+digests, size, visibility, retrieved, occurrence). It does **not** unify
+storage, does **not** unify retrieval and does **not** turn a source payload
+into a universal "memory".
+
+Granularity is source-native and preserved (§4): **one `relevant_memories.txt`
+attachment = one unit** (`granularity="attachment"`, inner body never parsed,
+reusing the canonicalizer); **one Unified-admitted OB candidate = one unit**
+(`granularity="candidate"`, read only from THIS request's snapshot under strict
+version / conversation / revision binding). Duplicate occurrences stay
+**distinct** units — this is an occurrence adapter, never an identity claim.
+
+The coordinator builds the snapshot **exactly once** per request and shares it
+between the Arbitration observer and the Delivery Shadow, so the forwarded body
+is canonicalized and the OB side is bound a single time.
+
+The snapshot describes the **complete** source set for the request: v0 applies
+**no silent evidence cap**. Only the *persisted Delivery artifact* is bounded
+(`MAX_DELIVERY_ROWS`) with explicit truncation telemetry, and its aggregate
+metrics are full-plan scope (§2.26).
+
+### 2.26 Unified Memory Delivery Plan Shadow (v0)
+
+| Field | Value |
+| --- | --- |
+| Owner | `src/ombrebrain/context/memory_delivery_shadow.py` (+ read-only reporter `src/ombrebrain/maintenance/memory_delivery_report.py`) |
+| Input | THIS request's Source Evidence Snapshot + the base `memory-surfacing-policy.v1` report already computed upstream |
+| Output | one privacy-safe `memory-delivery-plan-shadow.v1` artifact (per-source delivery rows + request metrics); **no** live effect |
+| Persisted | `memory_delivery_plan/{conversation_id}/{cognitive_request_id}.json` |
+| Shadow/Live | **SHADOW ONLY**, default OFF |
+| Flag | `OMBRE_GATEWAY_CONTEXT_MEMORY_DELIVERY_SHADOW` |
+| Mutates provider request | no |
+| Mutates canonical memory | no |
+| Lifecycle effect | none |
+| Downstream | none for the live request (evidence / proposal only); request-local `workspace.memory_delivery_plan` for THIS request |
+
+Artifact shape: `mode="shadow_only"`, `authority="proposal_only"`,
+`live_authority=false`, `policy_stage="base_surfacing_pre_lifecycle"`,
+`flash_required=false`, `lifecycle_required=false`. Rows carry three orthogonal
+facts: `currently_model_visible` (tri-state), `immediate_delivery_mode`
+(`direct_data` / `flash_cue` / `drop` / `unknown`) and `full_content_access_mode`
+(`already_present` / `recall_required` / `none` / `unknown`).
+
+Source invariants (enforced by the single authoritative validator):
+
+- a Frontend row is **always** `direct_data` + `already_present`, with
+  `base_surfacing_eligible = null` — a baseline observation of "already in the
+  request", not an endorsement;
+- an OB row is **always** `flash_cue` / `drop` / `unknown` and **never**
+  `direct_data`; its `full_content_access_mode` is `recall_required` / `none` /
+  `unknown`;
+- `UNKNOWN != DROP`: an unbound policy yields `unknown`, never a silent
+  `ineligible`;
+- duplicate occurrences are **never** collapsed; OB eligibility is matched by
+  FIFO position so duplicates cannot share a rank;
+- `evidence_ref = sha256(source + kind + occurrence + content_digest)` — a
+  request-local reference, not a memory id and not a global identity.
+
+It is a **proposal with no live authority**: it never kills / rewrites /
+reorders / merges a memory, never invokes a Flash, never performs or alters a
+Recall, never reinforces, never writes a memory and never changes the forwarded
+body. It never evaluates the Surfacing Policy itself; the base policy is passed
+in already computed. Lifecycle is intentionally excluded from v0 (see
+[UNIFIED_MEMORY_DELIVERY.md](UNIFIED_MEMORY_DELIVERY.md) §15).
+
+Bounded persisted rows, full-scope metrics: `rows` is capped at
+`MAX_DELIVERY_ROWS` (explicit `rows_truncated` / `rows_truncated_count`
+telemetry), while `metrics` is computed from the **complete** request plan
+before the cap, so `unit_count == persisted_unit_count + truncated_unit_count`
+and the source / channel algebra holds at full-plan scope. The single
+authoritative validator also enforces the closed-v0 source / channel identities
+even when hidden rows were truncated (see
+[UNIFIED_MEMORY_DELIVERY.md](UNIFIED_MEMORY_DELIVERY.md) §18a).
+
+Fail-open: a delivery fault is *missing delivery data* and nothing else.
+
 ---
 
 ## 3. What the cache rewriters do to attachments (relevant to Frontend Memory)
@@ -778,11 +904,18 @@ implicitly drives the upstream chain it consumes.
 - `OMBRE_GATEWAY_CONTEXT_CONFIDENCE_GATE_SHADOW`,
   `..._MEMORY_FLASH_SHADOW`, `..._EXPOSURE_LEDGER_SHADOW`,
   `..._MEMORY_RECALL_SURFACE_SHADOW`,
-  `..._LIFECYCLE_COMPARISON_SHADOW`, and
-  `..._MEMORY_SOURCE_ARBITRATION_SHADOW` all cause
+  `..._LIFECYCLE_COMPARISON_SHADOW`,
+  `..._MEMORY_SOURCE_ARBITRATION_SHADOW`, and
+  `..._MEMORY_DELIVERY_SHADOW` all cause
   `observe_context_sources` / `observe_unified_preview_gate` to run the
   upstream Conversation→Unified chain for this request (they are consumers, not
   observability-only toggles).
+- `..._MEMORY_SOURCE_ARBITRATION_SHADOW` now reuses the request-local
+  **Source-Neutral Memory Evidence** adapter (§2.25) instead of reparsing the
+  forwarded body / snapshot itself, but it remains **observation-only
+  measurement**. It is **NOT** the delivery authority. When both it and
+  `..._MEMORY_DELIVERY_SHADOW` are enabled, the coordinator builds the source
+  evidence snapshot **once** and both observers consume it.
 - `..._MEMORY_RECALL_SURFACE_SHADOW` is **not a standalone producer**: a Recall
   Surface derives from a Memory Flash artifact. With no Flash artifact for the
   request it has nothing to surface. Enabling it alone drives the upstream chain
@@ -807,6 +940,7 @@ Shadow flags that never mutate the provider request:
 `..._EXPOSURE_LEDGER_SHADOW`, `..._MEMORY_RECALL_SURFACE_SHADOW`,
 `..._LIFECYCLE_COMPARISON_SHADOW`,
 `..._MEMORY_SOURCE_ARBITRATION_SHADOW`,
+`..._MEMORY_DELIVERY_SHADOW`,
 `OMBRE_GATEWAY_MEMORY_LIFECYCLE_SHADOW`.
 
 Flags that can mutate the provider request:
@@ -946,6 +1080,24 @@ demonstrated correctness / data-integrity / authority violations.
 - No ArchiveCandidate behaviour; no consolidation; no migration or unification of
   lifecycle authority; OA-2 remains unresolved.
 - No conversation-global "latest comparison" file; no new live body mutation.
+
+### Explicitly NOT done in the Source-Neutral Memory Evidence + Unified Delivery Plan Shadow v0 task
+
+- No storage unification; the two sources keep their own storage, granularity
+  and retrieval semantics.
+- No Frontend item parser and no item-level parse of `relevant_memories.txt`;
+  Frontend stays attachment-granular (§4).
+- No live Frontend gating; no removal / rewriting / deletion of
+  `relevant_memories.txt`; no Frontend Recall.
+- No OB direct full-content path; the cue / Recall boundary is untouched.
+- No semantic auto-dedup, no embedding overlap, no LLM arbitration / judge; no
+  cross-source scoring or reranking.
+- No Memory Delivery live renderer; no provider body mutation; no memory
+  mutation; no reinforcement.
+- No lifecycle migration and no Lifecycle → Delivery composition (Lifecycle is
+  intentionally excluded from Delivery v0).
+- No new memory system (Episodic / Semantic / Relation / Prospective / Wake /
+  Emotion / Attachment).
 
 ---
 

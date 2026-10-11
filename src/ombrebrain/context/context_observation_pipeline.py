@@ -161,11 +161,23 @@ def observe_context_sources(body: bytes) -> str | None:
         )
     )
 
+    # Unified Memory Delivery Plan Shadow. Like the other Memory
+    # observers it consumes THIS request's own Source Evidence
+    # Snapshot (which is built from the request-local Unified
+    # observation), so enabling it must drive the same upstream chain
+    # instead of silently doing nothing.
+    memory_delivery_enabled = _truthy(
+        os.environ.get(
+            "OMBRE_GATEWAY_CONTEXT_MEMORY_DELIVERY_SHADOW"
+        )
+    )
+
     memory_downstream_enabled = (
         confidence_gate_enabled
         or memory_flash_enabled
         or exposure_ledger_enabled
         or memory_arbitration_enabled
+        or memory_delivery_enabled
     )
 
     if not (

@@ -24,8 +24,15 @@ from ombrebrain.context.memory_recall_surface import (
 from ombrebrain.context.memory_flash_live_exposure import (
     select_live_memory_flash_body,
 )
+from ombrebrain.context import (
+    memory_source_evidence,
+)
+from ombrebrain.context.memory_delivery_shadow import (
+    log_memory_delivery_report,
+    update_memory_delivery_plan,
+)
 from ombrebrain.context.memory_source_arbitration_shadow import (
-    update_memory_source_arbitration,
+    update_memory_source_arbitration_from_evidence,
 )
 from ombrebrain.context.memory_lifecycle_comparison_shadow import (
     lifecycle_comparison_enabled,
@@ -156,6 +163,20 @@ _MEMORY_FLASH_LIVE_EXPOSURE_ENV = (
 # rewrites or converts Frontend Memory and never changes the body.
 _MEMORY_SOURCE_ARBITRATION_ENV = (
     "OMBRE_GATEWAY_CONTEXT_MEMORY_SOURCE_ARBITRATION_SHADOW"
+)
+
+# Unified Memory Delivery Plan Shadow master flag. SHADOW ONLY and
+# default OFF. Like the other Memory observers it runs on the
+# request-local evidence THIS request just produced, so when it is on
+# it refreshes the Unified chain for this request instead of silently
+# doing nothing. It consumes the SAME shared Source Evidence Snapshot
+# the arbitration observer uses (built once) and the SAME base
+# Surfacing Policy the Flash / Comparison stages use (computed once).
+# It is a PROPOSAL with no live authority: it never changes the
+# forwarded body, never invokes a Flash, never performs a Recall and
+# never reinforces.
+_MEMORY_DELIVERY_ENV = (
+    "OMBRE_GATEWAY_CONTEXT_MEMORY_DELIVERY_SHADOW"
 )
 
 
@@ -394,9 +415,8 @@ def observe_memory_source_arbitration(
     conversation_id: str | None,
     *,
     cognitive_request_id: str | None,
-    snapshot: Any,
+    source_evidence_snapshot: Any,
     expected_unified_revision: Any,
-    forward_body: bytes,
 ) -> None:
     """Observe the Frontend Memory vs OB Memory access asymmetry.
 
@@ -418,12 +438,11 @@ def observe_memory_source_arbitration(
     those later stages are never modelled and are never fabricated
     here.
 
-    It consumes request-local evidence only: THIS request's
-    cache-stabilized forwarded body (Frontend attachments) and THIS
-    request's own Unified memory shadow snapshot (OB candidates + the
-    exact Unified revision). It never re-reads the shared
-    conversation-level Unified file, so two concurrent
-    same-conversation requests cannot cross-contaminate, and it never
+    Since the Unified Memory Delivery Plan v0, it consumes the SAME
+    request-local Source-Neutral Memory Evidence Snapshot the Delivery
+    Plan Shadow consumes -- the snapshot is built ONCE upstream and
+    this observer never reparses the forwarded body / snapshot again.
+    It never re-reads the shared conversation-level Unified file, never
     re-runs retrieval, re-embeds, re-ranks or calls a model / external
     API.
 
@@ -451,16 +470,19 @@ def observe_memory_source_arbitration(
         return
 
     try:
-        report = update_memory_source_arbitration(
-            conversation_id=conversation_id,
-            cognitive_request_id=(
-                cognitive_request_id
-            ),
-            snapshot=snapshot,
-            expected_unified_revision=(
-                expected_unified_revision
-            ),
-            forward_body=forward_body,
+        report = (
+            update_memory_source_arbitration_from_evidence(
+                conversation_id=conversation_id,
+                cognitive_request_id=(
+                    cognitive_request_id
+                ),
+                source_evidence_snapshot=(
+                    source_evidence_snapshot
+                ),
+                expected_unified_revision=(
+                    expected_unified_revision
+                ),
+            )
         )
     except Exception as exc:
         logger.warning(
@@ -509,6 +531,8 @@ def observe_memory_exposure_shadow(
     snapshot: Any,
     expected_unified_revision: Any,
     confidence_report: Any,
+    source_evidence_snapshot: Any = None,
+    workspace: Any = None,
 ) -> None:
     """Observe which memories were retrieved / surfaced as a Flash cue.
 
@@ -576,11 +600,20 @@ def observe_memory_exposure_shadow(
     # Flash artifact, a Recall Surface or a provider mutation.
     comparison_enabled = lifecycle_comparison_enabled()
 
+    # Unified Memory Delivery Plan Shadow. Default OFF, shadow-only and
+    # proposal-only. Like the comparison observer it may evaluate the
+    # base policy purely for observation, but it never creates a Flash
+    # artifact, a Recall Surface or a provider mutation.
+    delivery_enabled = _truthy(
+        os.environ.get(_MEMORY_DELIVERY_ENV)
+    )
+
     if not (
         flash_enabled
         or ledger_enabled
         or surface_enabled
         or comparison_enabled
+        or delivery_enabled
     ):
         return
 
@@ -665,7 +698,11 @@ def observe_memory_exposure_shadow(
 
     policy = None
 
-    if flash_enabled or comparison_enabled:
+    if (
+        flash_enabled
+        or comparison_enabled
+        or delivery_enabled
+    ):
         # Surfacing Policy: deterministic, rule-based, canonical
         # order, and fed the real request-local evidence.
         try:
@@ -729,6 +766,69 @@ def observe_memory_exposure_shadow(
         except Exception as exc:
             logger.warning(
                 "[gateway.context_memory_lifecycle_comparison] "
+                "observer_failed=%s fail_open=true",
+                type(exc).__name__,
+            )
+
+    # --------------------------------------------------
+    # 1b. Unified Memory Delivery Plan Shadow (proposal only)
+    #
+    # It consumes the SAME Source Evidence Snapshot the arbitration
+    # observer consumed (built ONCE by the caller) and the SAME base
+    # policy computed above. It NEVER evaluates the Surfacing Policy
+    # itself and never invokes a Flash / Recall. Fail-open: a delivery
+    # fault is missing delivery data and nothing else.
+    # --------------------------------------------------
+
+    if delivery_enabled:
+        try:
+            if source_evidence_snapshot is None:
+                delivery_report = {
+                    "stored": False,
+                    "mode": "shadow_only",
+                    "decision": "no_record",
+                    "reason": "evidence_unavailable",
+                }
+            else:
+                delivery_report = (
+                    update_memory_delivery_plan(
+                        conversation_id=(
+                            conversation_id
+                        ),
+                        cognitive_request_id=(
+                            cognitive_request_id
+                        ),
+                        source_evidence_snapshot=(
+                            source_evidence_snapshot
+                        ),
+                        expected_unified_revision=(
+                            expected_unified_revision
+                        ),
+                        base_policy=policy,
+                    )
+                )
+
+            log_memory_delivery_report(
+                delivery_report
+            )
+
+            if (
+                workspace is not None
+                and isinstance(
+                    delivery_report, dict
+                )
+                and delivery_report.get("stored")
+                and isinstance(
+                    delivery_report.get("plan"),
+                    dict,
+                )
+            ):
+                workspace.memory_delivery_plan = (
+                    delivery_report["plan"]
+                )
+        except Exception as exc:
+            logger.warning(
+                "[gateway.context_memory_delivery] "
                 "observer_failed=%s fail_open=true",
                 type(exc).__name__,
             )
@@ -1079,11 +1179,20 @@ async def observe_unified_preview_gate(
         lifecycle_comparison_enabled()
     )
 
+    # Unified Memory Delivery Plan Shadow. Default OFF, shadow-only and
+    # proposal-only. Like the other Memory observers it consumes THIS
+    # request's own evidence, so when it is on it refreshes the Unified
+    # chain for this request.
+    memory_delivery_enabled = _truthy(
+        os.environ.get(_MEMORY_DELIVERY_ENV)
+    )
+
     memory_observer_enabled = (
         memory_flash_enabled
         or exposure_ledger_enabled
         or recall_surface_enabled
         or lifecycle_comparison_observer_enabled
+        or memory_delivery_enabled
     )
 
     # Frontend Memory Arbitration Shadow (default OFF). Like the other
@@ -1313,6 +1422,57 @@ async def observe_unified_preview_gate(
             confidence_report
         )
 
+    # Source-Neutral Memory Evidence Snapshot (in memory only).
+    #
+    # It is built ONCE for THIS request and shared by the Arbitration
+    # observer and the Unified Memory Delivery Plan Shadow, so the
+    # forwarded body is canonicalized and the OB snapshot is bound
+    # exactly once. It is never persisted, never logged and never
+    # model-visible. Fail-open: a build fault simply leaves the
+    # downstream shadow observers with no evidence.
+    source_evidence = None
+
+    if (
+        memory_arbitration_enabled
+        or memory_delivery_enabled
+    ) and unified.get("stored") and isinstance(
+        cognitive_request_id,
+        str,
+    ):
+        try:
+            source_evidence = (
+                memory_source_evidence
+                .build_memory_source_evidence_snapshot(
+                    conversation_id=conversation_id,
+                    cognitive_request_id=(
+                        cognitive_request_id
+                    ),
+                    source_unified_revision=(
+                        unified.get("revision")
+                    ),
+                    forward_body=forward_body,
+                    memory_shadow_snapshot=(
+                        unified.get(
+                            "memory_shadow_snapshot"
+                        )
+                    ),
+                )
+            )
+        except Exception as exc:
+            logger.warning(
+                "[gateway.context_memory_source_evidence] "
+                "build_failed=%s fail_open=true",
+                type(exc).__name__,
+            )
+
+        if (
+            workspace is not None
+            and source_evidence is not None
+        ):
+            workspace.memory_source_evidence = (
+                source_evidence
+            )
+
     # Memory Surfacing Policy -> Memory Flash -> Exposure Ledger.
     #
     # Shadow-only observers that sit after Confidence and before
@@ -1347,6 +1507,10 @@ async def observe_unified_preview_gate(
                 confidence_report=(
                     confidence_report
                 ),
+                source_evidence_snapshot=(
+                    source_evidence
+                ),
+                workspace=workspace,
             )
         except Exception as exc:
             logger.warning(
@@ -1358,32 +1522,29 @@ async def observe_unified_preview_gate(
     # Frontend Memory Arbitration Shadow. It measures the access
     # asymmetry between Frontend Memory (already model-visible) and
     # OB memory (cue + Recall only). It consumes THIS request's own
-    # forwarded body and Unified snapshot only, is fail-open and never
+    # shared Source Evidence Snapshot only, is fail-open and never
     # changes the body. Being present in the request is not recalled /
     # used / reinforced, so no later stage is invented here.
     if (
         memory_arbitration_enabled
         and unified.get("stored")
-        and isinstance(forward_body, bytes)
         and isinstance(
             cognitive_request_id,
             str,
         )
+        and source_evidence is not None
     ):
         observe_memory_source_arbitration(
             conversation_id,
             cognitive_request_id=(
                 cognitive_request_id
             ),
-            snapshot=(
-                unified.get(
-                    "memory_shadow_snapshot"
-                )
+            source_evidence_snapshot=(
+                source_evidence
             ),
             expected_unified_revision=(
                 unified.get("revision")
             ),
-            forward_body=forward_body,
         )
 
     if not (

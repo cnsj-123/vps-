@@ -6,9 +6,14 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Any
 
+from ombrebrain.context.memory_source_evidence import (
+    SOURCE_FRONTEND,
+    SOURCE_OB,
+    build_memory_source_evidence_snapshot,
+    is_bound_to_request,
+)
 from ombrebrain.context.recall_types import (
     atomic_write,
-    estimate_tokens,
     is_valid_cognitive_request_id,
     is_valid_conversation_id,
     normalize_key,
@@ -24,7 +29,6 @@ from ombrebrain.context.validators.freshness import (
 from ombrebrain.gateway.canonicalizer import (
     extract_frontend_memory_segments,
 )
-from ombrebrain.gateway.operit_adapter import OperitAdapter
 
 
 # Frontend Memory Arbitration Shadow v1 -- shadow only.
@@ -48,6 +52,14 @@ from ombrebrain.gateway.operit_adapter import OperitAdapter
 #       The repository has no proven item-level schema for the inner
 #       body, so an attachment is never called one memory candidate.
 #   ob: one Unified-admitted memory CANDIDATE (retrieved side).
+#
+# Since v0 of the Unified Memory Delivery plan, the observations are
+# derived from the shared request-local Source-Neutral Memory Evidence
+# Snapshot (``memory_source_evidence``). This module no longer reparses
+# the forwarded body / snapshot on its own: it consumes the SAME
+# evidence the Delivery Plan Shadow consumes. It remains, however, an
+# OBSERVATION-ONLY measurement -- it is NOT the delivery authority and
+# its observation shape is NOT the Delivery Plan.
 #
 # It answers, from REAL requests: how many Frontend attachments exist,
 # how much model-visible context they occupy, whether they are current
@@ -89,17 +101,17 @@ from ombrebrain.gateway.operit_adapter import OperitAdapter
 _VERSION = "memory-source-arbitration-shadow.v1"
 _MODE = "shadow_only"
 
-_UNIFIED_VERSION = "unified-context-candidate.v1"
-_SNAPSHOT_VERSION = "memory-shadow-snapshot.v1"
-
-_SOURCE_FRONTEND = "frontend"
-_SOURCE_OB = "ob"
+_KNOWN_SOURCES = (
+    SOURCE_FRONTEND,
+    SOURCE_OB,
+)
 
 _KIND_FRONTEND_ATTACHMENT = "frontend_attachment"
 _KIND_OB_CANDIDATE = "ob_candidate"
 
 _PLACEMENT_CURRENT = "current"
 _PLACEMENT_HISTORY = "history"
+_PLACEMENT_RETRIEVAL = "retrieval"
 
 # Bound the persisted per-observation evidence. The observation pool is
 # small (<=6 OB candidates by Unified budget plus the Frontend
@@ -161,121 +173,111 @@ def _normalized_digest(text: str) -> str:
     ).hexdigest()
 
 
-def _frontend_observations(
-    segments: Any,
+def _observations_from_units(
+    units: Any,
 ) -> list[_Observation]:
+    """Map source-neutral evidence units to v1 observations.
+
+    Semantics are unchanged from the original v1 builder: a Frontend
+    unit keeps its current/history placement and its model-visible raw
+    envelope; an OB unit is retrieved but not model-visible. The
+    model-visible footprint is reused STRAIGHT from the shared evidence
+    unit (measured once by the adapter from the exact canonical
+    envelope), so the arbitration measurement and the Delivery Plan
+    Shadow can never disagree about the same occurrence.
+    """
+
     observations: list[_Observation] = []
 
-    if not isinstance(segments, (list, tuple)):
+    if not isinstance(units, (list, tuple)):
         return observations
 
-    for index, segment in enumerate(segments):
-        body = getattr(segment, "body", None)
+    for unit in units:
+        if unit.source == SOURCE_FRONTEND:
+            placement = unit.source_scope
 
-        if (
-            not isinstance(body, str)
-            or not body.strip()
-        ):
+            if placement not in (
+                _PLACEMENT_CURRENT,
+                _PLACEMENT_HISTORY,
+            ):
+                placement = _PLACEMENT_HISTORY
+
+            observations.append(
+                _Observation(
+                    source=SOURCE_FRONTEND,
+                    kind=_KIND_FRONTEND_ATTACHMENT,
+                    placement=placement,
+                    index=unit.source_index,
+                    content_digest=unit.content_digest,
+                    normalized_digest=(
+                        unit.normalized_digest
+                    ),
+                    content_chars=unit.content_chars,
+                    content_estimated_tokens=(
+                        unit.content_estimated_tokens
+                    ),
+                    model_visible_chars=(
+                        unit.model_visible_chars
+                    ),
+                    model_visible_estimated_tokens=(
+                        unit.model_visible_estimated_tokens
+                    ),
+                    currently_model_visible=True,
+                    retrieved=False,
+                )
+            )
             continue
 
-        # The exact raw canonical attachment text. It is only used in
-        # memory to measure the real model-visible footprint; it is
-        # never persisted or logged. If a caller supplied no raw text
-        # the body is used as a conservative lower bound -- no tags are
-        # ever reconstructed.
-        raw_attachment = getattr(
-            segment,
-            "raw_attachment",
-            None,
-        )
-
-        if (
-            not isinstance(raw_attachment, str)
-            or not raw_attachment
-        ):
-            raw_attachment = body
-
-        placement = getattr(
-            segment,
-            "placement",
-            _PLACEMENT_HISTORY,
-        )
-
-        observations.append(
-            _Observation(
-                source=_SOURCE_FRONTEND,
-                kind=_KIND_FRONTEND_ATTACHMENT,
-                placement=(
-                    _PLACEMENT_CURRENT
-                    if placement == _PLACEMENT_CURRENT
-                    else _PLACEMENT_HISTORY
-                ),
-                index=index,
-                content_digest=_digest(body),
-                normalized_digest=(
-                    _normalized_digest(body)
-                ),
-                content_chars=len(body),
-                content_estimated_tokens=(
-                    estimate_tokens(body)
-                ),
-                model_visible_chars=len(
-                    raw_attachment
-                ),
-                model_visible_estimated_tokens=(
-                    estimate_tokens(raw_attachment)
-                ),
-                # Frontend attachment content is already in the
-                # model-visible request.
-                currently_model_visible=True,
-                # It was attached by the frontend, not retrieved by
-                # the OB retrieval subsystem.
-                retrieved=False,
+        if unit.source == SOURCE_OB:
+            observations.append(
+                _Observation(
+                    source=SOURCE_OB,
+                    kind=_KIND_OB_CANDIDATE,
+                    placement=_PLACEMENT_HISTORY,
+                    index=unit.source_index,
+                    content_digest=unit.content_digest,
+                    normalized_digest=(
+                        unit.normalized_digest
+                    ),
+                    content_chars=unit.content_chars,
+                    content_estimated_tokens=(
+                        unit.content_estimated_tokens
+                    ),
+                    model_visible_chars=(
+                        unit.model_visible_chars
+                    ),
+                    model_visible_estimated_tokens=(
+                        unit.model_visible_estimated_tokens
+                    ),
+                    currently_model_visible=False,
+                    retrieved=True,
+                )
             )
-        )
 
     return observations
 
 
-def _ob_observations(
-    memories: Any,
+def _observations_from_segments_and_memories(
+    frontend_segments: Any,
+    ob_memories: Any,
 ) -> list[_Observation]:
-    observations: list[_Observation] = []
+    """Compatibility path: build units from the raw canonical inputs.
 
-    if not isinstance(memories, list):
-        return observations
+    It reuses the SAME shared adapter unit builders the coordinator
+    uses, so no second observation system exists.
+    """
 
-    for index, item in enumerate(memories):
-        content = candidate_text(item)
+    from ombrebrain.context.memory_source_evidence import (
+        frontend_evidence_units,
+        ob_evidence_units,
+    )
 
-        if not content:
-            continue
+    units = (
+        frontend_evidence_units(frontend_segments)
+        + ob_evidence_units(ob_memories)
+    )
 
-        observations.append(
-            _Observation(
-                source=_SOURCE_OB,
-                kind=_KIND_OB_CANDIDATE,
-                placement=_PLACEMENT_HISTORY,
-                index=index,
-                content_digest=_digest(content),
-                normalized_digest=(
-                    _normalized_digest(content)
-                ),
-                content_chars=len(content),
-                content_estimated_tokens=(
-                    estimate_tokens(content)
-                ),
-                # OB candidate content is NOT in the live request;
-                # only a future bounded cue / Recall may expose it.
-                model_visible_chars=0,
-                model_visible_estimated_tokens=0,
-                currently_model_visible=False,
-                # It came from THIS request's retrieval observation.
-                retrieved=True,
-            )
-        )
-
-    return observations
+    return _observations_from_units(units)
 
 
 def _build_metrics(
@@ -284,12 +286,12 @@ def _build_metrics(
     frontend = [
         o
         for o in observations
-        if o.source == _SOURCE_FRONTEND
+        if o.source == SOURCE_FRONTEND
     ]
     ob = [
         o
         for o in observations
-        if o.source == _SOURCE_OB
+        if o.source == SOURCE_OB
     ]
 
     frontend_visible = [
@@ -386,36 +388,20 @@ def _build_metrics(
         "combined_observation_count":
             len(observations),
         "source_counts": {
-            _SOURCE_FRONTEND: len(frontend),
-            _SOURCE_OB: len(ob),
+            SOURCE_FRONTEND: len(frontend),
+            SOURCE_OB: len(ob),
         },
     }
 
 
-def build_arbitration_artifact(
+def _build_artifact_from_observations(
     *,
     conversation_id: str,
     cognitive_request_id: str,
     source_unified_revision: int,
-    frontend_segments: Any,
-    ob_memories: Any,
+    observations: list[_Observation],
     ob_observation_available: bool,
 ) -> dict[str, Any]:
-    """Pure builder for one privacy-safe arbitration artifact.
-
-    No IO, no logging, deterministic. Frontend observations come from
-    the canonical forwarded request; OB observations come from THIS
-    request's own Unified memory section. Nothing is inferred beyond
-    those two real inputs. The two sides are different observation
-    units (attachment vs candidate) and the artifact says so instead of
-    pretending a shared candidate contract already exists.
-    """
-
-    observations = (
-        _frontend_observations(frontend_segments)
-        + _ob_observations(ob_memories)
-    )
-
     metrics = _build_metrics(observations)
 
     persisted: list[dict[str, Any]] = []
@@ -463,8 +449,8 @@ def build_arbitration_artifact(
         # The two sides are NOT the same unit and this v1 does not
         # claim a shared candidate contract.
         "observation_units": {
-            _SOURCE_FRONTEND: "attachment",
-            _SOURCE_OB: "candidate",
+            SOURCE_FRONTEND: "attachment",
+            SOURCE_OB: "candidate",
         },
         "overlap_scope": (
             "frontend_attachment_body"
@@ -483,67 +469,171 @@ def build_arbitration_artifact(
     }
 
 
-def _ob_memories_from_snapshot(
-    snapshot: Any,
+def build_arbitration_artifact(
     *,
     conversation_id: str,
-    expected_unified_revision: Any,
-) -> tuple[Any, bool]:
-    """Extract THIS request's OB memory section, or mark it unavailable.
+    cognitive_request_id: str,
+    source_unified_revision: int,
+    frontend_segments: Any,
+    ob_memories: Any,
+    ob_observation_available: bool,
+) -> dict[str, Any]:
+    """Pure builder for one privacy-safe arbitration artifact.
 
-    It never re-reads the shared conversation-level Unified file. Any
-    identity / version / revision mismatch is treated as "not
-    available" rather than guessed.
+    No IO, no logging, deterministic. Frontend observations come from
+    the canonical forwarded request; OB observations come from THIS
+    request's own Unified memory section. Nothing is inferred beyond
+    those two real inputs. The two sides are different observation
+    units (attachment vs candidate) and the artifact says so instead of
+    pretending a shared candidate contract already exists.
+
+    It now derives its observations from the SHARED source-neutral
+    evidence unit builders, so the arbitration measurement and the
+    Delivery Plan Shadow observe the exact same source occurrences.
     """
 
-    unavailable = ([], False)
+    observations = (
+        _observations_from_segments_and_memories(
+            frontend_segments,
+            ob_memories,
+        )
+    )
 
-    if not isinstance(snapshot, dict):
-        return unavailable
+    return _build_artifact_from_observations(
+        conversation_id=conversation_id,
+        cognitive_request_id=cognitive_request_id,
+        source_unified_revision=(
+            source_unified_revision
+        ),
+        observations=observations,
+        ob_observation_available=(
+            ob_observation_available
+        ),
+    )
 
-    if (
-        snapshot.get("version")
-        != _SNAPSHOT_VERSION
+
+def update_memory_source_arbitration_from_evidence(
+    *,
+    conversation_id: Any,
+    cognitive_request_id: Any,
+    source_evidence_snapshot: Any,
+    expected_unified_revision: Any,
+) -> dict[str, Any]:
+    """Observe + persist one request's arbitration from shared evidence.
+
+    The live coordinator path uses this: the request-local Source
+    Evidence Snapshot is built ONCE and both the arbitration observer
+    and the Delivery Plan Shadow consume it. This function never
+    reparses the forwarded body / snapshot and never raises.
+
+    Existing v1 semantics are preserved exactly: a valid canonical
+    Frontend side plus a valid/invalid OB side produces the same
+    artifact the legacy path produced, and a Frontend canonicalization
+    failure still yields ``no_record`` -- partial OB availability never
+    weakens the Frontend measurement.
+    """
+
+    if not is_valid_conversation_id(conversation_id):
+        return {
+            "stored": False,
+            "mode": _MODE,
+            "decision": "no_record",
+            "reason": "invalid_conversation_id",
+        }
+
+    if not is_valid_cognitive_request_id(
+        cognitive_request_id
     ):
-        return unavailable
+        return {
+            "stored": False,
+            "mode": _MODE,
+            "decision": "no_record",
+            "reason": "invalid_cognitive_request_id",
+        }
 
-    if (
-        snapshot.get("conversation_id")
-        != conversation_id
+    if not is_valid_revision(
+        expected_unified_revision
     ):
-        return unavailable
+        return {
+            "stored": False,
+            "mode": _MODE,
+            "decision": "no_record",
+            "reason":
+                "invalid_expected_unified_revision",
+        }
 
-    unified = snapshot.get("unified")
-
-    if not isinstance(unified, dict):
-        return unavailable
-
-    if unified.get("version") != _UNIFIED_VERSION:
-        return unavailable
-
-    if (
-        unified.get("conversation_id")
-        != conversation_id
+    if not is_bound_to_request(
+        source_evidence_snapshot,
+        conversation_id=conversation_id,
+        cognitive_request_id=(
+            cognitive_request_id
+        ),
+        expected_unified_revision=(
+            expected_unified_revision
+        ),
     ):
-        return unavailable
+        return {
+            "stored": False,
+            "mode": _MODE,
+            "decision": "no_record",
+            "reason": "evidence_not_bound",
+        }
 
-    if (
-        unified.get("revision")
-        != expected_unified_revision
+    if not (
+        source_evidence_snapshot
+        .frontend_observation_available
     ):
-        return unavailable
+        # Malformed / unsupported Frontend: fail-safe, no failure, no
+        # artifact, no reclassification of ordinary text.
+        return {
+            "stored": False,
+            "mode": _MODE,
+            "decision": "no_record",
+            "reason": "request_not_canonicalizable",
+        }
 
-    sections = unified.get("sections")
+    observations = _observations_from_units(
+        source_evidence_snapshot.units
+    )
 
-    if not isinstance(sections, dict):
-        return ([], True)
+    artifact = _build_artifact_from_observations(
+        conversation_id=conversation_id,
+        cognitive_request_id=(
+            cognitive_request_id
+        ),
+        source_unified_revision=(
+            expected_unified_revision
+        ),
+        observations=observations,
+        ob_observation_available=(
+            source_evidence_snapshot
+            .ob_observation_available
+        ),
+    )
 
-    memories = sections.get("memories")
+    artifact["created_at"] = now_iso()
 
-    if not isinstance(memories, list):
-        return ([], True)
+    atomic_write(
+        _path(
+            conversation_id,
+            cognitive_request_id,
+        ),
+        artifact,
+    )
 
-    return (memories, True)
+    return {
+        "stored": True,
+        "mode": _MODE,
+        "decision": "observed",
+        "reason": "arbitration_observed",
+        "source_unified_revision":
+            expected_unified_revision,
+        "ob_observation_available":
+            artifact["ob_observation_available"],
+        "metrics": dict(
+            artifact["metrics"]
+        ),
+    }
 
 
 def update_memory_source_arbitration(
@@ -556,11 +646,15 @@ def update_memory_source_arbitration(
 ) -> dict[str, Any]:
     """Observe and persist one request's memory-source arbitration.
 
-    Never raises. Returns a privacy-safe report. ``stored`` is False
-    (with a reason) whenever a truthful observation cannot be made: a
-    binding is invalid, the forwarded body is not canonicalizable, or
-    the Unified revision is invalid. It performs no retrieval, no
-    embedding, no re-ranking and no memory write.
+    Compatibility wrapper. It builds the request-local Source Evidence
+    Snapshot through the SHARED adapter and then delegates to
+    ``update_memory_source_arbitration_from_evidence`` -- there is only
+    one canonicalization / adaptation per call, and the same observation
+    semantics as v1. Never raises. Returns a privacy-safe report.
+    ``stored`` is False (with a reason) whenever a truthful observation
+    cannot be made: a binding is invalid, the forwarded body is not
+    canonicalizable, or the Unified revision is invalid. It performs no
+    retrieval, no embedding, no re-ranking and no memory write.
 
     The rollout flag is owned by the caller (the Context coordinator),
     exactly like the other Memory shadow observers: this function is
@@ -599,33 +693,7 @@ def update_memory_source_arbitration(
                 "invalid_expected_unified_revision",
         }
 
-    request = _canonicalize(forward_body)
-
-    if request is None:
-        # Malformed / unsupported request is fail-safe: no failure,
-        # no artifact, no reclassification of ordinary text.
-        return {
-            "stored": False,
-            "mode": _MODE,
-            "decision": "no_record",
-            "reason": "request_not_canonicalizable",
-        }
-
-    frontend_segments = (
-        extract_frontend_memory_segments(request)
-    )
-
-    ob_memories, ob_available = (
-        _ob_memories_from_snapshot(
-            snapshot,
-            conversation_id=conversation_id,
-            expected_unified_revision=(
-                expected_unified_revision
-            ),
-        )
-    )
-
-    artifact = build_arbitration_artifact(
+    evidence = build_memory_source_evidence_snapshot(
         conversation_id=conversation_id,
         cognitive_request_id=(
             cognitive_request_id
@@ -633,59 +701,17 @@ def update_memory_source_arbitration(
         source_unified_revision=(
             expected_unified_revision
         ),
-        frontend_segments=frontend_segments,
-        ob_memories=ob_memories,
-        ob_observation_available=ob_available,
+        forward_body=forward_body,
+        memory_shadow_snapshot=snapshot,
     )
 
-    artifact["created_at"] = now_iso()
-
-    atomic_write(
-        _path(
-            conversation_id,
-            cognitive_request_id,
+    return update_memory_source_arbitration_from_evidence(
+        conversation_id=conversation_id,
+        cognitive_request_id=(
+            cognitive_request_id
         ),
-        artifact,
+        source_evidence_snapshot=evidence,
+        expected_unified_revision=(
+            expected_unified_revision
+        ),
     )
-
-    return {
-        "stored": True,
-        "mode": _MODE,
-        "decision": "observed",
-        "reason": "arbitration_observed",
-        "source_unified_revision":
-            expected_unified_revision,
-        "ob_observation_available":
-            artifact["ob_observation_available"],
-        "metrics": dict(
-            artifact["metrics"]
-        ),
-    }
-
-
-def _canonicalize(
-    forward_body: Any,
-):
-    """Parse the forwarded body with the existing canonicalizer.
-
-    Returns None for anything that is not a supported Operit request,
-    so a malformed body can never be classified as Frontend Memory.
-    This is one canonicalization pass for the observer only; it starts
-    no pipeline and reuses the existing adapter.
-    """
-
-    if not isinstance(forward_body, bytes):
-        return None
-
-    try:
-        payload = json.loads(forward_body)
-    except Exception:
-        return None
-
-    if not OperitAdapter.supports(payload):
-        return None
-
-    try:
-        return OperitAdapter().adapt(payload)
-    except Exception:
-        return None
