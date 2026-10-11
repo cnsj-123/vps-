@@ -554,5 +554,273 @@ class BindingTests(unittest.TestCase):
         )
 
 
+class MalformedObStructureTests(unittest.TestCase):
+    """Malformed OB structure is UNAVAILABLE, never "zero candidates".
+
+    Only a valid dict ``sections`` whose ``memories`` is a list yields
+    ``ob_observation_available = true``. A malformed shape must never be
+    silently reported as a valid empty observation.
+    """
+
+    def _valid_empty(self):
+        return {
+            "version": "memory-shadow-snapshot.v1",
+            "mode": "shadow_only",
+            "conversation_id": CID,
+            "revision": 5,
+            "unified": {
+                "version": "unified-context-candidate.v1",
+                "conversation_id": CID,
+                "revision": 5,
+                "sections": {"memories": []},
+            },
+        }
+
+    def test_valid_empty_list_is_available(self):
+        memories, available = (
+            evidence.ob_memories_from_snapshot(
+                self._valid_empty(),
+                conversation_id=CID,
+                expected_unified_revision=5,
+            )
+        )
+
+        self.assertEqual(memories, [])
+        self.assertTrue(available)
+
+    def test_valid_memories_are_available(self):
+        memories, available = (
+            evidence.ob_memories_from_snapshot(
+                _snapshot([_memory("m1", "OB-A")]),
+                conversation_id=CID,
+                expected_unified_revision=5,
+            )
+        )
+
+        self.assertEqual(len(memories), 1)
+        self.assertTrue(available)
+
+    def test_malformed_structure_matrix_is_unavailable(
+        self,
+    ):
+        base = {
+            "version": "unified-context-candidate.v1",
+            "conversation_id": CID,
+            "revision": 5,
+        }
+
+        def snap(unified):
+            return {
+                "version": "memory-shadow-snapshot.v1",
+                "conversation_id": CID,
+                "unified": unified,
+            }
+
+        cases = {
+            "snapshot_none": None,
+            "snapshot_empty": {},
+            "snapshot_list": [1, 2],
+            "snapshot_wrong_version": {
+                "version": "other",
+                "conversation_id": CID,
+                "unified": {
+                    **base,
+                    "sections": {"memories": []},
+                },
+            },
+            "snapshot_foreign_conversation": {
+                "version": "memory-shadow-snapshot.v1",
+                "conversation_id":
+                    "ctx_ffffffffffffffff",
+                "unified": {
+                    **base,
+                    "sections": {"memories": []},
+                },
+            },
+            "unified_missing": snap(None),
+            "unified_not_dict": snap([1, 2]),
+            "unified_wrong_version": snap(
+                {
+                    **base,
+                    "version": "other",
+                    "sections": {"memories": []},
+                }
+            ),
+            "unified_foreign_conversation": snap(
+                {
+                    **base,
+                    "conversation_id":
+                        "ctx_ffffffffffffffff",
+                    "sections": {"memories": []},
+                }
+            ),
+            "unified_wrong_revision": snap(
+                {
+                    **base,
+                    "revision": 99,
+                    "sections": {"memories": []},
+                }
+            ),
+            "sections_missing": snap(dict(base)),
+            "sections_none": snap(
+                {**base, "sections": None}
+            ),
+            "sections_list": snap(
+                {**base, "sections": []}
+            ),
+            "sections_str": snap(
+                {**base, "sections": "x"}
+            ),
+            "memories_missing": snap(
+                {**base, "sections": {}}
+            ),
+            "memories_none": snap(
+                {**base, "sections": {"memories": None}}
+            ),
+            "memories_dict": snap(
+                {**base, "sections": {"memories": {}}}
+            ),
+            "memories_str": snap(
+                {**base, "sections": {"memories": "x"}}
+            ),
+        }
+
+        for name, snapshot in cases.items():
+            with self.subTest(name=name):
+                memories, available = (
+                    evidence
+                    .ob_memories_from_snapshot(
+                        snapshot,
+                        conversation_id=CID,
+                        expected_unified_revision=5,
+                    )
+                )
+
+                self.assertEqual(memories, [])
+                self.assertFalse(available)
+
+    def test_malformed_ob_never_becomes_available_in_build(
+        self,
+    ):
+        snap = build_memory_source_evidence_snapshot(
+            conversation_id=CID,
+            cognitive_request_id=(
+                "ctxreq_" + "a" * 32
+            ),
+            source_unified_revision=5,
+            forward_body=_frontend_current_body(
+                "MEM-A"
+            ),
+            memory_shadow_snapshot={
+                "version": "memory-shadow-snapshot.v1",
+                "conversation_id": CID,
+                "unified": {
+                    "version":
+                        "unified-context-candidate.v1",
+                    "conversation_id": CID,
+                    "revision": 5,
+                    "sections": {"memories": None},
+                },
+            },
+        )
+
+        # Malformed OB is UNAVAILABLE -- not "zero candidates" -- while
+        # the independent Frontend observation stays available.
+        self.assertFalse(
+            snap.ob_observation_available
+        )
+        self.assertTrue(
+            snap.frontend_observation_available
+        )
+        self.assertEqual(
+            [
+                u
+                for u in snap.units
+                if u.source == SOURCE_OB
+            ],
+            [],
+        )
+
+
+class ModelVisibleFootprintTests(unittest.TestCase):
+
+    def test_frontend_footprint_is_the_envelope(self):
+        units = frontend_evidence_units(
+            _segments(
+                _frontend_current_body("hi")
+            )
+        )
+
+        unit = units[0]
+
+        self.assertEqual(unit.content_chars, 2)
+        # The exact envelope always carries more than the bare body.
+        self.assertGreater(
+            unit.model_visible_chars,
+            unit.content_chars,
+        )
+        self.assertGreaterEqual(
+            unit.model_visible_estimated_tokens,
+            unit.content_estimated_tokens,
+        )
+
+    def test_ob_footprint_is_exactly_zero(self):
+        unit = ob_evidence_units(
+            [_memory("m1", "OB-A")]
+        )[0]
+
+        self.assertEqual(unit.model_visible_chars, 0)
+        self.assertEqual(
+            unit.model_visible_estimated_tokens, 0
+        )
+
+    def test_segment_without_envelope_is_refused(self):
+        # No canonical raw attachment => no proven model-visible
+        # envelope, so the unit is refused rather than measured as its
+        # bare body.
+        segment = FrontendMemorySegment(
+            placement=SCOPE_CURRENT,
+            source_message_index=0,
+            source_block_index=0,
+            body="BODY",
+            raw_attachment="",
+        )
+
+        self.assertEqual(
+            frontend_evidence_units([segment]), []
+        )
+
+
+class NoSilentTruncationTests(unittest.TestCase):
+
+    def test_all_frontend_occurrences_are_kept(self):
+        count = 520
+
+        bodies = [
+            "M-%d" % index
+            for index in range(count)
+        ]
+
+        units = frontend_evidence_units(
+            _segments(
+                _frontend_current_body(*bodies)
+            )
+        )
+
+        self.assertEqual(len(units), count)
+
+    def test_all_ob_occurrences_are_kept(self):
+        count = 520
+
+        units = ob_evidence_units(
+            [
+                _memory("m%d" % index, "C-%d" % index)
+                for index in range(count)
+            ]
+        )
+
+        self.assertEqual(len(units), count)
+
+
 if __name__ == "__main__":
     unittest.main()

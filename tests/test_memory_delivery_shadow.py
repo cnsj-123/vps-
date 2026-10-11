@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -96,11 +97,12 @@ def _snap(
     frontend_available=True,
     ob_available=True,
     revision=5,
+    rid=RID,
 ):
     return MemorySourceEvidenceSnapshot(
         version=evidence._VERSION,
         conversation_id=CID,
-        cognitive_request_id=RID,
+        cognitive_request_id=rid,
         source_unified_revision=revision,
         frontend_observation_available=(
             frontend_available
@@ -1025,6 +1027,400 @@ class DeliveryPersistenceTests(unittest.TestCase):
                 "ob_unit_count"
             ],
             2,
+        )
+
+
+class DeliveryMetricScopeTests(unittest.TestCase):
+    """Delivery metrics share ONE explicit full-plan scope."""
+
+    def test_model_visible_metrics_use_envelope(self):
+        artifact = _build(_frontend_units("hi"))
+
+        row = artifact["rows"][0]
+        metrics = artifact["metrics"]
+
+        # The envelope footprint is larger than the bare body...
+        self.assertGreater(
+            row["model_visible_chars"],
+            row["content_chars"],
+        )
+        # ...and the metric sums the envelope, never the body.
+        self.assertEqual(
+            metrics["current_model_visible_chars"],
+            row["model_visible_chars"],
+        )
+        self.assertGreater(
+            metrics["current_model_visible_chars"],
+            metrics["combined_content_chars"],
+        )
+        self.assertEqual(
+            metrics["current_model_visible_count"], 1
+        )
+
+    def test_ob_contributes_zero_model_visible(self):
+        artifact = _build(
+            _ob_units([_memory("m1", "OB-A")]),
+            policy=_policy(
+                eligible=[_memory("m1", "OB-A")]
+            ),
+        )
+
+        row = artifact["rows"][0]
+
+        self.assertEqual(row["model_visible_chars"], 0)
+        self.assertEqual(
+            row["model_visible_estimated_tokens"], 0
+        )
+        self.assertEqual(
+            artifact["metrics"][
+                "current_model_visible_chars"
+            ],
+            0,
+        )
+
+    def test_truncation_metric_algebra(self):
+        memories = [
+            _memory("m%d" % index, "OB-%d" % index)
+            for index in range(
+                MAX_DELIVERY_ROWS + 10
+            )
+        ]
+
+        artifact = _build(
+            _ob_units(memories),
+            policy=_policy(eligible=memories),
+        )
+
+        metrics = artifact["metrics"]
+
+        self.assertEqual(
+            metrics["unit_count"],
+            metrics["persisted_unit_count"]
+            + metrics["truncated_unit_count"],
+        )
+        self.assertEqual(
+            metrics["unit_count"],
+            metrics["frontend_unit_count"]
+            + metrics["ob_unit_count"],
+        )
+        self.assertEqual(
+            metrics["unit_count"],
+            metrics["direct_data_count"]
+            + metrics["flash_cue_count"]
+            + metrics["drop_count"]
+            + metrics["unknown_count"],
+        )
+        self.assertEqual(
+            metrics["persisted_unit_count"],
+            len(artifact["rows"]),
+        )
+        self.assertEqual(
+            metrics["truncated_unit_count"], 10
+        )
+        self.assertEqual(
+            metrics["ob_unit_count"],
+            MAX_DELIVERY_ROWS + 10,
+        )
+        self.assertTrue(
+            is_valid_memory_delivery_plan_artifact(
+                artifact
+            )
+        )
+
+    def test_truncation_split_is_full_scope(self):
+        frontend = _frontend_units(
+            *["F-%d" % index for index in range(3)]
+        )
+        ob = _ob_units(
+            [
+                _memory("m%d" % index, "OB-%d" % index)
+                for index in range(
+                    MAX_DELIVERY_ROWS + 5
+                )
+            ]
+        )
+
+        artifact = _build(frontend + ob, policy=None)
+
+        metrics = artifact["metrics"]
+
+        # Every counter is full-scope, not the persisted slice: the
+        # persisted rows are all 3 frontend + 61 ob, while the metrics
+        # report the complete request.
+        self.assertEqual(
+            metrics["frontend_unit_count"], 3
+        )
+        self.assertEqual(
+            metrics["ob_unit_count"],
+            MAX_DELIVERY_ROWS + 5,
+        )
+        self.assertEqual(
+            metrics["unit_count"],
+            3 + MAX_DELIVERY_ROWS + 5,
+        )
+        self.assertEqual(
+            metrics["unit_count"],
+            metrics["persisted_unit_count"]
+            + metrics["truncated_unit_count"],
+        )
+        self.assertTrue(
+            is_valid_memory_delivery_plan_artifact(
+                artifact
+            )
+        )
+
+
+class DeliveryEvidenceRefTests(unittest.TestCase):
+    """evidence_ref is semantically recomputed, not shape-checked."""
+
+    def _valid(self):
+        return _build(
+            _frontend_units("MEM-A")
+            + _ob_units([_memory("m1", "OB-A")]),
+            policy=_policy(
+                eligible=[_memory("m1", "OB-A")]
+            ),
+        )
+
+    def test_rejects_forged_valid_looking_ref(self):
+        artifact = self._valid()
+
+        real = artifact["rows"][0]["evidence_ref"]
+        forged = "b" * 64
+
+        self.assertNotEqual(real, forged)
+
+        artifact["rows"][0]["evidence_ref"] = forged
+
+        self.assertFalse(
+            is_valid_memory_delivery_plan_artifact(
+                artifact
+            )
+        )
+
+    def test_rejects_swapped_refs(self):
+        artifact = self._valid()
+
+        ref_0 = artifact["rows"][0]["evidence_ref"]
+        ref_1 = artifact["rows"][1]["evidence_ref"]
+
+        artifact["rows"][0]["evidence_ref"] = ref_1
+        artifact["rows"][1]["evidence_ref"] = ref_0
+
+        self.assertFalse(
+            is_valid_memory_delivery_plan_artifact(
+                artifact
+            )
+        )
+
+    def test_rejects_forged_ref_in_truncated_artifact(self):
+        memories = [
+            _memory("m%d" % index, "OB-%d" % index)
+            for index in range(
+                MAX_DELIVERY_ROWS + 10
+            )
+        ]
+
+        artifact = _build(
+            _ob_units(memories),
+            policy=_policy(eligible=memories),
+        )
+
+        self.assertTrue(
+            is_valid_memory_delivery_plan_artifact(
+                artifact
+            )
+        )
+
+        artifact["rows"][0]["evidence_ref"] = "c" * 64
+
+        self.assertFalse(
+            is_valid_memory_delivery_plan_artifact(
+                artifact
+            )
+        )
+
+
+class DeliveryIsolationTests(unittest.TestCase):
+    """Request-local evidence survives a concurrent overwrite."""
+
+    def test_ab_interleaving_keeps_evidence_isolated(self):
+        rid_a = "ctxreq_" + "4" * 32
+        rid_b = "ctxreq_" + "5" * 32
+
+        units_a = (
+            _frontend_units("FRONT-A")
+            + _ob_units([_memory("a1", "OB-A")])
+        )
+        units_b = (
+            _frontend_units("FRONT-B")
+            + _ob_units(
+                [
+                    _memory("b1", "OB-B"),
+                    _memory("b2", "OB-B2"),
+                ]
+            )
+        )
+
+        snap_a = _snap(units_a, rid=rid_a)
+        snap_b = _snap(units_b, rid=rid_b)
+
+        a_captured = threading.Event()
+        release_a = threading.Event()
+        result = {}
+
+        def run_a():
+            # Request A captured its OWN request-local evidence
+            # (snap_a); now pause while request B proceeds.
+            a_captured.set()
+            release_a.wait(10)
+            result["a"] = update_memory_delivery_plan(
+                conversation_id=CID,
+                cognitive_request_id=rid_a,
+                source_evidence_snapshot=snap_a,
+                expected_unified_revision=5,
+                base_policy=None,
+            )
+
+        with tempfile.TemporaryDirectory() as root:
+            with patch.dict(
+                os.environ,
+                {"OMBRE_CONTEXT_STATE_DIR": root},
+                clear=False,
+            ):
+                worker = threading.Thread(
+                    target=run_a
+                )
+                worker.start()
+
+                self.assertTrue(a_captured.wait(10))
+
+                # "Request B" overwrites the conversation-scoped
+                # Unified candidate on disk while A is paused. A must
+                # never observe it.
+                unified_dir = (
+                    Path(root)
+                    / "unified_context_candidate"
+                )
+                unified_dir.mkdir(
+                    parents=True, exist_ok=True
+                )
+                (
+                    unified_dir / (CID + ".json")
+                ).write_text(
+                    json.dumps(
+                        {
+                            "version":
+                                "unified-context"
+                                "-candidate.v1",
+                            "conversation_id": CID,
+                            "revision": 77,
+                            "sections": {
+                                "memories": [
+                                    _memory(
+                                        "b1", "OB-B"
+                                    ),
+                                    _memory(
+                                        "b2", "OB-B2"
+                                    ),
+                                    _memory(
+                                        "b3", "OB-B3"
+                                    ),
+                                ]
+                            },
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+                result["b"] = update_memory_delivery_plan(
+                    conversation_id=CID,
+                    cognitive_request_id=rid_b,
+                    source_evidence_snapshot=snap_b,
+                    expected_unified_revision=5,
+                    base_policy=None,
+                )
+
+                release_a.set()
+                worker.join(10)
+
+                self.assertFalse(worker.is_alive())
+
+                plan_dir = (
+                    Path(root)
+                    / "memory_delivery_plan"
+                    / CID
+                )
+
+                plans = {}
+
+                for path in plan_dir.iterdir():
+                    artifact = json.loads(
+                        path.read_text(
+                            encoding="utf-8"
+                        )
+                    )
+                    plans[
+                        artifact[
+                            "cognitive_request_id"
+                        ]
+                    ] = artifact
+
+        self.assertTrue(result["a"]["stored"])
+        self.assertTrue(result["b"]["stored"])
+
+        plan_a = plans[rid_a]
+        plan_b = plans[rid_b]
+
+        # A saw ONLY A's evidence; B's overwrite is invisible to A.
+        self.assertEqual(
+            plan_a["metrics"]["ob_unit_count"], 1
+        )
+        self.assertEqual(
+            plan_a["metrics"][
+                "frontend_unit_count"
+            ],
+            1,
+        )
+        self.assertEqual(
+            plan_a["metrics"]["unit_count"], 2
+        )
+
+        # B saw ONLY B's evidence.
+        self.assertEqual(
+            plan_b["metrics"]["ob_unit_count"], 2
+        )
+        self.assertEqual(
+            plan_b["metrics"]["unit_count"], 3
+        )
+
+        refs_a = {
+            row["evidence_ref"]
+            for row in plan_a["rows"]
+        }
+        refs_b = {
+            row["evidence_ref"]
+            for row in plan_b["rows"]
+        }
+
+        self.assertTrue(refs_a)
+        self.assertTrue(refs_b)
+        self.assertEqual(refs_a & refs_b, set())
+
+        # A's rows are exactly A's captured units.
+        self.assertEqual(
+            {
+                row["content_digest"]
+                for row in plan_a["rows"]
+            },
+            {unit.content_digest for unit in units_a},
+        )
+        self.assertEqual(
+            {
+                row["content_digest"]
+                for row in plan_b["rows"]
+            },
+            {unit.content_digest for unit in units_b},
         )
 
 

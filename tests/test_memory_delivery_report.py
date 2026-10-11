@@ -16,6 +16,7 @@ from ombrebrain.context import (
     memory_source_evidence as evidence,
 )
 from ombrebrain.context.memory_delivery_shadow import (
+    MAX_DELIVERY_ROWS,
     update_memory_delivery_plan,
 )
 from ombrebrain.context.memory_source_evidence import (
@@ -460,6 +461,50 @@ class ReadOnlyTests(unittest.TestCase):
         self.assertNotIn(_SENTINEL_OB, rendered)
         self.assertNotIn("ctx_", rendered)
         self.assertNotIn("ctxreq_", rendered)
+
+
+class TruncationAggregationTests(unittest.TestCase):
+
+    def test_untruncated_artifacts_report_zero(self):
+        with tempfile.TemporaryDirectory() as root:
+            _persist(
+                root,
+                units=_frontend_units("MEM-A"),
+            )
+            report = reporter.build_report(root=root)
+
+        self.assertEqual(
+            report["truncated_artifact_count"], 0
+        )
+        self.assertEqual(
+            report["truncated_unit_count"], 0
+        )
+
+    def test_truncated_artifacts_expose_counters(self):
+        memories = [
+            _memory("m%d" % index, "OB-%d" % index)
+            for index in range(
+                MAX_DELIVERY_ROWS + 6
+            )
+        ]
+
+        with tempfile.TemporaryDirectory() as root:
+            _persist(
+                root,
+                units=_ob_units(memories),
+                policy=_policy(eligible=memories),
+            )
+            report = reporter.build_report(root=root)
+
+        self.assertEqual(
+            report["valid_artifact_count"], 1
+        )
+        self.assertEqual(
+            report["truncated_artifact_count"], 1
+        )
+        self.assertEqual(
+            report["truncated_unit_count"], 6
+        )
 
 
 class CliTests(unittest.TestCase):

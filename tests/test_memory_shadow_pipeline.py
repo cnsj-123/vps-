@@ -41,6 +41,7 @@ from ombrebrain.context.unified_context_candidate import (
 )
 
 import ombrebrain.context.unified_context_candidate as unified_module
+import ombrebrain.context.memory_source_evidence as evidence_module
 
 
 CID = "ctx_0123456789abcdef"
@@ -1584,6 +1585,87 @@ class DeliveryFlagMatrixTests(
         self.assertEqual(
             len(arbitration_files), 1
         )
+
+    async def test_adapter_built_exactly_once_and_shared(
+        self,
+    ):
+        # With BOTH consumers ON the shared adapter must be invoked
+        # exactly once, and both observers must receive the SAME
+        # request-local evidence object.
+        self.bind([_memory("m1", "shared memory")])
+
+        environ = {
+            **_ISOLATED_ENV,
+            _DELIVERY_ENV: "1",
+            _ARBITRATION_ENV: "1",
+        }
+
+        built = []
+        delivery_seen = []
+        arbitration_seen = []
+
+        real_build = (
+            evidence_module
+            .build_memory_source_evidence_snapshot
+        )
+        real_delivery = (
+            coordinator.update_memory_delivery_plan
+        )
+        real_arbitration = (
+            coordinator
+            .update_memory_source_arbitration_from_evidence
+        )
+
+        def spy_build(*args, **kwargs):
+            snapshot = real_build(*args, **kwargs)
+
+            built.append(snapshot)
+
+            return snapshot
+
+        def spy_delivery(*args, **kwargs):
+            delivery_seen.append(
+                kwargs.get("source_evidence_snapshot")
+            )
+
+            return real_delivery(*args, **kwargs)
+
+        def spy_arbitration(*args, **kwargs):
+            arbitration_seen.append(
+                kwargs.get("source_evidence_snapshot")
+            )
+
+            return real_arbitration(*args, **kwargs)
+
+        with patch.dict(
+            os.environ,
+            environ,
+            clear=False,
+        ):
+            with patch.object(
+                evidence_module,
+                "build_memory_source_evidence_snapshot",
+                side_effect=spy_build,
+            ) as build_mock, patch.object(
+                coordinator,
+                "update_memory_delivery_plan",
+                side_effect=spy_delivery,
+            ), patch.object(
+                coordinator,
+                "update_memory_source_arbitration_from_evidence",
+                side_effect=spy_arbitration,
+            ):
+                await coordinator.run_context_pipeline(
+                    _body()
+                )
+
+        self.assertEqual(build_mock.call_count, 1)
+        self.assertEqual(len(built), 1)
+        self.assertEqual(len(delivery_seen), 1)
+        self.assertEqual(len(arbitration_seen), 1)
+
+        self.assertIs(delivery_seen[0], built[0])
+        self.assertIs(arbitration_seen[0], built[0])
 
 
 if __name__ == "__main__":
