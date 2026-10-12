@@ -227,20 +227,10 @@ class EmptyScanTests(unittest.TestCase):
     def test_negative_limit_scans_nothing(self):
         body = _frontend_body("MEM-A")
 
-        with tempfile.TemporaryDirectory() as root:
-            _persist(
-                root,
-                units=_frontend_units_from(body),
-                body=body,
+        def _no_scandir(path):
+            raise AssertionError(
+                "negative limit must not traverse"
             )
-            report = reporter.build_report(
-                root=root, limit=-1
-            )
-
-        self.assertEqual(report["artifact_count"], 0)
-
-    def test_zero_limit_opens_no_artifact(self):
-        body = _frontend_body("MEM-A")
 
         with tempfile.TemporaryDirectory() as root:
             _persist(
@@ -250,16 +240,57 @@ class EmptyScanTests(unittest.TestCase):
             )
 
             with patch.object(
-                reporter,
-                "_load_artifact",
-                wraps=reporter._load_artifact,
-            ) as opened:
-                report = reporter.build_report(
-                    root=root, limit=0
-                )
+                reporter.os, "scandir", _no_scandir
+            ):
+                with patch.object(
+                    reporter,
+                    "_load_artifact",
+                    wraps=reporter._load_artifact,
+                ) as opened:
+                    report = reporter.build_report(
+                        root=root, limit=-1
+                    )
 
         self.assertEqual(report["artifact_count"], 0)
         self.assertEqual(opened.call_count, 0)
+        self.assertEqual(report["scan_visit_budget"], 0)
+        self.assertEqual(
+            report["scan_visited_entry_count"], 0
+        )
+
+    def test_zero_limit_opens_no_artifact(self):
+        body = _frontend_body("MEM-A")
+
+        def _no_scandir(path):
+            raise AssertionError(
+                "zero limit must not traverse"
+            )
+
+        with tempfile.TemporaryDirectory() as root:
+            _persist(
+                root,
+                units=_frontend_units_from(body),
+                body=body,
+            )
+
+            with patch.object(
+                reporter.os, "scandir", _no_scandir
+            ):
+                with patch.object(
+                    reporter,
+                    "_load_artifact",
+                    wraps=reporter._load_artifact,
+                ) as opened:
+                    report = reporter.build_report(
+                        root=root, limit=0
+                    )
+
+        self.assertEqual(report["artifact_count"], 0)
+        self.assertEqual(opened.call_count, 0)
+        self.assertEqual(report["scan_visit_budget"], 0)
+        self.assertEqual(
+            report["scan_visited_entry_count"], 0
+        )
 
 
 class AggregationTests(unittest.TestCase):
@@ -778,6 +809,275 @@ class TruncationAggregationTests(unittest.TestCase):
             ],
             1,
         )
+
+
+class _FakeEntry:
+    """Minimal DirEntry stand-in for the patched ``os.scandir``."""
+
+    def __init__(self, path, *, kind):
+        self.path = str(path)
+        self.name = os.path.basename(str(path))
+        self._kind = kind
+
+    def is_dir(self, follow_symlinks=True):
+        return self._kind == "dir"
+
+    def is_file(self, follow_symlinks=True):
+        return self._kind == "file"
+
+
+class _GuardedScandir:
+    """Lazy scandir-like iterator that RAISES if over-enumerated.
+
+    ``guard_at`` is the index at which requesting the next entry raises
+    ``AssertionError("over-enumerated")``. A truly bounded traversal
+    never reaches it, so a failure here proves the reporter asked for an
+    entry it was not allowed to observe.
+    """
+
+    def __init__(self, entries, *, guard_at):
+        self._entries = list(entries)
+        self._guard_at = guard_at
+        self._index = 0
+        self.requested = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._index >= self._guard_at:
+            raise AssertionError("over-enumerated")
+
+        if self._index >= len(self._entries):
+            raise StopIteration
+
+        entry = self._entries[self._index]
+        self._index += 1
+        self.requested += 1
+        return entry
+
+
+def _fake_scandir(mapping):
+    """Build a ``scandir`` replacement dispatching on the path."""
+
+    def scandir(path):
+        key = os.fspath(path)
+
+        if key not in mapping:
+            raise AssertionError(
+                "unexpected scandir: %r" % key
+            )
+
+        return mapping[key]
+
+    return scandir
+
+
+class BoundedTraversalTests(unittest.TestCase):
+    """The filesystem TRAVERSAL itself must be bounded -- not merely the
+    number of parsed files.
+
+    These tests use an instrumented scandir whose root / child iterator
+    RAISES when asked for an entry beyond the bound. A pass therefore
+    proves the reporter stopped enumerating (did not drain and sort the
+    namespace) rather than that it merely truncated after parsing.
+    """
+
+    def _base(self, root):
+        return (
+            Path(root)
+            / "memory_live_authority_candidate"
+        )
+
+    def test_root_iterator_not_exhausted_at_limit(self):
+        root = "/fake/state"
+        base = self._base(root)
+
+        conv_a = _FakeEntry(base / "conv_a", kind="dir")
+        conv_b = _FakeEntry(base / "conv_b", kind="dir")
+        conv_c = _FakeEntry(base / "conv_c", kind="dir")
+
+        # Only two top-level entries may ever be requested.
+        root_iter = _GuardedScandir(
+            [conv_a, conv_b, conv_c], guard_at=2
+        )
+
+        child_a = _GuardedScandir(
+            [_FakeEntry(base / "conv_a" / "r1.json",
+                        kind="file")],
+            guard_at=10,
+        )
+        child_b = _GuardedScandir(
+            [_FakeEntry(base / "conv_b" / "r2.json",
+                        kind="file")],
+            guard_at=10,
+        )
+
+        mapping = {
+            os.fspath(base): root_iter,
+            os.fspath(base / "conv_a"): child_a,
+            os.fspath(base / "conv_b"): child_b,
+        }
+
+        with patch.object(
+            reporter.os,
+            "scandir",
+            _fake_scandir(mapping),
+        ):
+            report = reporter.build_report(
+                root=root, limit=2
+            )
+
+        # Exactly two artifacts selected; the third top-level
+        # conversation entry was NEVER requested (guard_at=2 would have
+        # raised if it had been).
+        self.assertEqual(report["artifact_count"], 2)
+        self.assertEqual(root_iter.requested, 2)
+        self.assertEqual(
+            report["scan_budget_exhausted"], False
+        )
+
+    def test_child_iterator_not_exhausted_at_limit(self):
+        root = "/fake/state"
+        base = self._base(root)
+
+        conv = _FakeEntry(base / "conv_a", kind="dir")
+        root_iter = _GuardedScandir([conv], guard_at=10)
+
+        # Three artifacts in ONE directory, but only the first two may
+        # ever be requested.
+        child_iter = _GuardedScandir(
+            [
+                _FakeEntry(base / "conv_a" / "a.json",
+                           kind="file"),
+                _FakeEntry(base / "conv_a" / "b.json",
+                           kind="file"),
+                _FakeEntry(base / "conv_a" / "c.json",
+                           kind="file"),
+            ],
+            guard_at=2,
+        )
+
+        mapping = {
+            os.fspath(base): root_iter,
+            os.fspath(base / "conv_a"): child_iter,
+        }
+
+        with patch.object(
+            reporter.os,
+            "scandir",
+            _fake_scandir(mapping),
+        ):
+            report = reporter.build_report(
+                root=root, limit=2
+            )
+
+        self.assertEqual(report["artifact_count"], 2)
+        self.assertEqual(child_iter.requested, 2)
+
+    def test_visit_budget_stops_before_limit(self):
+        root = "/fake/state"
+        base = self._base(root)
+
+        # Many empty conversation dirs and NO artifact anywhere.
+        entries = [
+            _FakeEntry(base / ("conv_%d" % index), kind="dir")
+            for index in range(8)
+        ]
+
+        # limit=2 -> visit budget 4: at most four top-level entries may
+        # ever be requested.
+        root_iter = _GuardedScandir(entries, guard_at=4)
+
+        mapping = {os.fspath(base): root_iter}
+
+        for entry in entries:
+            mapping[entry.path] = _GuardedScandir(
+                [], guard_at=10
+            )
+
+        with patch.object(
+            reporter.os,
+            "scandir",
+            _fake_scandir(mapping),
+        ):
+            report = reporter.build_report(
+                root=root, limit=2
+            )
+
+        # Underfill is allowed: the budget -- not the limit -- ended the
+        # scan, and no artifact beyond the budget was opened.
+        self.assertEqual(report["artifact_count"], 0)
+        self.assertEqual(report["scan_visit_budget"], 4)
+        self.assertEqual(
+            report["scan_visited_entry_count"], 4
+        )
+        self.assertEqual(
+            report["scan_budget_exhausted"], True
+        )
+        self.assertEqual(root_iter.requested, 4)
+
+    def test_junk_prefix_underfills_without_unbounded_scan(self):
+        root = "/fake/state"
+        base = self._base(root)
+
+        # A non-conversation (file) top-level entry plus an empty
+        # conversation dir before the only real artifact.
+        junk = _FakeEntry(base / "top_level.json", kind="file")
+        empty = _FakeEntry(base / "conv_empty", kind="dir")
+        conv = _FakeEntry(base / "conv_a", kind="dir")
+
+        root_iter = _GuardedScandir(
+            [junk, empty, conv], guard_at=4
+        )
+
+        mapping = {
+            os.fspath(base): root_iter,
+            os.fspath(base / "conv_empty"):
+                _GuardedScandir([], guard_at=10),
+            os.fspath(base / "conv_a"): _GuardedScandir(
+                [
+                    _FakeEntry(base / "conv_a" / "r1.json",
+                               kind="file")
+                ],
+                guard_at=10,
+            ),
+        }
+
+        with patch.object(
+            reporter.os,
+            "scandir",
+            _fake_scandir(mapping),
+        ):
+            report = reporter.build_report(
+                root=root, limit=3
+            )
+
+        # limit=3 but only one artifact exists in the bounded prefix, so
+        # the reporter underfills instead of scanning on to "fill" it.
+        self.assertEqual(report["artifact_count"], 1)
+        self.assertEqual(
+            report["scan_budget_exhausted"], False
+        )
+
+
+class SourceBoundaryTests(unittest.TestCase):
+    """The module source must not contain eager namespace enumeration."""
+
+    def test_no_eager_directory_enumeration(self):
+        source = Path(reporter.__file__).read_text(
+            encoding="utf-8"
+        )
+
+        self.assertNotIn("iterdir", source)
+        self.assertNotIn("sorted(", source)
+        self.assertIn("os.scandir", source)
 
 
 class ReadOnlyTests(unittest.TestCase):

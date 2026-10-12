@@ -263,11 +263,19 @@ every file: a candidate artifact is accepted only when its embedded conversation
 request ids match the `<conversation_id>/<cognitive_request_id>.json` path it was read
 from, so one request artifact copied under a foreign request filename or conversation
 directory is counted invalid and contributes **zero** to every statistic. Its `--limit`
-(default 500) is a **real traversal bound**, not post-scan slicing: a deterministic
-lexical traversal (sorted directory names, then sorted file names) yields files lazily
-and stops as soon as the limit is reached, so a large state tree is never fully
-enumerated before the bound is applied. The reporter never emits a "safe to cut over"
-state and never mutates anything it reads.
+(default 500) is the **maximum** artifact count, not a guaranteed count: the reporter
+uses a **true bounded filesystem traversal** via `os.scandir`, so directory entries are
+produced lazily and the namespace is never fully listed or sorted. Traversal stops as
+soon as **either** `limit` artifacts have been selected **or** a hard entry-visit budget
+(`max(2 * limit, limit)`) is reached — every top-level and child entry examined counts
+against that budget. The scan is therefore genuinely bounded and may **underfill** (a
+bounded prefix full of empty / junk / non-JSON entries yields fewer than `limit`
+artifacts); it does **not** globally sort or enumerate the full namespace, and it returns
+files in bounded traversal order rather than claiming a globally lexicographic prefix.
+Aggregate-only scan telemetry (`scan_visit_budget`, `scan_visited_entry_count`,
+`scan_budget_exhausted`) lets a reviewer distinguish "only N artifacts exist" from "the
+scan budget ended after observing N artifacts". The reporter never emits a "safe to cut
+over" state and never mutates anything it reads.
 
 ## 15. Privacy
 

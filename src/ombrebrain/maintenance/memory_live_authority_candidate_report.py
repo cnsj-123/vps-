@@ -104,78 +104,167 @@ def _reject_constant(name: str) -> Any:
     )
 
 
-def _iter_artifact_paths(base: Path):
-    """Deterministic lexical traversal yielding artifact files one at a
-    time.
+def _visit_budget(limit: int) -> int:
+    """Hard upper bound on filesystem entries examined for ``limit``.
 
-    It sorts directory names and, within one conversation directory,
-    file names, then yields files lazily. Callers stop consuming as soon
-    as the requested limit is reached, so the full tree is NEVER
-    enumerated before slicing: files in conversation directories beyond
-    the one that reaches the limit are never even listed.
+    Core to the bounded-maintenance contract: the reporter may NEVER
+    observe more than this many directory entries, so a state tree with
+    an unbounded / hostile number of entries can not force the reporter
+    to enumerate (or sort) the whole namespace. The budget is a small,
+    documented function of ``limit``: ``max(2 * limit, limit)`` for a
+    positive limit, and ``0`` when nothing may be read.
     """
 
+    if limit <= 0:
+        return 0
+
+    return max(2 * limit, limit)
+
+
+def _iter_artifact_paths(
+    base: Path,
+    *,
+    limit: int,
+    stats: dict[str, Any],
+):
+    """Bounded, lazy traversal yielding artifact files one at a time.
+
+    The filesystem iteration itself is bounded. It uses ``os.scandir``
+    so directory entries are produced lazily, and it stops as soon as
+    EITHER ``limit`` artifacts have been selected OR the entry-visit
+    budget has been reached. It never materializes an unbounded
+    namespace (no eager listing or sorting of the whole directory
+    tree), so neither the top-level conversation iterator nor a
+    conversation's child iterator is ever drained past the bound.
+
+    Every filesystem entry examined -- top-level or child -- counts
+    against the budget. Because the scan is genuinely bounded the
+    result may UNDERFILL: it yields the traversal-order prefix of
+    artifacts, not a globally lexicographic selection, and a prefix of
+    empty / junk / non-JSON entries yields fewer than ``limit`` files.
+
+    Aggregate-only telemetry (integers / boolean, never a name, path or
+    id) is written into ``stats``:
+
+        scan_visit_budget         the entry-visit budget for this scan
+        scan_visited_entry_count  entries actually examined
+        scan_budget_exhausted     True when the budget (not ``limit``)
+                                  ended the scan
+    """
+
+    visit_budget = _visit_budget(limit)
+
+    stats["scan_visit_budget"] = visit_budget
+    stats["scan_visited_entry_count"] = 0
+    stats["scan_budget_exhausted"] = False
+
+    if limit <= 0:
+        return
+
+    visited = 0
+    selected = 0
+    budget_exhausted = False
+
     try:
-        conversation_dirs = sorted(
-            base.iterdir(),
-            key=lambda item: item.name,
-        )
+        root_iterator = os.scandir(base)
     except OSError:
         return
 
-    for conversation_dir in conversation_dirs:
-        try:
-            if not conversation_dir.is_dir():
+    with root_iterator:
+        stop = False
+
+        for root_entry in root_iterator:
+            visited += 1
+
+            if visited >= visit_budget:
+                budget_exhausted = True
+                break
+
+            try:
+                is_conversation_dir = (
+                    root_entry.is_dir(
+                        follow_symlinks=False
+                    )
+                )
+            except OSError:
+                is_conversation_dir = False
+
+            if not is_conversation_dir:
                 continue
-        except OSError:
-            continue
 
-        try:
-            children = sorted(
-                (
-                    child
-                    for child in conversation_dir.iterdir()
-                    if child.is_file()
-                    and child.suffix == ".json"
-                ),
-                key=lambda item: item.name,
-            )
-        except OSError:
-            continue
+            try:
+                child_iterator = os.scandir(
+                    root_entry.path
+                )
+            except OSError:
+                continue
 
-        for child in children:
-            yield child
+            with child_iterator:
+                for child_entry in child_iterator:
+                    visited += 1
+
+                    try:
+                        is_artifact = (
+                            child_entry.name.endswith(
+                                ".json"
+                            )
+                            and child_entry.is_file(
+                                follow_symlinks=False
+                            )
+                        )
+                    except OSError:
+                        is_artifact = False
+
+                    if is_artifact:
+                        yield Path(child_entry.path)
+
+                        selected += 1
+
+                        if selected >= limit:
+                            stop = True
+                            break
+
+                    if visited >= visit_budget:
+                        budget_exhausted = True
+                        stop = True
+                        break
+
+            if stop:
+                break
+
+    stats["scan_visited_entry_count"] = visited
+    stats["scan_budget_exhausted"] = budget_exhausted
 
 
 def _artifact_paths(
     root: Path,
     *,
     limit: int,
-) -> list[Path]:
-    """Deterministic, BOUNDED list of artifact files (read-only).
+) -> tuple[list[Path], dict[str, Any]]:
+    """Bounded list of artifact files plus aggregate scan telemetry
+    (read-only).
 
-    The limit is a real traversal bound: traversal STOPS as soon as
-    ``limit`` files have been selected, so a huge state tree is never
-    enumerated before slicing. ``limit <= 0`` selects no file at all.
+    ``limit`` is the MAXIMUM number of artifacts selected / parsed, not
+    a guaranteed count: traversal also enforces a hard filesystem-entry
+    visit budget and stops at whichever bound is reached first, so a
+    huge (or hostile) state tree is never enumerated before slicing and
+    the result may underfill. ``limit <= 0`` selects no file and opens
+    no directory at all.
     """
 
-    if limit <= 0:
-        return []
+    stats: dict[str, Any] = {}
 
     base = root / _CANDIDATE_DIRNAME
 
-    if not base.is_dir():
-        return []
+    paths = list(
+        _iter_artifact_paths(
+            base,
+            limit=limit,
+            stats=stats,
+        )
+    )
 
-    paths: list[Path] = []
-
-    for path in _iter_artifact_paths(base):
-        paths.append(path)
-
-        if len(paths) >= limit:
-            break
-
-    return paths
+    return paths, stats
 
 
 def _path_identity(path: Path) -> tuple[str, str]:
@@ -225,7 +314,9 @@ def build_report(
     else:
         base = Path(root)
 
-    paths = _artifact_paths(base, limit=limit)
+    paths, scan_stats = _artifact_paths(
+        base, limit=limit
+    )
 
     artifact_count = 0
     valid_artifact_count = 0
@@ -415,6 +506,20 @@ def build_report(
         "live_cutover_ready_true_count": (
             live_cutover_ready_true_count
         ),
+        "scan_visit_budget": _as_count(
+            scan_stats.get("scan_visit_budget")
+        ),
+        "scan_visited_entry_count": _as_count(
+            scan_stats.get(
+                "scan_visited_entry_count"
+            )
+        ),
+        "scan_budget_exhausted": (
+            scan_stats.get(
+                "scan_budget_exhausted"
+            )
+            is True
+        ),
     }
 
 
@@ -490,6 +595,24 @@ def _render_text(
             "  %-58s %s"
             % (name, report[name])
         )
+
+    lines.append("")
+    lines.append("scan_bound:")
+    for name in (
+        "scan_visit_budget",
+        "scan_visited_entry_count",
+    ):
+        lines.append(
+            "  %-58s %s"
+            % (name, report[name])
+        )
+    lines.append(
+        "  %-58s %s"
+        % (
+            "scan_budget_exhausted",
+            report["scan_budget_exhausted"],
+        )
+    )
 
     return "\n".join(lines)
 
