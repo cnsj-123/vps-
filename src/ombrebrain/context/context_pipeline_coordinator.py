@@ -35,6 +35,13 @@ from ombrebrain.context.memory_authority_migration_shadow import (
     log_memory_authority_migration_report,
     update_memory_authority_migration,
 )
+from ombrebrain.context.frontend_controlled_direct_surface import (
+    build_frontend_controlled_direct_surface,
+)
+from ombrebrain.context.memory_live_authority_candidate_shadow import (
+    log_memory_live_authority_candidate_report,
+    update_memory_live_authority_candidate,
+)
 from ombrebrain.context.memory_source_arbitration_shadow import (
     update_memory_source_arbitration_from_evidence,
 )
@@ -199,6 +206,27 @@ _MEMORY_DELIVERY_ENV = (
 # Real Context Injection, Source Arbitration or the Exposure Ledger.
 _MEMORY_AUTHORITY_MIGRATION_ENV = (
     "OMBRE_GATEWAY_CONTEXT_MEMORY_AUTHORITY_MIGRATION_SHADOW"
+)
+
+# Unified Memory Authority Compatibility Candidate Shadow master flag.
+# SHADOW ONLY, CANDIDATE ONLY and default OFF. It is the FIRST
+# target-body candidate this repository allows, and a deliberately
+# ultra-narrow zero-behaviour-change one: it proves unified control
+# COULD explicitly authorize the CURRENT Frontend direct exposure
+# without changing a single byte the model sees.
+#
+# It needs the existing Migration Shadow (which in turn needs the Source
+# Evidence + Unified Memory Delivery Plan) for THIS request, so when it
+# is ON it MAY drive those upstream SHADOW dependencies even while the
+# standalone Delivery / Migration flags are OFF (through the
+# ``migration_needed`` / ``delivery_needed`` composition below). It must
+# NOT activate any live memory channel: it does not enable Memory Flash,
+# Recall Surface, Live Memory Flash Exposure, Lifecycle Surfacing,
+# Lifecycle Comparison, Real Context Injection, Source Arbitration or
+# the Exposure Ledger. Its candidate body NEVER becomes the returned
+# body in v0.
+_MEMORY_LIVE_AUTHORITY_CANDIDATE_ENV = (
+    "OMBRE_GATEWAY_CONTEXT_MEMORY_LIVE_AUTHORITY_CANDIDATE_SHADOW"
 )
 
 
@@ -640,8 +668,25 @@ def observe_memory_exposure_shadow(
         os.environ.get(_MEMORY_AUTHORITY_MIGRATION_ENV)
     )
 
+    # Unified Memory Authority Compatibility Candidate Shadow. Default
+    # OFF and candidate-only. It CONSUMES the Migration Shadow (which in
+    # turn consumes the Delivery Plan) as required upstream evidence for
+    # THIS request, so it may drive both even while their standalone
+    # flags are OFF. Either way the plan is still built EXACTLY ONCE:
+    # ``delivery_needed`` below only widens WHETHER the existing single
+    # build happens, never how many times.
+    candidate_enabled = _truthy(
+        os.environ.get(
+            _MEMORY_LIVE_AUTHORITY_CANDIDATE_ENV
+        )
+    )
+
+    migration_needed = (
+        migration_enabled or candidate_enabled
+    )
+
     delivery_needed = (
-        delivery_enabled or migration_enabled
+        delivery_enabled or migration_needed
     )
 
     if not (
@@ -1137,9 +1182,20 @@ def observe_memory_authority_migration(
     text is ever logged from here.
     """
 
-    if not _truthy(
-        os.environ.get(
-            _MEMORY_AUTHORITY_MIGRATION_ENV
+    # The Migration observation is driven by its own flag OR by the
+    # Unified Memory Authority Compatibility Candidate Shadow, which
+    # consumes the Migration artifact as required upstream evidence. It
+    # is still produced EXACTLY ONCE.
+    if not (
+        _truthy(
+            os.environ.get(
+                _MEMORY_AUTHORITY_MIGRATION_ENV
+            )
+        )
+        or _truthy(
+            os.environ.get(
+                _MEMORY_LIVE_AUTHORITY_CANDIDATE_ENV
+            )
         )
     ):
         return
@@ -1220,6 +1276,163 @@ def observe_memory_authority_migration(
         # NOTHING else. It never changes the already-selected body.
         logger.warning(
             "[gateway.context_memory_authority_migration] "
+            "observer_failed=%s fail_open=true",
+            type(exc).__name__,
+        )
+
+
+def observe_memory_live_authority_candidate(
+    conversation_id: str | None,
+    *,
+    cognitive_request_id: str | None,
+    workspace: Any,
+    final_body: bytes,
+) -> None:
+    """Observe the zero-behaviour-change Unified Authority Candidate.
+
+    SHADOW ONLY, CANDIDATE ONLY and fail-open. This is the final rung
+    that runs AFTER a valid Migration observation and BEFORE the
+    selection is returned:
+
+        final_body
+            -> Memory Authority Migration Shadow
+            -> Frontend Controlled Direct Surface
+            -> Unified Memory Authority Compatibility Candidate
+            -> return the EXACT SAME final_body
+
+    It builds the in-memory Frontend Controlled Direct Surface ONCE from
+    THIS request's request-local authority, runs the exact-envelope
+    final-body control walk, and persists only a privacy-safe candidate
+    artifact. It never rebuilds evidence / Delivery / Migration, never
+    reads a conversation-global "latest", never calls a selector, never
+    mutates a body and never reinforces a memory.
+
+    It has NO body authority: it may READ ``final_body`` but never
+    replaces it. Any failure leaves the already-selected body untouched
+    and is simply missing candidate data. The coordinator IGNORES any
+    body-like value: this function returns nothing at all.
+
+    Only privacy-safe telemetry is logged by the callee: aggregates,
+    booleans, enums, revisions and counts only. No conversation id,
+    request id, evidence ref, digest, body hash, memory id, cue, memref
+    or memory text is ever logged from here.
+    """
+
+    if not _truthy(
+        os.environ.get(
+            _MEMORY_LIVE_AUTHORITY_CANDIDATE_ENV
+        )
+    ):
+        return
+
+    if (
+        not isinstance(conversation_id, str)
+        or not conversation_id
+        or not isinstance(
+            cognitive_request_id,
+            str,
+        )
+        or not cognitive_request_id
+    ):
+        return
+
+    try:
+        # Request-local only: the workspace is the runtime authority for
+        # THIS request. A conversation-scoped "latest" is never
+        # consulted.
+        source_evidence = getattr(
+            workspace,
+            "memory_source_evidence",
+            None,
+        )
+
+        delivery_plan = getattr(
+            workspace,
+            "memory_delivery_plan",
+            None,
+        )
+
+        migration = getattr(
+            workspace,
+            "memory_authority_migration",
+            None,
+        )
+
+        unified = getattr(
+            workspace,
+            "unified",
+            None,
+        )
+
+        source_unified_revision = (
+            unified.get("revision")
+            if isinstance(unified, dict)
+            else None
+        )
+
+        # In-memory-only controlled surface, built EXACTLY ONCE from
+        # THIS request's request-local authority. It carries exact raw
+        # Frontend envelopes and is never persisted / logged.
+        surface_result = (
+            build_frontend_controlled_direct_surface(
+                conversation_id=conversation_id,
+                cognitive_request_id=(
+                    cognitive_request_id
+                ),
+                source_unified_revision=(
+                    source_unified_revision
+                ),
+                source_evidence_snapshot=(
+                    source_evidence
+                ),
+                delivery_plan=delivery_plan,
+                migration=migration,
+            )
+        )
+
+        if (
+            workspace is not None
+            and surface_result.ok
+        ):
+            workspace.frontend_controlled_direct_surface = (
+                surface_result.surface
+            )
+
+        report = update_memory_live_authority_candidate(
+            conversation_id=conversation_id,
+            cognitive_request_id=(
+                cognitive_request_id
+            ),
+            delivery_plan=delivery_plan,
+            migration=migration,
+            surface=surface_result,
+            source_unified_revision=(
+                source_unified_revision
+            ),
+            final_body=final_body,
+        )
+
+        log_memory_live_authority_candidate_report(
+            report
+        )
+
+        if (
+            workspace is not None
+            and isinstance(report, dict)
+            and report.get("stored")
+            and isinstance(
+                report.get("artifact"),
+                dict,
+            )
+        ):
+            workspace.memory_live_authority_candidate = (
+                report["artifact"]
+            )
+    except Exception as exc:
+        # Fail-open: a candidate fault is missing candidate data and
+        # NOTHING else. It never changes the already-selected body.
+        logger.warning(
+            "[gateway.context_memory_live_authority_candidate] "
             "observer_failed=%s fail_open=true",
             type(exc).__name__,
         )
@@ -1367,6 +1580,20 @@ async def observe_unified_preview_gate(
         )
     )
 
+    # Unified Memory Authority Compatibility Candidate Shadow. Default
+    # OFF, shadow-only and candidate-only. Like the other Memory
+    # observers it consumes THIS request's own evidence, so when it is
+    # on it refreshes the Unified chain for this request. It needs the
+    # Migration Shadow (and therefore the Delivery Plan) as required
+    # upstream evidence but does NOT activate any live memory channel.
+    memory_live_authority_candidate_enabled = (
+        _truthy(
+            os.environ.get(
+                _MEMORY_LIVE_AUTHORITY_CANDIDATE_ENV
+            )
+        )
+    )
+
     memory_observer_enabled = (
         memory_flash_enabled
         or exposure_ledger_enabled
@@ -1374,6 +1601,7 @@ async def observe_unified_preview_gate(
         or lifecycle_comparison_observer_enabled
         or memory_delivery_enabled
         or memory_authority_migration_enabled
+        or memory_live_authority_candidate_enabled
     )
 
     # Frontend Memory Arbitration Shadow (default OFF). Like the other
@@ -1617,6 +1845,7 @@ async def observe_unified_preview_gate(
         memory_arbitration_enabled
         or memory_delivery_enabled
         or memory_authority_migration_enabled
+        or memory_live_authority_candidate_enabled
     ) and unified.get("stored") and isinstance(
         cognitive_request_id,
         str,
@@ -2748,6 +2977,31 @@ async def _run_context_pipeline_selection(
         except Exception as exc:
             logger.warning(
                 "[gateway.context_memory_authority_migration] "
+                "observer_failed=%s fail_open=true",
+                type(exc).__name__,
+            )
+
+        # Unified Memory Authority Compatibility Candidate Shadow. It
+        # runs AFTER a valid Migration observation and BEFORE the
+        # selection is returned, so it observes the ACTUAL model-facing
+        # body (not the forward_body and not the pre-live body). It is
+        # candidate-only and has NO body authority: the EXACT SAME bytes
+        # below are returned regardless of its outcome. The call is
+        # wrapped in its own guard so even an unexpected observer fault
+        # can never cause the outer handler to fall back to
+        # ``forward_body`` -- the already-selected body always wins.
+        try:
+            observe_memory_live_authority_candidate(
+                conversation_id,
+                cognitive_request_id=(
+                    cognitive_request_id
+                ),
+                workspace=workspace,
+                final_body=final_body,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[gateway.context_memory_live_authority_candidate] "
                 "observer_failed=%s fail_open=true",
                 type(exc).__name__,
             )

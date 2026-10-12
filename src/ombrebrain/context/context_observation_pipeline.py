@@ -183,6 +183,18 @@ def observe_context_sources(body: bytes) -> str | None:
         )
     )
 
+    # Unified Memory Authority Compatibility Candidate Shadow. It is
+    # candidate-only, but it CONSUMES the request-local Migration Shadow
+    # (which in turn consumes the Delivery Plan) as required upstream
+    # evidence, so enabling it alone must also drive the same upstream
+    # chain. It never activates a live memory channel.
+    memory_live_authority_candidate_enabled = _truthy(
+        os.environ.get(
+            "OMBRE_GATEWAY_CONTEXT_MEMORY_"
+            "LIVE_AUTHORITY_CANDIDATE_SHADOW"
+        )
+    )
+
     memory_downstream_enabled = (
         confidence_gate_enabled
         or memory_flash_enabled
@@ -190,6 +202,7 @@ def observe_context_sources(body: bytes) -> str | None:
         or memory_arbitration_enabled
         or memory_delivery_enabled
         or memory_authority_migration_enabled
+        or memory_live_authority_candidate_enabled
     )
 
     if not (

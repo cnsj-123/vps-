@@ -447,6 +447,50 @@ This experiment **does not** answer any of them. From
 `migration readiness evidence exists` — **not** `unified Memory authority is live`,
 **not** `Frontend direct mouth removed`, **not** `cutover approved`.
 
+## 20. Follow-on experiment — Frontend Controlled Direct Channel → Unified Memory Authority Compatibility Candidate
+
+A later, separate experiment builds **directly on top of this Migration Shadow**
+without changing any of its semantics:
+
+```
+Memory Authority Migration Shadow
+    ↓
+Frontend Controlled Direct Surface
+    ↓
+Unified Memory Authority Compatibility Candidate Shadow
+```
+
+This Migration Shadow records the CURRENT Frontend path as a **gap**:
+`frontend + direct_data -> gap_frontend_direct_bypass` with
+`replacement_requirement = controlled_frontend_channel_required`. That observation
+is **historical fact and stays untouched** — this experiment never mutates
+`gap_frontend_direct_bypass` inside a Migration artifact.
+
+The follow-on Candidate reads THIS request's already-validated Migration artifact
+(and its Delivery Plan / Source Evidence) and observes that the **same** Frontend
+occurrence can be **adopted** into an explicit, controller-owned
+`preserve_direct_data` compatibility lane:
+
+```
+Migrated: frontend + direct_data -> gap_frontend_direct_bypass
+Candidate: the SAME occurrence -> covered_frontend_controlled_direct_candidate
+```
+
+It answers one bounded question only — *"could unified control explicitly adopt
+the CURRENT Frontend direct exposure WITHOUT changing a single byte the model
+sees?"* — and proves the candidate body is byte-for-byte identical to the actual
+`final_body`. It is a **ZERO-BEHAVIOUR-CHANGE compatibility migration lane**, not
+the live unification: `live_authority` / `candidate_applied` / `live_cutover_ready`
+are always `false`, and `preserve_direct_data` does **not** mean Frontend
+`direct_data` is the final policy.
+
+OB handling is **delegation, not re-implementation**: the Candidate maps this
+Migration Shadow's validated full-scope OB metrics onto the existing OB control
+plane (`ob_control_strategy = delegate_existing_ob_control_plane`) and keeps OB
+`unknown` as a gap. See
+[`FRONTEND_CONTROLLED_DIRECT_CHANNEL.md`](FRONTEND_CONTROLLED_DIRECT_CHANNEL.md)
+and `ARCHITECTURE_STATUS.md` §2.28.
+
 ---
 
 ## Explicit non-goals of this experiment

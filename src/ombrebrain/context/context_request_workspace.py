@@ -71,6 +71,24 @@ class ContextRequestWorkspace:
     # is bound only when a valid stored comparison was produced.
     memory_authority_migration: dict[str, Any] | None = None
 
+    # In-memory-only Frontend Controlled Direct Surface THIS request
+    # built. SENSITIVE: it carries the exact raw Frontend attachment
+    # envelopes (metadata + body) so a downstream stage can prove
+    # exact-envelope binding. It is IN-MEMORY ONLY -- never serialized,
+    # never persisted, never logged, never model-visible, never a cache
+    # key and never a memory database. It is a compatibility migration
+    # lane, not a Frontend identity / item schema.
+    frontend_controlled_direct_surface: Any | None = None
+
+    # Request-local Unified Memory Authority Compatibility Candidate
+    # Shadow artifact THIS request produced. Privacy-safe, shadow-only
+    # and candidate-only: it has NO live authority, never becomes the
+    # returned body and never changes a single byte the model sees. It
+    # is bound only when a valid stored candidate was produced.
+    memory_live_authority_candidate: (
+        dict[str, Any] | None
+    ) = None
+
     # Confidence Gate report for THIS request (observer only).
     confidence_report: dict[str, Any] | None = None
 
